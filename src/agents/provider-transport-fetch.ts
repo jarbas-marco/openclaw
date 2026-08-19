@@ -395,15 +395,24 @@ async function normalizeOpenAISdkStreamContentType(params: {
   if (/\btext\/event-stream\b/i.test(contentType)) {
     return params.response;
   }
-  if (isJsonContentType(contentType)) {
+  const isPlainText = /\btext\/plain\b/i.test(contentType);
+  if (isJsonContentType(contentType) || isPlainText) {
     // Some OpenAI-compatible gateways stream real SSE (`data: {...}`) but mislabel
-    // the response as JSON. Without relabeling, the JSON-wrap fallback below would
-    // re-prefix each frame as `data: data: {...}`, breaking JSON.parse in the SDK.
+    // the response as JSON or plain text. Without relabeling, the JSON-wrap fallback
+    // below would re-prefix each frame as `data: data: {...}`, breaking JSON.parse
+    // in the SDK. Plain-text responses are body-sniffed and remain rejected unless
+    // they contain a recognizable SSE or JSON payload.
     const kind = await classifyOpenAISdkStreamBody(params.response).catch(() => "unknown" as const);
     if (kind === "sse") {
       return withOpenAISdkStreamContentType(params.response, "text/event-stream; charset=utf-8");
     }
-    return params.response;
+    if (kind === "json" && isPlainText) {
+      return withOpenAISdkStreamContentType(params.response, "application/json; charset=utf-8");
+    }
+    if (!isPlainText) {
+      return params.response;
+    }
+    // Preserve the existing invalid-content-type error path for HTML or arbitrary text.
   }
   if (!contentType.trim()) {
     // ChatGPT Codex can stream valid SSE with no content-type header. Sniff a
