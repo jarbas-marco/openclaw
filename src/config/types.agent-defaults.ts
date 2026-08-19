@@ -110,6 +110,8 @@ export type AgentContextLimitsConfig = {
   memoryGetDefaultLines?: number;
   /** Advanced max chars for a single live tool result; unset uses model-context auto cap. */
   toolResultMaxChars?: number;
+  /** Advanced max chars retained across all live tool results in one prompt. */
+  toolResultAggregateMaxChars?: number;
   /** Max chars retained from post-compaction AGENTS.md context injection (default: 1800). */
   postCompactionMaxChars?: number;
 };

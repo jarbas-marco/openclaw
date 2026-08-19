@@ -7,6 +7,7 @@ import { listTaskRecords } from "../tasks/runtime-internal.js";
 import { listTaskFlowAuditFindings } from "../tasks/task-flow-registry.audit.js";
 import { listTaskFlowRecords } from "../tasks/task-flow-runtime-internal.js";
 import { listTaskAuditFindings } from "../tasks/task-registry.audit.js";
+import { summarizeTaskRecords } from "../tasks/task-registry.summary.js";
 import type { TaskRecord } from "../tasks/task-registry.types.js";
 import {
   buildTaskSystemAuditJsonPayload,
@@ -25,7 +26,11 @@ type TasksListJsonArgs = {
   json?: boolean;
   runtime?: string;
   status?: string;
+  limit?: number | "all";
+  summary?: boolean;
 };
+
+const DEFAULT_TASK_LIST_LIMIT = 100;
 
 type TasksAuditJsonArgs = {
   json?: boolean;
@@ -63,11 +68,18 @@ function buildTasksListJsonPayload(opts: TasksListJsonArgs) {
     }
     return true;
   });
+  const limit = opts.limit ?? DEFAULT_TASK_LIST_LIMIT;
+  const shownTasks = opts.summary ? [] : limit === "all" ? tasks : tasks.slice(0, limit);
   return {
     count: tasks.length,
+    shown: shownTasks.length,
+    truncated: shownTasks.length < tasks.length,
+    summaryOnly: Boolean(opts.summary),
+    limit: limit === "all" ? null : limit,
     runtime: runtimeFilter ?? null,
     status: statusFilter ?? null,
-    tasks,
+    summary: summarizeTaskRecords(tasks),
+    tasks: shownTasks,
   };
 }
 

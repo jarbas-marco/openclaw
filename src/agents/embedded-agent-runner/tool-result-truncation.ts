@@ -311,6 +311,13 @@ export function resolveLiveToolResultAggregateMaxChars(params: {
   const contextWindowTokens = Number.isFinite(params.contextWindowTokens)
     ? Math.max(1, Math.floor(params.contextWindowTokens))
     : 1;
+  const configuredCap = resolveAgentContextLimits(
+    params.cfg,
+    params.agentId,
+  )?.toolResultAggregateMaxChars;
+  if (configuredCap !== undefined) {
+    return Math.max(perResultMaxChars, Math.floor(configuredCap));
+  }
   // Aggregate truncation shares the 0.5 history-pressure invariant used by
   // safeguard compaction and the mid-turn single-result guard. If this drifts,
   // truncation can hide pressure that compaction routing should see.

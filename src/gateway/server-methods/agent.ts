@@ -48,6 +48,10 @@ import {
 } from "../../agents/identity-avatar.js";
 import { AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION } from "../../agents/internal-event-contract.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
+import {
+  removeInternalSessionEffectsTranscript,
+  resolveInternalSessionEffectsTranscriptPath,
+} from "../../agents/internal-session-effects.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import {
   AGENT_RUN_RESTART_ABORT_STOP_REASON,
@@ -663,7 +667,11 @@ function resolveGatewayAgentTaskTrackingMode(params: {
   sessionKey?: string;
   inputProvenance?: InputProvenance;
   confirmedAcpManualSpawn?: boolean;
+  modelRun?: boolean;
 }): GatewayAgentTaskTrackingMode {
+  if (params.modelRun) {
+    return "none";
+  }
   if (!params.sessionKey?.trim() || params.inputProvenance?.kind === "inter_session") {
     return "none";
   }
@@ -977,6 +985,7 @@ function dispatchAgentRunFromGateway(params: {
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
   taskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
+  cleanupInternalTranscript?: boolean;
 }) {
   const shouldTrackTask = params.taskTrackingMode === "cli";
   let taskTracked = false;
@@ -1085,6 +1094,11 @@ function dispatchAgentRunFromGateway(params: {
     .finally(() => {
       clearAgentRunContext(params.runId, params.ingressOpts.lifecycleGeneration);
       params.cleanupAbortController();
+      if (params.cleanupInternalTranscript) {
+        void removeInternalSessionEffectsTranscript(
+          resolveInternalSessionEffectsTranscriptPath(params.runId),
+        );
+      }
     });
 }
 
@@ -3143,6 +3157,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         sessionKey: resolvedSessionKey,
         inputProvenance,
         confirmedAcpManualSpawn,
+        modelRun: isRawModelRun,
       });
       let dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent"> =
         taskTrackingMode === "cli" ? "cli" : "none";
@@ -3388,6 +3403,7 @@ export const agentHandlers: GatewayRequestHandlers = {
             respond,
             context,
             taskTrackingMode: dispatchTaskTrackingMode,
+            cleanupInternalTranscript: isRawModelRun && suppressVisibleSessionEffects,
           });
           dispatched = true;
         } catch (err) {

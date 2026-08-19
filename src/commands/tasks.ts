@@ -55,6 +55,7 @@ const DELIVERY_PAD = 14;
 const ID_PAD = 10;
 const RUN_PAD = 10;
 const SESSION_REGISTRY_RETENTION_MS = 7 * 24 * 60 * 60_000;
+const DEFAULT_TASK_LIST_LIMIT = 100;
 
 const info = theme.info;
 
@@ -346,7 +347,13 @@ function toSystemAuditFindings(params: {
 
 /** Lists background tasks with optional runtime/status filters. */
 export async function tasksListCommand(
-  opts: { json?: boolean; runtime?: string; status?: string },
+  opts: {
+    json?: boolean;
+    runtime?: string;
+    status?: string;
+    limit?: number | "all";
+    summary?: boolean;
+  },
   runtime: RuntimeEnv,
 ) {
   const runtimeFilter = opts.runtime?.trim();
@@ -361,14 +368,24 @@ export async function tasksListCommand(
     return true;
   });
 
+  const summary = summarizeTaskRecords(tasks);
+  const limit = opts.limit ?? DEFAULT_TASK_LIST_LIMIT;
+  const shownTasks = opts.summary ? [] : limit === "all" ? tasks : tasks.slice(0, limit);
+  const truncated = shownTasks.length < tasks.length;
+
   if (opts.json) {
     runtime.log(
       JSON.stringify(
         {
           count: tasks.length,
+          shown: shownTasks.length,
+          truncated,
+          summaryOnly: Boolean(opts.summary),
+          limit: limit === "all" ? null : limit,
           runtime: runtimeFilter ?? null,
           status: statusFilter ?? null,
-          tasks,
+          summary,
+          tasks: shownTasks,
         },
         null,
         2,
@@ -391,8 +408,18 @@ export async function tasksListCommand(
     );
     return;
   }
+  if (opts.summary) {
+    return;
+  }
+  if (truncated) {
+    runtime.log(
+      info(
+        `Showing newest ${shownTasks.length} of ${tasks.length}. Use --limit all for full output.`,
+      ),
+    );
+  }
   const rich = isRich();
-  for (const line of formatTaskRows(tasks, rich)) {
+  for (const line of formatTaskRows(shownTasks, rich)) {
     runtime.log(line);
   }
 }

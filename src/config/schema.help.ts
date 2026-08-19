@@ -299,6 +299,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Default memory_get line window used when requests omit lines. This controls how many source lines are selected before the max-char cap is applied.",
   "agents.defaults.contextLimits.toolResultMaxChars":
     "Advanced ceiling for a single live tool result before truncation. Leave unset to use the model-context auto cap; explicit values affect both persisted live tool-result writes and overflow-recovery truncation heuristics.",
+  "agents.defaults.contextLimits.toolResultAggregateMaxChars":
+    "Advanced ceiling for the combined live tool-result text retained in one model prompt. Set this to keep several individually bounded results from collectively consuming the context window; the effective value is never lower than the single-result ceiling.",
   "agents.defaults.contextLimits.postCompactionMaxChars":
     "Default max characters retained from AGENTS.md during post-compaction context refresh injection. Lower this to make compaction recovery cheaper, or raise it for agents that depend on longer startup guidance.",
   "agents.list":
@@ -315,6 +317,8 @@ export const FIELD_HELP: Record<string, string> = {
     "Per-agent override for the default memory_get line window when lines is omitted.",
   "agents.list[].contextLimits.toolResultMaxChars":
     "Per-agent advanced ceiling for the live tool-result max character budget. Omit to inherit defaults or the model-context auto cap.",
+  "agents.list[].contextLimits.toolResultAggregateMaxChars":
+    "Per-agent ceiling for combined live tool-result text in one prompt. Omit to inherit the default aggregate budget.",
   "agents.list[].contextLimits.postCompactionMaxChars":
     "Per-agent override for the post-compaction AGENTS.md excerpt budget.",
   "agents.list[].thinkingDefault":

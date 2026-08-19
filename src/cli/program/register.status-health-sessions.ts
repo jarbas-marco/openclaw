@@ -93,6 +93,19 @@ function parseTasksAuditLimit(limit: unknown): number | null | undefined {
   return parsed;
 }
 
+function parseTasksListLimit(limit: unknown): number | "all" | null | undefined {
+  if (typeof limit === "string" && limit.trim().toLowerCase() === "all") {
+    return "all";
+  }
+  const parsed = parseStrictPositiveIntOrUndefined(limit);
+  if (limit !== undefined && parsed === undefined) {
+    defaultRuntime.error('--limit must be a positive integer or "all".');
+    defaultRuntime.exit(1);
+    return null;
+  }
+  return parsed;
+}
+
 async function runWithVerboseAndTimeout(
   opts: { verbose?: boolean; debug?: boolean; timeout?: unknown },
   action: (params: { verbose: boolean; timeoutMs: number | undefined }) => Promise<void>,
@@ -544,7 +557,13 @@ export function registerStatusHealthSessionsCommands(program: Command) {
       "--status <name>",
       "Filter by status (queued, running, succeeded, failed, timed_out, cancelled, lost)",
     )
+    .option("--limit <count>", 'Max tasks to show (default: 100; use "all" for full output)')
+    .option("--summary", "Show counts only", false)
     .action(async (opts) => {
+      const limit = parseTasksListLimit(opts.limit);
+      if (limit === null) {
+        return;
+      }
       await runCommandWithRuntime(defaultRuntime, async () => {
         const { tasksListCommand } = await loadTasksCommands();
         await tasksListCommand(
@@ -552,6 +571,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             json: Boolean(opts.json),
             runtime: opts.runtime as string | undefined,
             status: opts.status as string | undefined,
+            limit,
+            summary: Boolean(opts.summary),
           },
           defaultRuntime,
         );
@@ -568,14 +589,22 @@ export function registerStatusHealthSessionsCommands(program: Command) {
       "--status <name>",
       "Filter by status (queued, running, succeeded, failed, timed_out, cancelled, lost)",
     )
+    .option("--limit <count>", 'Max tasks to show (default: 100; use "all" for full output)')
+    .option("--summary", "Show counts only", false)
     .action(async (opts, command) => {
       const parentOpts = command.parent?.opts() as
         | {
             json?: boolean;
             runtime?: string;
             status?: string;
+            limit?: string;
+            summary?: boolean;
           }
         | undefined;
+      const limit = parseTasksListLimit((opts.limit as string | undefined) ?? parentOpts?.limit);
+      if (limit === null) {
+        return;
+      }
       await runCommandWithRuntime(defaultRuntime, async () => {
         const { tasksListCommand } = await loadTasksCommands();
         await tasksListCommand(
@@ -583,6 +612,8 @@ export function registerStatusHealthSessionsCommands(program: Command) {
             json: Boolean(opts.json || parentOpts?.json),
             runtime: (opts.runtime as string | undefined) ?? parentOpts?.runtime,
             status: (opts.status as string | undefined) ?? parentOpts?.status,
+            limit,
+            summary: Boolean(opts.summary || parentOpts?.summary),
           },
           defaultRuntime,
         );

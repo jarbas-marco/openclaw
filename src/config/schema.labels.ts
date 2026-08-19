@@ -101,6 +101,8 @@ export const FIELD_LABELS: Record<string, string> = {
   "agents.defaults.contextLimits.memoryGetMaxChars": "Default memory_get Max Chars",
   "agents.defaults.contextLimits.memoryGetDefaultLines": "Default memory_get Line Window",
   "agents.defaults.contextLimits.toolResultMaxChars": "Default Tool Result Max Chars",
+  "agents.defaults.contextLimits.toolResultAggregateMaxChars":
+    "Default Aggregate Tool Result Max Chars",
   "agents.defaults.contextLimits.postCompactionMaxChars": "Default Post-compaction Max Chars",
   "agents.list": "Agent List",
   "agents.list[].skillsLimits": "Agent Skills Limits",
@@ -109,6 +111,8 @@ export const FIELD_LABELS: Record<string, string> = {
   "agents.list[].contextLimits.memoryGetMaxChars": "Agent memory_get Max Chars",
   "agents.list[].contextLimits.memoryGetDefaultLines": "Agent memory_get Line Window",
   "agents.list[].contextLimits.toolResultMaxChars": "Agent Tool Result Max Chars",
+  "agents.list[].contextLimits.toolResultAggregateMaxChars":
+    "Agent Aggregate Tool Result Max Chars",
   "agents.list[].contextLimits.postCompactionMaxChars": "Agent Post-compaction Max Chars",
   "agents.list.*.models": "Agent Model Overrides",
   "agents.list.*.models.*.agentRuntime": "Agent Model Runtime",

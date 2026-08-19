@@ -815,9 +815,8 @@ async function runModelRun(params: {
   }
 
   const { provider, model } = resolveModelRefOverride(modelRef);
-  // Provider/model overrides require trusted-operator scope. Use the backend
-  // shared-secret lane so local gateway smokes do not depend on paired CLI device scopes.
-  const hasModelOverride = Boolean(provider || model);
+  // Raw model runs are internal, context-free probes. Use the backend lane so
+  // their transient session controls are authorized even without an override.
   const sessionId = `model-run-${randomUUID()}`;
   const sessionKey = buildExplicitSessionIdSessionKey({ agentId, sessionId });
   const response: {
@@ -852,14 +851,16 @@ async function runModelRun(params: {
       ...(params.thinking ? { thinking: params.thinking } : {}),
       modelRun: true,
       promptMode: "none",
+      sessionEffects: "internal",
+      suppressPromptPersistence: true,
       cleanupBundleMcpOnRunEnd: true,
       idempotencyKey: randomIdempotencyKey(),
     },
     expectFinal: true,
     timeoutMs: 120_000,
-    clientName: hasModelOverride ? GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT : GATEWAY_CLIENT_NAMES.CLI,
-    mode: hasModelOverride ? GATEWAY_CLIENT_MODES.BACKEND : GATEWAY_CLIENT_MODES.CLI,
-    ...(hasModelOverride ? { scopes: [ADMIN_SCOPE] } : {}),
+    clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
+    mode: GATEWAY_CLIENT_MODES.BACKEND,
+    scopes: [ADMIN_SCOPE],
   });
   return {
     ok: true,
