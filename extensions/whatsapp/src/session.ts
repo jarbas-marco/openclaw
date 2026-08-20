@@ -4,11 +4,8 @@ import type { Agent } from "node:https";
 import type { GroupMetadata, WAMessageKey, proto } from "baileys";
 import { formatCliCommand } from "openclaw/plugin-sdk/cli-runtime";
 import { VERSION } from "openclaw/plugin-sdk/cli-runtime";
-import {
-  createHttp1EnvHttpProxyAgent,
-  createHttp1ProxyAgent,
-  createNodeProxyAgent,
-} from "openclaw/plugin-sdk/fetch-runtime";
+import { resolveAmbientNodeProxyAgent } from "openclaw/plugin-sdk/extension-shared";
+import { createNodeProxyAgent } from "openclaw/plugin-sdk/fetch-runtime";
 import { danger, success } from "openclaw/plugin-sdk/runtime-env";
 import { getChildLogger, toPinoLikeLogger } from "openclaw/plugin-sdk/runtime-env";
 import { ensureDir, resolveUserPath } from "openclaw/plugin-sdk/text-utility-runtime";
@@ -191,7 +188,7 @@ export async function createWaSocket(
   const { version } = await fetchLatestBaileysVersion();
   const waWebSocketUrl = resolveWaWebSocketUrl(opts.waWebSocketUrl) ?? resolveEnvWaWebSocketUrl();
   const agent = await resolveEnvProxyAgent(sessionLogger);
-  const fetchAgent = await resolveEnvFetchDispatcher(sessionLogger, agent);
+  const fetchAgent = await resolveEnvFetchAgent(sessionLogger);
   const socketTiming = {
     keepAliveIntervalMs:
       opts.keepAliveIntervalMs ?? DEFAULT_WHATSAPP_SOCKET_TIMING.keepAliveIntervalMs,
@@ -212,9 +209,7 @@ export async function createWaSocket(
     markOnlineOnConnect: false,
     ...socketTiming,
     agent,
-    // Baileys types still model `fetchAgent` as a Node agent even though the
-    // runtime path accepts an undici dispatcher for upload fetches.
-    fetchAgent: fetchAgent as Agent | undefined,
+    fetchAgent,
     ...(waWebSocketUrl ? { waWebSocketUrl } : {}),
     ...(opts.getMessage ? { getMessage: opts.getMessage } : {}),
     ...(opts.cachedGroupMetadata ? { cachedGroupMetadata: opts.cachedGroupMetadata } : {}),
@@ -286,62 +281,17 @@ async function resolveEnvProxyAgent(
   }
 }
 
-async function resolveEnvFetchDispatcher(
+async function resolveEnvFetchAgent(
   logger: ReturnType<typeof getChildLogger>,
-  agent?: unknown,
-): Promise<unknown> {
-  const proxyUrl = resolveProxyUrlFromAgent(agent);
-  const envProxyUrl = resolveEnvHttpsProxyUrl();
-  if (!proxyUrl && !envProxyUrl) {
-    return undefined;
-  }
-  try {
-    return proxyUrl ? createHttp1ProxyAgent({ uri: proxyUrl }) : createHttp1EnvHttpProxyAgent();
-  } catch (error) {
-    logger.warn(
-      { error: String(error) },
-      "Failed to initialize env proxy dispatcher for WhatsApp media uploads",
-    );
-    return undefined;
-  }
-}
-
-function resolveProxyUrlFromAgent(agent: unknown): string | undefined {
-  if (
-    typeof agent === "object" &&
-    agent !== null &&
-    "getProxyForUrl" in agent &&
-    typeof agent.getProxyForUrl === "function"
-  ) {
-    const proxyUrl = agent.getProxyForUrl(WHATSAPP_WEBSOCKET_PROXY_TARGET);
-    return typeof proxyUrl === "string" && proxyUrl.length > 0 ? proxyUrl : undefined;
-  }
-  if (typeof agent !== "object" || agent === null || !("proxy" in agent)) {
-    return undefined;
-  }
-  const proxy = (agent as { proxy?: unknown }).proxy;
-  if (proxy instanceof URL) {
-    return proxy.toString();
-  }
-  return typeof proxy === "string" && proxy.length > 0 ? proxy : undefined;
-}
-
-function resolveEnvHttpsProxyUrl(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const lowerHttpsProxy = normalizeEnvProxyValue(env.https_proxy);
-  const lowerHttpProxy = normalizeEnvProxyValue(env.http_proxy);
-  const httpsProxy =
-    lowerHttpsProxy !== undefined ? lowerHttpsProxy : normalizeEnvProxyValue(env.HTTPS_PROXY);
-  const httpProxy =
-    lowerHttpProxy !== undefined ? lowerHttpProxy : normalizeEnvProxyValue(env.HTTP_PROXY);
-  return httpsProxy ?? httpProxy ?? undefined;
-}
-
-function normalizeEnvProxyValue(value: string | undefined): string | null | undefined {
-  if (typeof value !== "string") {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  return trimmed.length > 0 ? trimmed : null;
+): Promise<Agent | undefined> {
+  return await resolveAmbientNodeProxyAgent<Agent>({
+    onError: (error) => {
+      logger.warn(
+        { error: String(error) },
+        "Failed to initialize env proxy agent for WhatsApp media uploads",
+      );
+    },
+  });
 }
 
 type WhatsAppConnectionWaitOptions =
