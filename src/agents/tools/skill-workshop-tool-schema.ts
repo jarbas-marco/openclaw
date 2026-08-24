@@ -10,6 +10,7 @@ import {
 
 export const SKILL_WORKSHOP_ACTIONS = [
   "create",
+  "prepare_patch",
   "patch",
   "update",
   "read",
@@ -35,7 +36,7 @@ export const SKILL_PROPOSAL_STATUSES = [
 export function resolveProposalOnlyActions(updateProposals: boolean, supportsCompletion: boolean) {
   return [
     "create",
-    ...(updateProposals ? ["patch", "update", "read"] : []),
+    ...(updateProposals ? ["prepare_patch", "patch", "update", "read"] : []),
     "revise",
     "list",
     "inspect",
@@ -65,10 +66,10 @@ export function buildSkillWorkshopToolSchema(
           description: proposalRevision
             ? "inspect = read the exact operator-reviewed proposal; revise = update only that proposal with the run-bound expected revision hash."
             : proposalOnly
-              ? `create = new skill;${updateProposals ? " patch = targeted find-and-replace on an existing live skill (quote the exact current text in old_string, replacement in new_string; empty old_string appends new_string at the end); read = complete existing live skill when it fits the selected-model budget, otherwise metadata without a partial body (required before patch or update); update = full-body rewrite of an existing live skill after reading it;" : ""} revise = existing pending proposal; list/inspect discover pending proposals (not filesystem search).${supportsCompletion ? " complete = durably finish this review after all proposal work." : ""} Nothing writes a live skill directly; lifecycle actions are unavailable.`
+              ? `create = new skill;${updateProposals ? " prepare_patch = authorize one exact non-empty old_string and return bounded context for a skill that cannot fit a complete read; patch = targeted find-and-replace after a complete read or prepare_patch (empty old_string appends only after a complete read); read = complete existing live skill when it fits the selected-model budget, otherwise metadata without a partial body; update = full-body rewrite after a complete read;" : ""} revise = existing pending proposal; list/inspect discover pending proposals (not filesystem search).${supportsCompletion ? " complete = durably finish this review after all proposal work." : ""} Nothing writes a live skill directly; lifecycle actions are unavailable.`
               : collectionOnly
                 ? SKILL_COLLECTION_ACTION_DESCRIPTION
-                : "create = new skill; read = existing live skill; patch = targeted find-and-replace after reading; update = full-body rewrite; history = show up to 20 recent collection review outcomes and drop reasons; restore_collection = restore the collection backup retained by the last cleanup; revise = existing pending proposal; list/inspect discover pending proposals (not filesystem search); evaluate runs plugin evaluators for the exact draft; apply/reject/quarantine are explicit lifecycle actions.",
+                : "create = new skill; read = existing live skill when complete content fits; prepare_patch = authorize one exact non-empty span and return bounded context; patch = targeted find-and-replace after read or prepare_patch; update = full-body rewrite after read; history = show up to 20 recent collection review outcomes and drop reasons; restore_collection = restore the collection backup retained by the last cleanup; revise = existing pending proposal; list/inspect discover pending proposals (not filesystem search); evaluate runs plugin evaluators for the exact draft; apply/reject/quarantine are explicit lifecycle actions.",
         },
       ),
       proposal_id: Type.Optional(
@@ -112,13 +113,13 @@ export function buildSkillWorkshopToolSchema(
       skill_name: Type.Optional(
         Type.String({
           description:
-            "Existing skill name or key for action=update, action=patch, or action=read.",
+            "Existing skill name or key for action=update, action=prepare_patch, action=patch, or action=read.",
         }),
       ),
       old_string: Type.Optional(
         Type.String({
           description:
-            "For action=patch: the exact current skill text to replace, quoted from read. Must match exactly once. Empty string appends new_string at the end of the skill.",
+            "For action=prepare_patch or action=patch: the exact current skill text to replace. Must match exactly once. For patch only, an empty string appends new_string after a complete read.",
         }),
       ),
       new_string: Type.Optional(

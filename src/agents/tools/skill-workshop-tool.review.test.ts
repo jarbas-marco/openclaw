@@ -4,6 +4,7 @@ import { writeFileSync } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { inspectSkillProposal } from "../../skills/workshop/service.js";
 import type { SkillWorkshopProposalMutationBudget } from "../../skills/workshop/types.js";
 import {
   createOpenClawTestState,
@@ -158,7 +159,7 @@ describe("skill_workshop review mode", () => {
     expect(
       (reviewTool.parameters as { properties: { action: { enum: string[] } } }).properties.action
         .enum,
-    ).toEqual(["create", "patch", "update", "read", "revise", "list", "inspect"]);
+    ).toEqual(["create", "prepare_patch", "patch", "update", "read", "revise", "list", "inspect"]);
 
     await expect(
       reviewTool.execute("patch-without-read", {
@@ -302,20 +303,23 @@ describe("skill_workshop review mode", () => {
     expect(proposalMutationBudget.remaining).toBe(0);
   });
 
-  it("caps reviewer live-skill reads at the read budget", async () => {
+  it("prepares a bounded exact patch for a skill above the read budget", async () => {
     const workspaceDir = await tempDirs.make("openclaw-skill-workshop-review-read-cap-");
+    const oldString = "Run the legacy deployment preflight.";
+    const newString = "Run openclaw doctor and resolve every reported blocker.";
     await seedLiveSkill(
       workspaceDir,
       "big-skill",
       "A very large operator skill",
-      `# Big Skill\n\n${"A detailed operational line.\n".repeat(1200)}`,
+      `# Big Skill\n\n${"A detailed operational line.\n".repeat(600)}${oldString}\n${"A later operational line.\n".repeat(600)}`,
     );
 
+    const proposalMutationBudget: SkillWorkshopProposalMutationBudget = { remaining: 1 };
     const reviewTool = createSkillWorkshopTool({
       workspaceDir,
       proposalOnly: true,
       updateProposals: true,
-      proposalMutationBudget: { remaining: 1 },
+      proposalMutationBudget,
       modelContextWindowTokens: 200_000,
     });
     const read = await reviewTool.execute("review-read", {
@@ -326,16 +330,104 @@ describe("skill_workshop review mode", () => {
     expect(read.details).toMatchObject({ skillKey: "big-skill", contentIncluded: false });
     expect(text.length).toBeLessThanOrEqual(20_000);
     expect(text).toContain("Content omitted");
-    expect(text).not.toContain("A detailed operational line.");
+    expect(text).not.toContain(oldString);
 
     await expect(
       reviewTool.execute("oversized-patch", {
         action: "patch",
         skill_name: "big-skill",
-        old_string: "A detailed operational line.",
-        new_string: "A rewritten operational line.",
+        old_string: oldString,
+        new_string: newString,
       }),
-    ).rejects.toThrow("cannot be updated autonomously");
+    ).rejects.toThrow("call action=prepare_patch");
+
+    const prepared = await reviewTool.execute("prepare-patch", {
+      action: "prepare_patch",
+      skill_name: "big-skill",
+      old_string: oldString,
+    });
+    const preparedText = (prepared.content[0] as { text: string }).text;
+    expect(prepared.details).toMatchObject({ skillKey: "big-skill", patchPrepared: true });
+    expect(preparedText.length).toBeLessThanOrEqual(20_000);
+    expect(preparedText).toContain("bounded excerpt, not the complete skill");
+    expect(preparedText).toContain(`--- authorized old_string ---\n${oldString}`);
+
+    const retriedReviewTool = createSkillWorkshopTool({
+      workspaceDir,
+      proposalOnly: true,
+      updateProposals: true,
+      proposalMutationBudget,
+      modelContextWindowTokens: 200_000,
+    });
+    const patched = await retriedReviewTool.execute("prepared-patch", {
+      action: "patch",
+      skill_name: "big-skill",
+      old_string: oldString,
+      new_string: newString,
+    });
+    expect(patched.details).toMatchObject({ status: "pending", kind: "update" });
+    const inspected = await inspectSkillProposal((patched.details as { id: string }).id, {
+      workspaceDir,
+    });
+    expect(inspected?.content).toContain(newString);
+    expect(inspected?.content).not.toContain(oldString);
+  });
+
+  it("invalidates prepared patch authority on substitution or target change", async () => {
+    const workspaceDir = await tempDirs.make("openclaw-skill-workshop-prepared-patch-stale-");
+    const oldString = "Run the legacy deployment preflight.";
+    await seedLiveSkill(
+      workspaceDir,
+      "big-skill",
+      "A very large operator skill",
+      `# Big Skill\n\n${"A detailed operational line.\n".repeat(1200)}${oldString}\n`,
+    );
+    const proposalMutationBudget: SkillWorkshopProposalMutationBudget = { remaining: 1 };
+    const reviewTool = createSkillWorkshopTool({
+      workspaceDir,
+      proposalOnly: true,
+      updateProposals: true,
+      proposalMutationBudget,
+      modelContextWindowTokens: 200_000,
+    });
+    await reviewTool.execute("prepare-patch", {
+      action: "prepare_patch",
+      skill_name: "big-skill",
+      old_string: oldString,
+    });
+    await expect(
+      reviewTool.execute("substituted-patch", {
+        action: "patch",
+        skill_name: "big-skill",
+        old_string: "# Big Skill",
+        new_string: "# Bigger Skill",
+      }),
+    ).rejects.toThrow("differs from the prepared exact span");
+    await expect(
+      reviewTool.execute("replayed-patch", {
+        action: "patch",
+        skill_name: "big-skill",
+        old_string: oldString,
+        new_string: "Run the current deployment preflight.",
+      }),
+    ).rejects.toThrow("call action=prepare_patch");
+
+    await reviewTool.execute("prepare-patch-again", {
+      action: "prepare_patch",
+      skill_name: "big-skill",
+      old_string: oldString,
+    });
+    const liveSkillFile = path.join(workspaceDir, "skills", "big-skill", "SKILL.md");
+    await fs.appendFile(liveSkillFile, "\nOperator edit after preparation.\n");
+    await expect(
+      reviewTool.execute("stale-prepared-patch", {
+        action: "patch",
+        skill_name: "big-skill",
+        old_string: oldString,
+        new_string: "Run the current deployment preflight.",
+      }),
+    ).rejects.toThrow("changed since the patch was prepared");
+    expect(proposalMutationBudget.remaining).toBe(1);
   });
 
   it("does not refund the review mutation budget after a failed mutation", async () => {

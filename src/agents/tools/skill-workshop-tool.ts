@@ -49,6 +49,7 @@ import { buildSkillWorkshopToolDescription } from "./skill-workshop-tool-descrip
 import {
   actionResult,
   beginProposalReviewMutation,
+  bindProposalRevisionConstraint,
   completeProposalReview,
   proposalMutationText,
   proposalResult,
@@ -60,6 +61,11 @@ import {
   readSupportFilesParam,
   skillWorkshopAgentEventActor,
 } from "./skill-workshop-tool-helpers.js";
+import {
+  executePrepareSkillPatch,
+  readSkillPatchText,
+  redeemPreparedSkillPatch,
+} from "./skill-workshop-tool-patch.js";
 import {
   formatProposalEvaluation,
   formatProposalInspect,
@@ -80,57 +86,6 @@ function requireProposalContent(content: string | undefined): string {
     throw new ToolInputError("proposal_content required");
   }
   return content;
-}
-
-function readSkillPatchText(params: Record<string, unknown>) {
-  return {
-    oldString:
-      readToolStringParam(params, "old_string", { label: "old_string", trim: false }) ?? "",
-    newString: readToolStringParam(params, "new_string", {
-      required: true,
-      label: "new_string",
-      trim: false,
-    }),
-  };
-}
-
-function bindProposalRevisionConstraint(
-  params: Record<string, unknown>,
-  action: string,
-  constraint: SkillWorkshopProposalRevisionConstraint | undefined,
-): Record<string, unknown> {
-  if (!constraint) {
-    return params;
-  }
-  if (!constraint.proposalId.trim()) {
-    throw new ToolInputError("operator-reviewed proposal_id required");
-  }
-  if (!constraint.expectedRevisionHash.trim()) {
-    throw new ToolInputError("operator-reviewed expected_revision_hash required");
-  }
-  if (action !== "inspect" && action !== "revise") {
-    throw new ToolInputError(
-      "this operator-requested Skill Workshop turn can only inspect or revise its reviewed proposal",
-    );
-  }
-  const proposalId = readToolStringParam(params, "proposal_id", { label: "proposal_id" });
-  if (proposalId && proposalId !== constraint.proposalId) {
-    throw new ToolInputError("proposal_id conflicts with the operator-reviewed proposal");
-  }
-  if (readToolStringParam(params, "name")) {
-    throw new ToolInputError("name cannot replace the operator-reviewed proposal_id");
-  }
-  const expectedRevisionHash = readToolStringParam(params, "expected_revision_hash");
-  if (expectedRevisionHash && expectedRevisionHash !== constraint.expectedRevisionHash) {
-    throw new ToolInputError(
-      "expected_revision_hash conflicts with the operator-reviewed proposal revision",
-    );
-  }
-  return {
-    ...params,
-    proposal_id: constraint.proposalId,
-    expected_revision_hash: constraint.expectedRevisionHash,
-  };
 }
 
 type SkillWorkshopToolOptions = {
@@ -165,12 +120,14 @@ export function createSkillWorkshopTool(options: SkillWorkshopToolOptions): AnyA
     options.collectionReconcile?.readSkillHashes ??
     options.proposalMutationBudget?.readSkillHashes ??
     new Map<string, string>();
+  const preparedSkillPatches = options.proposalMutationBudget?.preparedSkillPatches ?? new Map();
   if (options.collectionReconcile) {
     options.collectionReconcile.readSkillHashes = readSkillHashes;
     options.collectionReconcile.readSkillTreeHashes ??= new Map();
   }
   if (options.proposalMutationBudget) {
     options.proposalMutationBudget.readSkillHashes = readSkillHashes;
+    options.proposalMutationBudget.preparedSkillPatches = preparedSkillPatches;
   }
   return {
     label: "Skill Workshop",
@@ -277,7 +234,7 @@ export function createSkillWorkshopTool(options: SkillWorkshopToolOptions): AnyA
                 "Content omitted: the complete skill exceeds the selected-model read budget.",
                 options.collectionReconcile
                   ? "Next: select a larger-context model or use operator/CLI access; this collection cannot be reconciled without a complete read."
-                  : "Next: use operator/CLI access for the complete skill; autonomous patch/update requires a complete model read.",
+                  : "Next: call action=prepare_patch with a non-empty exact old_string for a targeted patch, or use operator/CLI access for the complete skill. Full updates require a complete model read.",
               ].join("\n"),
               readMaxChars,
             )
@@ -286,6 +243,24 @@ export function createSkillWorkshopTool(options: SkillWorkshopToolOptions): AnyA
           content: [{ type: "text", text }],
           details: { skillKey: skill.skillKey, sizeBytes, contentIncluded: !truncated },
         };
+      }
+
+      if (action === "prepare_patch") {
+        if (
+          options.proposalOnly === true &&
+          !options.collectionReconcile &&
+          options.updateProposals !== true
+        ) {
+          throw new ToolInputError("this Skill Workshop session cannot prepare live skill patches");
+        }
+        return await executePrepareSkillPatch({
+          workspaceDir: options.workspaceDir,
+          config: options.config,
+          agentId: options.agentId,
+          toolParams: params,
+          preparedSkillPatches,
+          maxChars: projectionBudgets.artifactChars,
+        });
       }
 
       if (action === "reconcile") {
@@ -462,30 +437,45 @@ export function createSkillWorkshopTool(options: SkillWorkshopToolOptions): AnyA
         throw new ToolInputError("foreground skill repair is disabled by autonomous mode off");
       }
       let expectedCurrentContentHash: string | undefined;
+      const patchOldString = action === "patch" ? readSkillPatchText(params).oldString : undefined;
       const requiresRead = action === "patch" || (action === "update" && options.updateProposals);
       if (requiresRead) {
-        // The model must see the entire current skill before a targeted patch or
-        // autonomous rewrite. The service binds the proposal to that read.
+        // Full rewrites require a complete model read. A targeted patch may instead
+        // redeem one exact span prepared from the authoritative full skill.
         const target = await readWritableWorkspaceSkill(
           options.workspaceDir,
           readToolStringParam(params, "skill_name", { required: true, label: "skill_name" }),
           { config: options.config, agentId: options.agentId },
         );
         const readHash = readSkillHashes.get(target.skillKey);
-        if (!readHash) {
+        const contentHash = sha256Hex(target.content);
+        if (action === "patch" && readHash) {
+          preparedSkillPatches.delete(target.skillKey);
+        }
+        const preparedHash =
+          action === "patch" && !readHash
+            ? redeemPreparedSkillPatch({
+                skill: target,
+                oldString: patchOldString ?? "",
+                preparedSkillPatches,
+              })
+            : undefined;
+        if (!readHash && !preparedHash) {
           throw new ToolInputError(
             target.content.length > projectionBudgets.artifactChars
-              ? `skill "${target.skillKey}" exceeds the reviewer read budget and cannot be updated autonomously`
+              ? action === "patch"
+                ? `skill "${target.skillKey}" exceeds the reviewer read budget: call action=prepare_patch with the non-empty exact old_string before patching`
+                : `skill "${target.skillKey}" exceeds the reviewer read budget and cannot be updated autonomously`
               : `read the live skill first: call action=read with skill_name "${target.skillKey}", then ${action === "patch" ? "quote its current text in the patch" : "rewrite it from the returned content"}`,
           );
         }
-        if (readHash !== sha256Hex(target.content)) {
+        if (readHash && readHash !== contentHash) {
           readSkillHashes.delete(target.skillKey);
           throw new ToolInputError(
             `skill "${target.skillKey}" changed since it was read: call action=read again and redraft the ${action} from the current content`,
           );
         }
-        expectedCurrentContentHash = readHash;
+        expectedCurrentContentHash = readHash ?? preparedHash;
         if (action === "patch") {
           if (
             foregroundRepair &&

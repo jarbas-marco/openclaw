@@ -9,8 +9,48 @@ import type {
   SkillProposalStatus,
   SkillProposalSupportFileInput,
   SkillWorkshopProposalReviewCompletion,
+  SkillWorkshopProposalRevisionConstraint,
 } from "../../skills/workshop/types.js";
 import { readPositiveIntegerParam, readToolStringParam, ToolInputError } from "./common.js";
+
+export function bindProposalRevisionConstraint(
+  params: Record<string, unknown>,
+  action: string,
+  constraint: SkillWorkshopProposalRevisionConstraint | undefined,
+): Record<string, unknown> {
+  if (!constraint) {
+    return params;
+  }
+  if (!constraint.proposalId.trim()) {
+    throw new ToolInputError("operator-reviewed proposal_id required");
+  }
+  if (!constraint.expectedRevisionHash.trim()) {
+    throw new ToolInputError("operator-reviewed expected_revision_hash required");
+  }
+  if (action !== "inspect" && action !== "revise") {
+    throw new ToolInputError(
+      "this operator-requested Skill Workshop turn can only inspect or revise its reviewed proposal",
+    );
+  }
+  const proposalId = readToolStringParam(params, "proposal_id", { label: "proposal_id" });
+  if (proposalId && proposalId !== constraint.proposalId) {
+    throw new ToolInputError("proposal_id conflicts with the operator-reviewed proposal");
+  }
+  if (readToolStringParam(params, "name")) {
+    throw new ToolInputError("name cannot replace the operator-reviewed proposal_id");
+  }
+  const expectedRevisionHash = readToolStringParam(params, "expected_revision_hash");
+  if (expectedRevisionHash && expectedRevisionHash !== constraint.expectedRevisionHash) {
+    throw new ToolInputError(
+      "expected_revision_hash conflicts with the operator-reviewed proposal revision",
+    );
+  }
+  return {
+    ...params,
+    proposal_id: constraint.proposalId,
+    expected_revision_hash: constraint.expectedRevisionHash,
+  };
+}
 
 export function skillWorkshopAgentEventActor(agentId?: string) {
   return { type: "agent" as const, ...(agentId ? { id: agentId } : {}) };

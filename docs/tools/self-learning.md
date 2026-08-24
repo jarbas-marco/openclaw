@@ -23,7 +23,11 @@ approval. Choose `propose` to review every capture before it becomes active, or
 
 When the foreground agent discovers that a skill it used is wrong or incomplete,
 it reads the current live skill and drafts a targeted patch through Skill
-Workshop in the same turn. A runtime usage receipt prevents foreground repair of
+Workshop in the same turn. If the complete skill does not fit the selected
+model's read budget, `prepare_patch` can authorize one non-empty unique exact
+span and return bounded surrounding context. The next `patch` must quote that
+same span, and the authorization expires after one attempt or any target change.
+A runtime usage receipt prevents foreground repair of
 skills that the run did not use. Autonomous mode controls the outcome: `off`
 disables the repair, `propose` leaves it pending for explicit review and apply,
 and `auto` scans and applies it immediately. The repair still goes through
@@ -153,8 +157,9 @@ Every learned skill receives these controls:
   system, and extra-root skills, remain read-only.
 - **Hash binding:** update proposals bind to the current live skill and go stale
   if that target changes before apply.
-- **Read before update:** the reviewer must read the complete current skill
-  before either a targeted patch or a full-body rewrite.
+- **Bounded patch authority:** full-body rewrites require a complete current
+  skill read. A targeted patch may instead use one exact span prepared from the
+  authoritative full skill; append patches still require a complete read.
 - **Rollback metadata:** apply records the prior skill and support-file contents
   before the live write.
 - **Collection review:** once a day in `auto` mode, an isolated model session
