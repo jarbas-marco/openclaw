@@ -774,7 +774,7 @@ describe("Crabbox worker provider", () => {
   it("preserves the allocated lease and both failures when setup cleanup times out", async () => {
     let releaseCommitted = false;
     const provider = providerWithRunner(async (argv) => {
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "run") {
@@ -920,7 +920,7 @@ describe("Crabbox worker provider", () => {
         }
         return commandResult();
       }
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "stop") {
@@ -1304,7 +1304,7 @@ describe("Crabbox worker provider", () => {
       if (argv[1] === "config" && argv[2] === "show") {
         return commandResult({ stdout: JSON.stringify(config) });
       }
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "run" && String(options.input).includes("openclaw-worker-browser")) {
@@ -1420,7 +1420,7 @@ describe("Crabbox worker provider", () => {
     const pairingSecret = "pairing-secret-value-0123456789";
     const provider = providerWithRunner(async (argv, options) => {
       calls.push({ argv, options });
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "run" && String(options.input).includes("node.log tail:")) {
@@ -1493,7 +1493,7 @@ describe("Crabbox worker provider", () => {
     const calls: string[][] = [];
     const provider = providerWithRunner(async (argv, options) => {
       calls.push(argv);
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "run" && String(options.input).includes("node.log tail:")) {
@@ -1528,7 +1528,7 @@ describe("Crabbox worker provider", () => {
     },
   ])("bounds enrollment evidence for $name", async ({ output, expected }) => {
     const provider = providerWithRunner(async (argv, options) => {
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "run" && String(options.input).includes("node.log tail:")) {
@@ -1630,6 +1630,7 @@ describe("Crabbox worker provider", () => {
           : commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       });
       const profile = { ...PROFILE, provider: providerId };
+      const readinessAction = providerId === "machine0" ? "status" : "inspect";
 
       await expect(provider.provision(profile, OPERATION_ID)).resolves.toMatchObject({
         leaseId: LEASE_ID,
@@ -1673,13 +1674,14 @@ describe("Crabbox worker provider", () => {
       });
       expect(calls[1]?.argv).toEqual([
         SIBLING_BINARY,
-        "inspect",
+        readinessAction,
         "--provider",
         providerId,
         "--network",
         "public",
         "--id",
         LEASE_ID,
+        ...(providerId === "machine0" ? ["--wait", "--wait-timeout", "4m"] : []),
         "--json",
       ]);
       expect(calls[1]?.options.timeoutMs).toBe(lifecycleTimeoutMs);
@@ -1710,7 +1712,7 @@ describe("Crabbox worker provider", () => {
         expect.arrayContaining(["--allow-env", "CRABBOX_WORKER_SETUP_CODE"]),
       );
       expect(calls[2]?.argv.join(" ")).not.toContain("setup-code");
-      expect(calls[3]?.argv[1]).toBe("inspect");
+      expect(calls[3]?.argv[1]).toBe(readinessAction);
       expect(calls[3]?.options.timeoutMs).toBe(lifecycleTimeoutMs);
 
       const lease = lifecycleLease(LEASE_ID, profile);
@@ -1734,7 +1736,7 @@ describe("Crabbox worker provider", () => {
       const delays: number[] = [];
       const provider = providerWithRunner(
         async (argv) => {
-          if (argv[1] === "inspect") {
+          if (argv[1] === "inspect" || argv[1] === "status") {
             inspections += 1;
             return commandResult({
               stdout: inspectJson({ ready: inspections > 1, sshHostKey: HOST_KEY }),
@@ -1765,7 +1767,7 @@ describe("Crabbox worker provider", () => {
         elapsedMs = 30 * 60_000;
         return commandResult();
       }
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         inspectTimeouts.push(options.timeoutMs);
         if (inspectTimeouts.length <= 2) {
           elapsedMs += 4 * 60_000;
@@ -1793,7 +1795,7 @@ describe("Crabbox worker provider", () => {
     let cleanupTimeoutMs = 0;
     const now = vi.spyOn(Date, "now").mockImplementation(() => elapsedMs);
     const provider = providerWithRunner(async (argv, options) => {
-      if (argv[1] === "inspect") {
+      if (argv[1] === "inspect" || argv[1] === "status") {
         return commandResult({ stdout: inspectJson({ sshHostKey: HOST_KEY }) });
       }
       if (argv[1] === "stop") {
@@ -1947,7 +1949,7 @@ describe("Crabbox worker provider", () => {
           }
           return commandResult();
         }
-        if (argv[1] === "inspect") {
+        if (argv[1] === "inspect" || argv[1] === "status") {
           lifecycleTimeouts.push(options.timeoutMs);
           inspections += 1;
           return inspections === 1
@@ -1974,7 +1976,11 @@ describe("Crabbox worker provider", () => {
       expect(creates).toBe(1);
       expect(live.size).toBe(0);
       expect(lifecycleTimeouts).toEqual([lifecycleTimeoutMs, lifecycleTimeoutMs]);
-      expect(calls.map((argv) => argv[1])).toEqual(["warmup", "inspect", "stop"]);
+      expect(calls.map((argv) => argv[1])).toEqual([
+        "warmup",
+        providerId === "machine0" ? "status" : "inspect",
+        "stop",
+      ]);
       expect(calls.at(-1)).toEqual([
         SIBLING_BINARY,
         "stop",
