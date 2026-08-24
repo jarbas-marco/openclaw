@@ -50,13 +50,13 @@ import {
   resolveCrabboxLifecycleTimeoutMs,
   resolveCrabboxProvisionBaseTimeoutMs,
   resolveCrabboxProvisionCallTimeoutMs,
+  resolveCrabboxReadyPollIntervalMs,
   CRABBOX_MACHINE0_WARMUP_TIMEOUT_MS,
 } from "./crabbox-worker-timeouts.js";
 import { loadCrabboxWorkerWallpaperBase64 } from "./crabbox-worker-wallpaper.js";
 
 export { resolveOpenClawRoot } from "./crabbox-worker-profile.js";
 
-const READY_POLL_INTERVAL_MS = 2_000;
 const MAX_ERROR_DETAIL_CHARS = 512;
 const NODE_ENROLLMENT_DIAGNOSTIC_TIMEOUT_MS = 60_000;
 const MAX_NODE_ENROLLMENT_EVIDENCE_BYTES = 2_048;
@@ -225,7 +225,7 @@ async function waitForProvisionReady(
     assertProvisionSecurityPolicy({ inspect, provider: params.provider });
     while (inspect.ready !== true && !isUnusableProvisionState(inspect.state)) {
       const remaining = remainingProvisionTimeout(params.deadline, CRABBOX_LIFECYCLE_TIMEOUT_MS);
-      await params.sleep(Math.min(READY_POLL_INTERVAL_MS, remaining));
+      await params.sleep(Math.min(resolveCrabboxReadyPollIntervalMs(params.provider), remaining));
       inspect = await inspectAgain();
       assertProvisionSecurityPolicy({ inspect, provider: params.provider });
     }
