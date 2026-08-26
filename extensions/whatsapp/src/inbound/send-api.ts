@@ -70,6 +70,7 @@ export function createWebSendApi(params: {
   // proactive sends to LID-addressed contacts reach the recipient instead of
   // ending up in a sender-only ghost chat (#67378). Defaults to PN-only.
   authDir?: string;
+  waitForMessageAck?: (message: WAMessage | undefined) => Promise<void>;
 }) {
   const resolveOutboundJid = (recipient: string): string =>
     params.authDir
@@ -82,13 +83,24 @@ export function createWebSendApi(params: {
     params.resolveOutboundMentions
       ? await params.resolveOutboundMentions({ jid, text })
       : { text, mentionedJids: [] };
+  const sendMessage = async (
+    jid: string,
+    content: AnyMessageContent,
+    options?: MiscMessageGenerationOptions,
+  ): Promise<WAMessage | undefined> => {
+    const result = options
+      ? await params.sock.sendMessage(jid, content, options)
+      : await params.sock.sendMessage(jid, content);
+    await params.waitForMessageAck?.(result);
+    return result;
+  };
   const sendStructuredMessage = async (
     to: string,
     content: AnyMessageContent,
     kind: WhatsAppSendKind,
   ): Promise<WhatsAppSendResult> => {
     const jid = resolveOutboundJid(to);
-    const result = await params.sock.sendMessage(jid, content);
+    const result = await sendMessage(jid, content);
     recordWhatsAppOutbound(params.defaultAccountId);
     return normalizeWhatsAppSendResult(result, kind);
   };
@@ -165,8 +177,8 @@ export function createWebSendApi(params: {
         messageText: sendOptions?.quotedMessageKey?.messageText,
       });
       const result = quotedOpts
-        ? await params.sock.sendMessage(jid, payload, quotedOpts)
-        : await params.sock.sendMessage(jid, payload);
+        ? await sendMessage(jid, payload, quotedOpts)
+        : await sendMessage(jid, payload);
       const results = [normalizeWhatsAppSendResult(result, mediaBuffer ? "media" : "text")];
       if (shouldSendAudioText) {
         const resolvedAudioText = await resolveMentions(jid, text);
@@ -175,8 +187,8 @@ export function createWebSendApi(params: {
           resolvedAudioText.mentionedJids,
         );
         const textResult = quotedOpts
-          ? await params.sock.sendMessage(jid, textPayload, quotedOpts)
-          : await params.sock.sendMessage(jid, textPayload);
+          ? await sendMessage(jid, textPayload, quotedOpts)
+          : await sendMessage(jid, textPayload);
         results.push(normalizeWhatsAppSendResult(textResult, "text"));
       }
       const accountId = sendOptions?.accountId ?? params.defaultAccountId;
@@ -260,7 +272,7 @@ export function createWebSendApi(params: {
       // Resolve DM targets through the same LID-aware path as normal sends so
       // reactions land on the delivered WhatsApp message key.
       const jid = resolveOutboundJid(chatJid);
-      const result = await params.sock.sendMessage(jid, {
+      const result = await sendMessage(jid, {
         react: {
           text: emoji,
           key: {

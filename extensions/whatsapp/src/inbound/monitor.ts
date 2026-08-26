@@ -1,13 +1,15 @@
 // Whatsapp plugin module implements monitor behavior.
-import type {
-  AnyMessageContent,
-  MiscMessageGenerationOptions,
-  proto,
-  GroupMetadata,
-  ReachoutTimelockState,
-  WAMessage,
-  WAMessageKey,
-  WASocket,
+import {
+  WAMessageStatus,
+  type WAMessageUpdate,
+  type AnyMessageContent,
+  type MiscMessageGenerationOptions,
+  type proto,
+  type GroupMetadata,
+  type ReachoutTimelockState,
+  type WAMessage,
+  type WAMessageKey,
+  type WASocket,
 } from "baileys";
 import { recordChannelActivity } from "openclaw/plugin-sdk/channel-activity-runtime";
 import {
@@ -84,12 +86,14 @@ import {
   extractText,
   hasInboundUserContent,
 } from "./extract.js";
+import { createCachedGroupMetadataResolver } from "./group-metadata-resolver.js";
 import { attachEmitterListener, closeInboundMonitorSocket } from "./lifecycle.js";
 import { downloadInboundMedia, downloadQuotedInboundMedia } from "./media.js";
 import {
   normalizeWebInboundMessage,
   withDeprecatedWebInboundMessageFlatAliases,
 } from "./message-aliases.js";
+import { createWhatsAppOutboundAckTracker } from "./outbound-ack.js";
 import {
   addWhatsAppOutboundMentionsToContent,
   mayContainWhatsAppOutboundMention,
@@ -111,6 +115,7 @@ const RECONNECT_IN_PROGRESS_ERROR = "no active socket - reconnection in progress
 const GROUP_META_TTL_MS = 5 * 60 * 1000;
 const BAILEYS_MESSAGE_TTL_MS = 10 * 60 * 1000;
 const INBOUND_CLOSE_DRAIN_TIMEOUT_MS = 5_000;
+const OUTBOUND_SERVER_ACK_TIMEOUT_MS = 3_000;
 const REPLY_SESSION_INIT_CONFLICT_MESSAGE_RE = /reply session initialization conflicted for \S+/u;
 export const WHATSAPP_GROUP_METADATA_CACHE_MAX_ENTRIES = 500;
 
@@ -1662,6 +1667,9 @@ export async function attachWebInboxToSocket(
       event,
       listener,
     );
+  const outboundAckTracker = createWhatsAppOutboundAckTracker({
+    timeoutMs: OUTBOUND_SERVER_ACK_TIMEOUT_MS,
+  });
   const detachMessagesUpsert = attachSockListener(
     "messages.upsert",
     handleMessagesUpsertEvent as unknown as (...args: unknown[]) => void,
@@ -1727,6 +1735,27 @@ export async function attachWebInboxToSocket(
   }) => {
     forgetFullGroupMetadata(update.id);
   }) as unknown as (...args: unknown[]) => void);
+  const detachMessagesUpdate = attachSockListener("messages.update", ((
+    updates: WAMessageUpdate[],
+  ) => {
+    for (const { key, update } of updates) {
+      if (update.status !== WAMessageStatus.ERROR || !key.id) {
+        continue;
+      }
+      if (key.remoteJid && isJidGroup(key.remoteJid)) {
+        forgetFullGroupMetadata(key.remoteJid);
+      }
+      inboundLogger.warn(
+        {
+          messageId: key.id,
+          jid: key.remoteJid,
+          providerCode: update.messageStubParameters?.[0],
+        },
+        "WhatsApp rejected outbound message after relay submission",
+      );
+    }
+    outboundAckTracker.observe(updates);
+  }) as unknown as (...args: unknown[]) => void);
 
   const replayTask = replayPendingDurableInboundMessages().catch((err: unknown) => {
     inboundLogger.error({ error: String(err) }, "failed replaying durable WhatsApp inbound");
@@ -1786,6 +1815,7 @@ export async function attachWebInboxToSocket(
     defaultAccountId: options.accountId,
     resolveOutboundMentions: ({ jid, text }) => resolveOutboundMentionsForGroup(jid, text),
     authDir: options.authDir,
+    waitForMessageAck: outboundAckTracker.waitForServerAck,
   });
 
   return {
@@ -1796,6 +1826,8 @@ export async function attachWebInboxToSocket(
         detachGroupsUpsert();
         detachGroupsUpdate();
         detachGroupParticipantsUpdate();
+        detachMessagesUpdate();
+        outboundAckTracker.close();
         await drainInboundBeforeSocketCloseWithTimeout();
       } catch (err) {
         logWhatsAppVerbose(options.verbose, `Inbound close drain failed: ${String(err)}`);
@@ -1824,6 +1856,13 @@ export async function monitorWebInbox(options: MonitorWebInboxOptions) {
   const baileysGroupMetaCache: WhatsAppBaileysGroupMetadataCache =
     options.baileysGroupMetaCache ?? new Map();
 
+  const initialSocketRef: { current?: WASocket } = {};
+  const cachedGroupMetadata = createCachedGroupMetadataResolver({
+    getSocket: () => initialSocketRef.current,
+    read: (jid) => readWhatsAppBaileysCacheEntry(baileysGroupMetaCache, jid),
+    remember: (jid, metadata) =>
+      rememberWhatsAppBaileysCacheEntry(baileysGroupMetaCache, jid, metadata, GROUP_META_TTL_MS),
+  });
   const sock = await createWaSocket(false, options.verbose, {
     authDir: options.authDir,
     ...socketTiming,
@@ -1831,11 +1870,9 @@ export async function monitorWebInbox(options: MonitorWebInboxOptions) {
       key.id && key.remoteJid
         ? readWhatsAppBaileysCacheEntry(recentMessageKeys, `${key.remoteJid}:${key.id}`)
         : undefined,
-    cachedGroupMetadata: async (jid: string) => {
-      const meta = readWhatsAppBaileysCacheEntry(baileysGroupMetaCache, jid);
-      return meta?.participants?.length ? meta : undefined;
-    },
+    cachedGroupMetadata,
   });
+  initialSocketRef.current = sock;
   try {
     await waitForWaConnection(sock, { timeoutMs: socketTiming.connectTimeoutMs });
   } catch (err) {

@@ -29,6 +29,7 @@ import {
 } from "../connection-controller.js";
 import { resolveWhatsAppInboundPolicy } from "../inbound-policy.js";
 import { WHATSAPP_INBOUND_DEDUPE_TTL_MS } from "../inbound/dedupe.js";
+import { createCachedGroupMetadataResolver } from "../inbound/group-metadata-resolver.js";
 import { normalizeWebInboundMessage } from "../inbound/message-aliases.js";
 import {
   attachWebInboxToSocket,
@@ -280,16 +281,29 @@ export async function monitorWebChannel(
 
       let connection;
       try {
+        const cachedGroupMetadata = createCachedGroupMetadataResolver({
+          getSocket: () => controller.socketRef.current ?? undefined,
+          read: (jid) => readWhatsAppBaileysCacheEntry(baileysGroupMetaCache, jid),
+          remember: (jid, metadata) => {
+            baileysGroupMetaCache.set(jid, {
+              expiresAt: Date.now() + 5 * 60 * 1000,
+              value: metadata,
+            });
+          },
+          onFetchError: (jid, error) => {
+            replyLogger.warn(
+              { jid, error: String(error) },
+              "failed fetching live WhatsApp group metadata after cache miss",
+            );
+          },
+        });
         connection = await controller.openConnection({
           connectionId,
           getMessage: async (key: WAMessageKey) =>
             key.id && key.remoteJid
               ? readWhatsAppBaileysCacheEntry(recentMessageKeys, `${key.remoteJid}:${key.id}`)
               : undefined,
-          cachedGroupMetadata: async (jid: string) => {
-            const meta = readWhatsAppBaileysCacheEntry(baileysGroupMetaCache, jid);
-            return meta?.participants?.length ? meta : undefined;
-          },
+          cachedGroupMetadata,
           createListener: async ({ sock, connection: connectionLocal }) => {
             const onMessage = createWebOnMessageHandler({
               cfg,

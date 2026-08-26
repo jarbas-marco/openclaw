@@ -227,6 +227,21 @@ describe("createWebSendApi", () => {
     });
   });
 
+  it("does not report activity or success when the provider later rejects the send", async () => {
+    const waitForMessageAck = vi.fn(async () => {
+      throw new Error("WhatsApp rejected message msg-1 (479)");
+    });
+    api = createWebSendApi({
+      sock: { sendMessage, sendPresenceUpdate },
+      defaultAccountId: "main",
+      waitForMessageAck,
+    });
+
+    await expect(api.sendMessage("+1555", "hello")).rejects.toThrow(/479/);
+    expect(waitForMessageAck).toHaveBeenCalledOnce();
+    expect(recordChannelActivity).not.toHaveBeenCalled();
+  });
+
   it("sends structured contact messages through the canonical send path", async () => {
     const res = await api.sendContact("+1555", {
       displayName: "QA Contact",
