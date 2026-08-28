@@ -733,7 +733,7 @@ describe("installSessionToolResultGuard", () => {
     expect(persisted[0]?.role).toBe("assistant");
   });
 
-  it("suppresses transcript-only assistant messages when requested", () => {
+  it("suppresses successful and timed-out transcript-only assistant messages when requested", () => {
     const sm = SessionManager.inMemory();
     installSessionToolResultGuard(sm, {
       suppressTranscriptOnlyAssistantPersistence: true,
@@ -743,14 +743,24 @@ describe("installSessionToolResultGuard", () => {
       asAppendMessage({
         role: "assistant",
         content: "private room-event note",
+        stopReason: "stop",
         timestamp: Date.now(),
       }),
     );
     sm.appendMessage(
       asAppendMessage({
         role: "assistant",
-        content: [{ type: "toolCall", id: "call_1", name: "message", arguments: {} }],
+        content: [],
+        stopReason: "aborted",
+        errorMessage: "Request timed out.",
         timestamp: Date.now() + 1,
+      }),
+    );
+    sm.appendMessage(
+      asAppendMessage({
+        role: "assistant",
+        content: [{ type: "toolCall", id: "call_1", name: "message", arguments: {} }],
+        timestamp: Date.now() + 2,
       }),
     );
 

@@ -130,6 +130,8 @@ export type AgentEventPayload = {
 /** Per-run metadata used to stamp events and gate Control UI visibility. */
 export type AgentRunContext = {
   sessionKey?: string;
+  /** Selects the subscriber bus for run events; audit events never reach session clients. */
+  eventAudience?: "shared" | "audit";
   /** Resolved agent owner, including for unscoped session keys. */
   agentId?: string;
   /** Owning run's sessionId; stamped onto lifecycle events (see AgentEventPayload.sessionId). */
@@ -244,6 +246,9 @@ export function registerAgentRunContext(runId: string, context: AgentRunContext)
   }
   if (context.sessionKey && existing.sessionKey !== context.sessionKey) {
     existing.sessionKey = context.sessionKey;
+  }
+  if (context.eventAudience && existing.eventAudience !== context.eventAudience) {
+    existing.eventAudience = context.eventAudience;
   }
   if (context.sessionId && existing.sessionId !== context.sessionId) {
     existing.sessionId = context.sessionId;
@@ -485,9 +490,11 @@ function enrichAgentEvent(
 
 /** Emits an agent event after assigning per-run sequence, timestamp, and context metadata. */
 export function emitAgentEvent(event: Omit<AgentEventPayload, "seq" | "ts">) {
+  const state = getAgentEventState();
+  const eventAudience = state.runContextById.get(event.runId)?.eventAudience ?? "shared";
   const enriched = enrichAgentEvent(event);
   if (enriched) {
-    notifyListeners(getAgentEventState().listeners, enriched);
+    notifyListeners(eventAudience === "audit" ? state.auditListeners : state.listeners, enriched);
   }
 }
 

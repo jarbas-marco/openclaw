@@ -110,6 +110,36 @@ describe("agent-events sequencing", () => {
     });
   });
 
+  test("routes events from an audit-only run context away from the shared bus", () => {
+    const shared: AgentEventPayload[] = [];
+    const audit: AgentEventPayload[] = [];
+    const stopShared = onAgentEvent((event) => shared.push(event));
+    const stopAudit = onAgentAuditEvent((event) => audit.push(event));
+    registerAgentRunContext("model-run", {
+      sessionKey: "agent:main:direct:source",
+      eventAudience: "audit",
+    });
+
+    emitAgentEvent({
+      runId: "model-run",
+      stream: "lifecycle",
+      data: { phase: "start" },
+    });
+    emitAgentEvent({
+      runId: "model-run",
+      stream: "lifecycle",
+      data: { phase: "end" },
+    });
+
+    stopShared();
+    stopAudit();
+    expect(shared).toEqual([]);
+    expect(audit.map((event) => [event.data.phase, event.seq])).toEqual([
+      ["start", 1],
+      ["end", 2],
+    ]);
+  });
+
   test("preserves sequence state when same-generation ownership is reclaimed", () => {
     const lifecycleGeneration = getAgentEventLifecycleGeneration();
     claimAgentRunContext("retry-run", {

@@ -2684,6 +2684,7 @@ describe("CLI attempt execution", () => {
       modelRun: true,
       promptMode: "none",
       disableTools: true,
+      suppressTranscriptOnlyAssistantPersistence: true,
     });
     expect(firstEmbeddedAgentArg().prompt).not.toContain("[Inter-session message]");
   });

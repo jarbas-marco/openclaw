@@ -2746,6 +2746,13 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     expect(state.removeInternalSessionEffectsTranscriptMock).toHaveBeenCalledWith(
       "/tmp/openclaw-internal-rotated.jsonl",
     );
+    expect(state.registerAgentRunContextMock).toHaveBeenCalledWith(
+      "model-run-success",
+      expect.objectContaining({
+        eventAudience: "audit",
+        isControlUiVisible: false,
+      }),
+    );
     const deliveryOrder = state.deliverAgentCommandResultMock.mock.invocationCallOrder[0] ?? 0;
     const trajectoryCleanupOrder =
       state.removeSessionTrajectoryArtifactsMock.mock.invocationCallOrder.at(-1) ?? 0;
@@ -2780,6 +2787,65 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
     );
     expect(state.removeInternalSessionEffectsTranscriptMock).toHaveBeenCalledWith(
       "/tmp/openclaw-internal-model-run-failure.jsonl",
+    );
+  });
+
+  it("keeps timed-out internal model runs audit-only and removes their artifacts", async () => {
+    setupSingleAttemptFallback();
+    state.prepareInternalSessionEffectsTranscriptMock.mockResolvedValueOnce(
+      "/tmp/openclaw-internal-model-run-timeout.jsonl",
+    );
+    const baseResult = makeSuccessResult("openai", "gpt-5.4");
+    state.runAgentAttemptMock.mockResolvedValueOnce({
+      ...baseResult,
+      payloads: [
+        { text: "LLM request failed.", isError: true },
+        { text: "Request timed out before a response was generated.", isError: true },
+      ],
+      meta: {
+        ...baseResult.meta,
+        aborted: true,
+        stopReason: "timeout",
+        timeoutPhase: "provider",
+      },
+    });
+
+    await agentCommand({
+      message: "probe",
+      to: "+1234567890",
+      runId: "model-run-timeout",
+      modelRun: true,
+      promptMode: "none",
+      sessionEffects: "internal",
+    });
+
+    expect(state.registerAgentRunContextMock).toHaveBeenCalledWith(
+      "model-run-timeout",
+      expect.objectContaining({
+        eventAudience: "audit",
+        isControlUiVisible: false,
+      }),
+    );
+    expect(
+      state.emitAgentEventMock.mock.calls.some(([event]) => {
+        const candidate = event as {
+          stream?: string;
+          data?: { phase?: string; stopReason?: string };
+        };
+        return (
+          candidate.stream === "lifecycle" &&
+          candidate.data?.phase === "end" &&
+          candidate.data.stopReason === "timeout"
+        );
+      }),
+    ).toBe(true);
+    expect(state.removeSessionTrajectoryArtifactsMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sessionFile: "/tmp/openclaw-internal-model-run-timeout.jsonl",
+      }),
+    );
+    expect(state.removeInternalSessionEffectsTranscriptMock).toHaveBeenCalledWith(
+      "/tmp/openclaw-internal-model-run-timeout.jsonl",
     );
   });
 

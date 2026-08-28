@@ -1338,6 +1338,7 @@ async function agentCommandInternal(
       if (sessionKey || suppressVisibleSessionEffects) {
         registerAgentRunContext(runId, {
           ...(sessionKey ? { sessionKey, sessionId } : {}),
+          ...(initialOpts.modelRun === true ? { eventAudience: "audit" as const } : {}),
           agentId: sessionAgentId,
           lifecycleGeneration,
           verboseLevel: resolvedVerboseLevel,
