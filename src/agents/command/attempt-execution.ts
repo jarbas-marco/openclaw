@@ -126,6 +126,7 @@ type PersistTextTurnTranscriptParams = {
   finalText: string;
   sessionId: string;
   sessionKey: string;
+  sessionFile?: string;
   sessionEntry: SessionEntry | undefined;
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
@@ -366,6 +367,7 @@ async function persistTextTurnTranscript(
     {
       sessionId: params.sessionId,
       sessionKey: params.sessionKey,
+      sessionFile: params.sessionFile,
       sessionEntry: params.sessionEntry,
       sessionStore: params.sessionStore,
       storePath: params.storePath,
@@ -412,6 +414,7 @@ export async function persistAcpTurnTranscript(params: {
   finalText: string;
   sessionId: string;
   sessionKey: string;
+  sessionFile?: string;
   sessionEntry: SessionEntry | undefined;
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
@@ -438,6 +441,7 @@ export async function persistCliTurnTranscript(params: {
   result: EmbeddedAgentRunResult;
   sessionId: string;
   sessionKey: string;
+  sessionFile?: string;
   sessionEntry: SessionEntry | undefined;
   sessionStore?: Record<string, SessionEntry>;
   storePath?: string;
@@ -461,6 +465,7 @@ export async function persistCliTurnTranscript(params: {
     finalText: replyText,
     sessionId: params.sessionId,
     sessionKey: params.sessionKey,
+    sessionFile: params.sessionFile,
     sessionEntry: params.sessionEntry,
     sessionStore: params.sessionStore,
     storePath: params.storePath,

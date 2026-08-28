@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions.js";
+import { resolveSessionTranscriptPath } from "../../config/sessions/paths.js";
 import { clearSessionStoreCacheForTest } from "../../config/sessions/store.js";
 import { appendSessionTranscriptMessage } from "../../config/sessions/transcript-append.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -277,7 +278,7 @@ describe("CLI attempt execution", () => {
   }
 
   beforeEach(async () => {
-    homeEnvSnapshot = captureEnv(["HOME"]);
+    homeEnvSnapshot = captureEnv(["HOME", "OPENCLAW_STATE_DIR"]);
     tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-cli-attempt-"));
     storePath = path.join(tmpDir, "sessions.json");
     runCliAgentMock.mockReset();
@@ -1328,6 +1329,59 @@ describe("CLI attempt execution", () => {
     expect(persisted[sessionKey]?.updatedAt).toBeLessThanOrEqual(nowCalls.at(-1) ?? 0);
     expect(sessionStore[sessionKey]?.updatedAt).toBe(persisted[sessionKey]?.updatedAt);
   });
+
+  it.each(["CLI", "ACP"] as const)(
+    "keeps an explicit internal %s transcript out of the visible session path",
+    async (runtime) => {
+      const sessionId = `session-explicit-internal-${runtime.toLowerCase()}`;
+      const sessionKey = `agent:main:direct:${sessionId}`;
+      setTestEnvValue("HOME", tmpDir);
+      setTestEnvValue("OPENCLAW_STATE_DIR", path.join(tmpDir, "state"));
+      const visibleSessionFile = resolveSessionTranscriptPath(sessionId, "main");
+      const internalSessionFile = path.join(tmpDir, "internal-agent-runs", `${sessionId}.jsonl`);
+      const sessionEntry: SessionEntry = {
+        sessionId,
+        sessionFile: visibleSessionFile,
+        updatedAt: Date.now(),
+      };
+      await fs.mkdir(path.dirname(internalSessionFile), { recursive: true });
+
+      if (runtime === "CLI") {
+        await persistCliTurnTranscript({
+          body: "internal prompt",
+          result: makeCliResult("internal reply"),
+          sessionId,
+          sessionKey,
+          sessionFile: internalSessionFile,
+          sessionEntry,
+          sessionAgentId: "main",
+          sessionCwd: tmpDir,
+          config: {},
+          embeddedAssistantGapFill: true,
+        });
+      } else {
+        await persistAcpTurnTranscript({
+          body: "internal prompt",
+          finalText: "internal reply",
+          sessionId,
+          sessionKey,
+          sessionFile: internalSessionFile,
+          sessionEntry,
+          sessionAgentId: "main",
+          sessionCwd: tmpDir,
+          config: {},
+        });
+      }
+
+      expect(await readSessionMessages(internalSessionFile)).toContainEqual(
+        expect.objectContaining({
+          role: "assistant",
+          content: [{ type: "text", text: "internal reply" }],
+        }),
+      );
+      await expect(fs.stat(visibleSessionFile)).rejects.toMatchObject({ code: "ENOENT" });
+    },
+  );
 
   it("mirrors only the CLI reply when the shared recorder already persisted the user turn", async () => {
     const sessionKey = "agent:main:direct:cli-recorder-owned-user";

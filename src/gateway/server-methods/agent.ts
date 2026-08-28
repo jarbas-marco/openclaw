@@ -48,10 +48,6 @@ import {
 } from "../../agents/identity-avatar.js";
 import { AGENT_INTERNAL_EVENT_TYPE_TASK_COMPLETION } from "../../agents/internal-event-contract.js";
 import type { AgentInternalEvent } from "../../agents/internal-events.js";
-import {
-  removeInternalSessionEffectsTranscript,
-  resolveInternalSessionEffectsTranscriptPath,
-} from "../../agents/internal-session-effects.js";
 import { resolveProviderIdForAuth } from "../../agents/provider-auth-aliases.js";
 import {
   AGENT_RUN_RESTART_ABORT_STOP_REASON,
@@ -985,7 +981,6 @@ function dispatchAgentRunFromGateway(params: {
   respond: GatewayRequestHandlerOptions["respond"];
   context: GatewayRequestHandlerOptions["context"];
   taskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent">;
-  cleanupInternalTranscript?: boolean;
 }) {
   const shouldTrackTask = params.taskTrackingMode === "cli";
   let taskTracked = false;
@@ -1094,11 +1089,6 @@ function dispatchAgentRunFromGateway(params: {
     .finally(() => {
       clearAgentRunContext(params.runId, params.ingressOpts.lifecycleGeneration);
       params.cleanupAbortController();
-      if (params.cleanupInternalTranscript) {
-        void removeInternalSessionEffectsTranscript(
-          resolveInternalSessionEffectsTranscriptPath(params.runId),
-        );
-      }
     });
 }
 
@@ -1207,7 +1197,8 @@ export const agentHandlers: GatewayRequestHandlers = {
     const requestedModelOverride = Boolean(request.provider || request.model);
     const requestedInternalSessionEffects = request.sessionEffects === "internal";
     const requestedPromptPersistenceSuppression = request.suppressPromptPersistence === true;
-    const isRawModelRun = request.modelRun === true || request.promptMode === "none";
+    const isOneShotModelRun = request.modelRun === true;
+    const isRawModelRun = isOneShotModelRun || request.promptMode === "none";
     if (requestedModelOverride && !allowModelOverride) {
       respond(
         false,
@@ -1264,7 +1255,10 @@ export const agentHandlers: GatewayRequestHandlers = {
     const preserveUserFacingSessionModelState =
       canUseInternalRuntimeHandoff &&
       shouldPreserveUserFacingSessionStateForInputProvenance(inputProvenance);
-    const sessionEffects = requestedInternalSessionEffects ? "internal" : request.sessionEffects;
+    // `modelRun` is the stateless probe contract. Keep its effects private
+    // without granting public callers backend-only handoff controls.
+    const sessionEffects =
+      isOneShotModelRun || requestedInternalSessionEffects ? "internal" : request.sessionEffects;
     const suppressVisibleSessionEffects = sessionEffects === "internal";
     const agentDedupeKeys = resolveAgentDedupeKeys({
       idempotencyKey: idem,
@@ -3157,7 +3151,7 @@ export const agentHandlers: GatewayRequestHandlers = {
         sessionKey: resolvedSessionKey,
         inputProvenance,
         confirmedAcpManualSpawn,
-        modelRun: isRawModelRun,
+        modelRun: isOneShotModelRun,
       });
       let dispatchTaskTrackingMode: Exclude<GatewayAgentTaskTrackingMode, "plugin_subagent"> =
         taskTrackingMode === "cli" ? "cli" : "none";
@@ -3247,7 +3241,7 @@ export const agentHandlers: GatewayRequestHandlers = {
             return;
           }
 
-          if (resolvedSessionKey) {
+          if (!isOneShotModelRun && resolvedSessionKey) {
             await reactivateCompletedSubagentSession({
               sessionKey: resolvedSessionKey,
               runId,
@@ -3255,14 +3249,19 @@ export const agentHandlers: GatewayRequestHandlers = {
             });
           }
 
-          if (requestedSessionKey && resolvedSessionKey && isNewSession) {
+          if (
+            !suppressVisibleSessionEffects &&
+            requestedSessionKey &&
+            resolvedSessionKey &&
+            isNewSession
+          ) {
             emitSessionsChanged(context, {
               sessionKey: resolvedSessionKey,
               ...(resolvedSessionKey === "global" ? { agentId: activeSessionAgentId } : {}),
               reason: "create",
             });
           }
-          if (resolvedSessionKey) {
+          if (!suppressVisibleSessionEffects && resolvedSessionKey) {
             emitSessionsChanged(context, {
               sessionKey: resolvedSessionKey,
               ...(resolvedSessionKey === "global" ? { agentId: activeSessionAgentId } : {}),
@@ -3403,7 +3402,6 @@ export const agentHandlers: GatewayRequestHandlers = {
             respond,
             context,
             taskTrackingMode: dispatchTaskTrackingMode,
-            cleanupInternalTranscript: isRawModelRun && suppressVisibleSessionEffects,
           });
           dispatched = true;
         } catch (err) {
