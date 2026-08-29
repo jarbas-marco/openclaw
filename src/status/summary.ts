@@ -24,6 +24,7 @@ import {
 } from "../config/sessions/types.js";
 import type { OpenClawConfig } from "../config/types.js";
 import { listGatewayAgentsBasic } from "../gateway/agent-list.js";
+import { buildDeliveryQueueHealthSummary } from "../gateway/health/delivery-queue.js";
 import { resolveHeartbeatSessionKey } from "../infra/heartbeat-runner-session.js";
 import { resolveHeartbeatSummaryForAgent } from "../infra/heartbeat-summary.js";
 import { hasResolvableHeartbeatOwnerRoute } from "../infra/outbound/targets.js";
@@ -581,6 +582,7 @@ export async function getStatusSummary(
     selectRecentSessionCandidates(allSessions, RECENT_SESSION_LIMIT),
   );
   const totalSessions = allSessions.length;
+  const deliveryQueues = buildDeliveryQueueHealthSummary();
   const hostDesktopStatus =
     options.hostDesktopStatus ??
     (
@@ -589,6 +591,8 @@ export async function getStatusSummary(
       ).inspectHostDesktop({ config: cfg.desktop?.host })
     ).status;
   const summary: StatusSummary = {
+    ok: deliveryQueues === undefined,
+    ...(deliveryQueues ? { deliveryQueues } : {}),
     runtimeVersion: resolveRuntimeServiceVersion(process.env),
     hostDesktop: hostDesktopStatus,
     linkChannel: linkContext

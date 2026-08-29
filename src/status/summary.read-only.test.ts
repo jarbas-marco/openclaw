@@ -14,6 +14,7 @@ import {
   createOutboundTestPlugin,
   createTestRegistry,
 } from "../test-utils/channel-plugins.js";
+import { createOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import { getStatusSummary } from "./summary.js";
 
 describe("getStatusSummary read-only session access", () => {
@@ -131,6 +132,56 @@ describe("getStatusSummary read-only session access", () => {
     } finally {
       closeOpenClawAgentDatabasesForTest();
       closeOpenClawStateDatabaseForTest();
+    }
+  });
+
+  it("projects sanitized delivery dead letters and marks status degraded", async () => {
+    const openClawState = await createOpenClawTestState({
+      layout: "state-only",
+      prefix: "openclaw-status-queue-health-",
+    });
+    try {
+      const { moveDeliveryQueueEntryToFailed, upsertDeliveryQueueEntry } =
+        await import("../infra/delivery-queue-sqlite.js");
+      upsertDeliveryQueueEntry({
+        queueName: "outbound",
+        entry: {
+          id: "private-outbound-id",
+          enqueuedAt: 1_000,
+          retryCount: 5,
+          retainOnFailure: true,
+        },
+      });
+      moveDeliveryQueueEntryToFailed("outbound", "private-outbound-id");
+
+      const { createChannelIngressQueue } = await import("../channels/message/ingress-queue.js");
+      const ingressQueue = createChannelIngressQueue<{ text: string }>({
+        channelId: "telegram",
+        accountId: "ops",
+      });
+      await ingressQueue.enqueue("private-inbound-id", { text: "private payload" });
+      const claim = await ingressQueue.claim("private-inbound-id", {
+        ownerId: "private-owner",
+      });
+      if (!claim) {
+        throw new Error("Expected an inbound claim");
+      }
+      await ingressQueue.fail(claim, { reason: "private failure", failedAt: 50_000 });
+
+      const summary = await getStatusSummary({ includeChannelSummary: false });
+
+      expect(summary.ok).toBe(false);
+      expect(summary.deliveryQueues).toEqual({
+        failed: [{ queueName: "outbound", count: 1, oldestFailedAt: expect.any(Number) }],
+        ingressFailed: [
+          { channelId: "telegram", accountId: "ops", count: 1, oldestFailedAt: 50_000 },
+        ],
+      });
+      expect(JSON.stringify(summary.deliveryQueues)).not.toMatch(
+        /private-outbound-id|private-inbound-id|private payload|private-owner|private failure/,
+      );
+    } finally {
+      await openClawState.cleanup();
     }
   });
 });

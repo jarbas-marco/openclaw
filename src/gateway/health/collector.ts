@@ -441,7 +441,7 @@ export async function collectGatewayHealthSnapshot(params: {
   const contextEngineHealth = buildContextEngineHealthSummary();
   const deliveryQueueHealth = buildDeliveryQueueHealthSummary();
   return {
-    ok: true,
+    ok: deliveryQueueHealth === undefined,
     ts: Date.now(),
     durationMs: Date.now() - start,
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),

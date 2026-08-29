@@ -3,6 +3,7 @@
 
 import type { FastMode } from "@openclaw/normalization-core/string-coerce";
 import type { ChannelId } from "../channels/plugins/types.public.js";
+import type { HealthSummary } from "../gateway/health/types.js";
 import type { SessionKind } from "../sessions/classify-session-kind.js";
 import type {
   RetainedLostTaskAuditSummary,
@@ -53,6 +54,8 @@ export type HeartbeatStatus = {
 
 /** Aggregate status summary before text or JSON formatting. */
 export type StatusSummary = {
+  ok: boolean;
+  deliveryQueues?: HealthSummary["deliveryQueues"];
   runtimeVersion?: string | null;
   hostDesktop?: import("../gateway/desktop/host-source.js").HostDesktopStatus;
   eventLoop?: import("../gateway/server/event-loop-health.js").GatewayEventLoopHealth;

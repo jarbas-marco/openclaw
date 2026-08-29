@@ -65,6 +65,7 @@ describe("SnapshotSchema", () => {
     const snapshot = {
       ...snapshotWithPresence({ ts: 1 }),
       health: {
+        ok: false,
         deliveryQueues: {
           failed: [],
           ingressFailed: [

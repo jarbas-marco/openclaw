@@ -49,6 +49,7 @@ describe("queue health collector", () => {
       const { moveDeliveryQueueEntryToFailed, upsertDeliveryQueueEntry } =
         await import("../../infra/delivery-queue-sqlite.js");
       const clean = await collectHealth();
+      expect(clean.ok).toBe(true);
       expect(clean.deliveryQueues).toBeUndefined();
 
       upsertDeliveryQueueEntry({
@@ -69,6 +70,7 @@ describe("queue health collector", () => {
       await ingressQueue.fail(claim, { reason: "handler-error", failedAt: 50_000 });
 
       const snap = await collectHealth();
+      expect(snap.ok).toBe(false);
       expect(snap.deliveryQueues).toEqual({
         failed: [{ queueName: "outbound", count: 1, oldestFailedAt: expect.any(Number) }],
         ingressFailed: [
@@ -145,6 +147,7 @@ describe("queue health collector", () => {
       }
 
       const snap = await collectHealth();
+      expect(snap.ok).toBe(false);
       expect(snap.deliveryQueues).toEqual({
         failed: [],
         ingressPressure: [

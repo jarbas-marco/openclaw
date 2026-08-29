@@ -26,6 +26,7 @@ function createRecentSessionRow(): SessionStatus {
 describe("redactSensitiveStatusSummary", () => {
   it("removes sensitive session and path details while preserving summary structure", () => {
     const input: StatusSummary = {
+      ok: true,
       runtimeVersion: "2026.3.8",
       heartbeat: {
         defaultAgentId: "main",
