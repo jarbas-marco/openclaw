@@ -46,6 +46,7 @@ export async function prepareEmbeddedSessionState(params: {
   if (params.sessionKey || params.suppressVisibleSessionEffects) {
     registerAgentRunContext(params.runId, {
       ...(params.sessionKey ? { sessionKey: params.sessionKey, sessionId: params.sessionId } : {}),
+      ...(params.opts.modelRun === true ? { eventAudience: "audit" as const } : {}),
       agentId: params.sessionAgentId,
       lifecycleGeneration: params.lifecycleGeneration,
       verboseLevel: resolvedVerboseLevel,

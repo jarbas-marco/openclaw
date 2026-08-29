@@ -317,11 +317,13 @@ function enrichAgentEvent(
 
 /** Emits an event only when its run ownership is still current. */
 export function emitAgentEventIfCurrent(event: Omit<AgentEventPayload, "seq" | "ts">): boolean {
+  const state = getAgentEventState();
+  const eventAudience = getAgentRunContext(event.runId)?.eventAudience ?? "shared";
   const enriched = enrichAgentEvent(event);
   if (!enriched) {
     return false;
   }
-  notifyListeners(getAgentEventState().listeners, enriched);
+  notifyListeners(eventAudience === "audit" ? state.auditListeners : state.listeners, enriched);
   return true;
 }
 
@@ -334,9 +336,11 @@ export function emitAgentEventForOwner(
   event: Omit<AgentEventPayload, "seq" | "ts">,
   claimId: string,
 ) {
+  const state = getAgentEventState();
+  const eventAudience = getAgentRunContext(event.runId)?.eventAudience ?? "shared";
   const enriched = enrichAgentEvent(event, claimId);
   if (enriched) {
-    notifyListeners(getAgentEventState().listeners, enriched);
+    notifyListeners(eventAudience === "audit" ? state.auditListeners : state.listeners, enriched);
   }
 }
 
