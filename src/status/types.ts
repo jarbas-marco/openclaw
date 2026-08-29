@@ -55,6 +55,7 @@ export type HeartbeatStatus = {
 /** Aggregate status summary before text or JSON formatting. */
 export type StatusSummary = {
   ok: boolean;
+  deliveryQueuesComplete?: boolean;
   deliveryQueues?: HealthSummary["deliveryQueues"];
   runtimeVersion?: string | null;
   hostDesktop?: import("../gateway/desktop/host-source.js").HostDesktopStatus;

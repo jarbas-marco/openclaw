@@ -111,23 +111,18 @@ function mergeCachedHealthRuntimeState(params: {
   eventLoop?: HealthSummary["eventLoop"];
   configReloadHotReloadStatus?: GatewayHotReloadStatus;
 }): HealthSummary {
-  const {
-    contextEngines: _cachedContextEngines,
-    deliveryQueues: _cachedDeliveryQueues,
-    ...cached
-  } = params.cached;
-  // Dead-letter counts are cheap live reads. Preserve the grouped pressure
-  // aggregate for the cache interval so routine health RPCs do not amplify it.
-  const deliveryQueues = buildDeliveryQueueHealthSummary(
-    _cachedDeliveryQueues?.ingressPressure ?? [],
-  );
+  const cached = { ...params.cached };
+  delete cached.contextEngines;
+  delete cached.deliveryQueues;
+  // All queue facts are cheap, redacted, read-only snapshots. Recompute them
+  // so a cached health response cannot conceal current ingress pressure.
+  const deliveryQueueHealth = buildDeliveryQueueHealthSummary();
   const contextEngines = buildContextEngineHealthSummary();
   return {
     ...cached,
-    ok: deliveryQueues === undefined,
+    ...deliveryQueueHealth,
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
     ...(contextEngines ? { contextEngines } : {}),
-    ...(deliveryQueues ? { deliveryQueues } : {}),
     ...(params.configReloadHotReloadStatus
       ? { configReload: { hotReloadStatus: params.configReloadHotReloadStatus } }
       : {}),

@@ -4,12 +4,23 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const countOutbound = vi.fn();
 const countIngressFailed = vi.fn();
 const countIngressPressure = vi.fn();
+const readOnlySnapshot = vi.fn();
+
+vi.mock("../../state/openclaw-state-db-readonly.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../state/openclaw-state-db-readonly.js")>();
+  return {
+    ...actual,
+    withExistingOpenClawStateDatabaseArtifactPreservingReadOnly: (
+      read: (database: never) => unknown,
+    ) => readOnlySnapshot(read),
+  };
+});
 
 vi.mock("../../infra/delivery-queue-sqlite.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../infra/delivery-queue-sqlite.js")>();
   return {
     ...actual,
-    countFailedDeliveryQueueEntries: () => countOutbound(),
+    countFailedDeliveryQueueEntriesInDatabase: () => countOutbound(),
   };
 });
 
@@ -18,8 +29,8 @@ vi.mock("../../channels/message/ingress-queue-health.js", async (importOriginal)
     await importOriginal<typeof import("../../channels/message/ingress-queue-health.js")>();
   return {
     ...actual,
-    countFailedChannelIngressQueueEntries: () => countIngressFailed(),
-    countChannelIngressQueuePressure: () => countIngressPressure(),
+    countFailedChannelIngressQueueEntriesInDatabase: () => countIngressFailed(),
+    countChannelIngressQueuePressureInDatabase: () => countIngressPressure(),
   };
 });
 
@@ -45,6 +56,7 @@ describe("buildDeliveryQueueHealthSummary", () => {
     countOutbound.mockReset().mockReturnValue([]);
     countIngressFailed.mockReset().mockReturnValue([]);
     countIngressPressure.mockReset().mockReturnValue([]);
+    readOnlySnapshot.mockReset().mockImplementation((read) => read({}));
   });
 
   it.each([
@@ -56,7 +68,11 @@ describe("buildDeliveryQueueHealthSummary", () => {
           throw new Error("ingress database unavailable");
         });
       },
-      expected: { failed: outboundFailed },
+      expected: {
+        ok: false,
+        deliveryQueuesComplete: false,
+        deliveryQueues: { failed: outboundFailed },
+      },
     },
     {
       name: "ingress failures when the outbound read fails",
@@ -66,7 +82,11 @@ describe("buildDeliveryQueueHealthSummary", () => {
         });
         countIngressFailed.mockReturnValue(ingressFailed);
       },
-      expected: { failed: [], ingressFailed },
+      expected: {
+        ok: false,
+        deliveryQueuesComplete: false,
+        deliveryQueues: { failed: [], ingressFailed },
+      },
     },
     {
       name: "dead letters when the ingress pressure read fails",
@@ -76,7 +96,11 @@ describe("buildDeliveryQueueHealthSummary", () => {
           throw new Error("ingress pressure read unavailable");
         });
       },
-      expected: { failed: [], ingressFailed },
+      expected: {
+        ok: false,
+        deliveryQueuesComplete: false,
+        deliveryQueues: { failed: [], ingressFailed },
+      },
     },
     {
       name: "ingress pressure when the dead-letter read fails",
@@ -86,18 +110,54 @@ describe("buildDeliveryQueueHealthSummary", () => {
         });
         countIngressPressure.mockReturnValue(ingressPressure);
       },
-      expected: { failed: [], ingressPressure },
+      expected: {
+        ok: false,
+        deliveryQueuesComplete: false,
+        deliveryQueues: { failed: [], ingressPressure },
+      },
     },
   ])("preserves $name", ({ arrange, expected }) => {
     arrange();
     expect(buildDeliveryQueueHealthSummary()).toEqual(expected);
   });
 
-  it("uses cached ingress pressure without rerunning its reader", () => {
-    expect(buildDeliveryQueueHealthSummary(ingressPressure)).toEqual({
-      failed: [],
-      ingressPressure,
+  it("marks the snapshot incomplete when all queue readers fail", () => {
+    countOutbound.mockImplementation(() => {
+      throw new Error("outbound database unavailable");
     });
-    expect(countIngressPressure).not.toHaveBeenCalled();
+    countIngressFailed.mockImplementation(() => {
+      throw new Error("ingress dead-letter database unavailable");
+    });
+    countIngressPressure.mockImplementation(() => {
+      throw new Error("ingress pressure database unavailable");
+    });
+
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: false, deliveryQueuesComplete: false });
+  });
+
+  it("recomputes ingress pressure instead of retaining a stale cached value", () => {
+    countIngressPressure.mockReturnValue(ingressPressure);
+    expect(buildDeliveryQueueHealthSummary()).toEqual({
+      ok: false,
+      deliveryQueuesComplete: true,
+      deliveryQueues: { failed: [], ingressPressure },
+    });
+    expect(countIngressPressure).toHaveBeenCalledOnce();
+  });
+
+  it("uses one existing read-only snapshot for all three queries", () => {
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: true, deliveryQueuesComplete: true });
+    expect(readOnlySnapshot).toHaveBeenCalledOnce();
+    expect(countOutbound).toHaveBeenCalledOnce();
+    expect(countIngressFailed).toHaveBeenCalledOnce();
+    expect(countIngressPressure).toHaveBeenCalledOnce();
+  });
+
+  it("marks queue health incomplete when snapshot preparation fails", () => {
+    readOnlySnapshot.mockImplementation(() => {
+      throw new Error("snapshot unavailable");
+    });
+
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: false, deliveryQueuesComplete: false });
   });
 });

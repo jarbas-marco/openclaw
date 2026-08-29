@@ -193,6 +193,9 @@ export function formatDeliveryQueueHealthLine(
   const ingressFailed = summary.deliveryQueues?.ingressFailed ?? [];
   const ingressPressure = summary.deliveryQueues?.ingressPressure ?? [];
   const warnings: string[] = [];
+  if (summary.deliveryQueuesComplete === false) {
+    warnings.push("queue status incomplete");
+  }
   const deadLetterCounts = [
     ...failed.map((queue) => `${queue.queueName}: ${queue.count}`),
     ...ingressFailed.map(

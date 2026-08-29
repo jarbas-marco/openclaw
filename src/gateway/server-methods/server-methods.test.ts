@@ -4939,7 +4939,7 @@ describe("gateway healthHandlers.health cache freshness", () => {
     }
   });
 
-  it("retains cached ingress pressure while merging live dead letters", async () => {
+  it("recomputes ingress pressure while merging live dead letters", async () => {
     const openClawState = await createOpenClawTestState({
       layout: "state-only",
       prefix: "openclaw-health-cached-dq-",
@@ -5002,7 +5002,17 @@ describe("gateway healthHandlers.health cache freshness", () => {
       expect(payload?.deliveryQueues?.ingressFailed).toEqual([
         { channelId: "telegram", accountId: "ops", count: 1, oldestFailedAt: 50_000 },
       ]);
-      expect(payload?.deliveryQueues?.ingressPressure).toEqual(cachedPressure);
+      expect(payload?.deliveryQueues?.ingressPressure).toEqual([
+        {
+          channelId: "telegram",
+          accountId: "ops",
+          laneCount: 1,
+          pendingCount: 2,
+          claimedCount: 0,
+          blockedCount: 1,
+          oldestReceivedAt: expect.any(Number),
+        },
+      ]);
       expect(mockCallArg(respond, 0, 3)).toEqual({ cached: true });
     } finally {
       await openClawState.cleanup();

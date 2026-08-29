@@ -441,13 +441,12 @@ export async function collectGatewayHealthSnapshot(params: {
   const contextEngineHealth = buildContextEngineHealthSummary();
   const deliveryQueueHealth = buildDeliveryQueueHealthSummary();
   return {
-    ok: deliveryQueueHealth === undefined,
+    ...deliveryQueueHealth,
     ts: Date.now(),
     durationMs: Date.now() - start,
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
     ...(pluginHealth ? { plugins: pluginHealth } : {}),
     ...(contextEngineHealth ? { contextEngines: contextEngineHealth } : {}),
-    ...(deliveryQueueHealth ? { deliveryQueues: deliveryQueueHealth } : {}),
     ...(params.configReloadHotReloadStatus
       ? { configReload: { hotReloadStatus: params.configReloadHotReloadStatus } }
       : {}),

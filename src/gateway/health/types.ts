@@ -35,6 +35,7 @@ export type PluginHealthSummary = Omit<ProtocolPlugin, "unavailable"> & {
 /** Full gateway health payload consumed by `openclaw health`. */
 export type HealthSummary = ProtocolHealth & {
   ok: boolean;
+  deliveryQueuesComplete?: boolean;
   ts: number;
   durationMs: number;
   plugins?: PluginHealthSummary;

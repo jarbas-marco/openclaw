@@ -338,16 +338,17 @@ export function reserveDeliveryQueueEntryAttempt(params: {
   );
 }
 
-/** Count dead-lettered entries per queue namespace for coarse health reporting. */
-export function countFailedDeliveryQueueEntries(stateDir?: string): Array<{
+/** Shared health query; callers own the read-only state lifecycle. */
+export function countFailedDeliveryQueueEntriesInDatabase(
+  database: OpenClawStateDatabase["db"],
+): Array<{
   queueName: string;
   count: number;
   oldestFailedAt?: number;
 }> {
-  const database = openStateDatabase(stateDir);
-  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database.db);
+  const queueDb = getNodeSqliteKysely<DeliveryQueueDatabase>(database);
   const rows = executeSqliteQuerySync(
-    database.db,
+    database,
     queueDb
       .selectFrom("delivery_queue_entries")
       .select((eb) => [
