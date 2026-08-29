@@ -1744,6 +1744,40 @@ describe("shared Codex app-server client", () => {
     expect(second.process.stdin.destroyed).toBe(true);
   });
 
+  it("rejects an in-flight acquire after its shared client is detached for cleanup", async () => {
+    const harness = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start").mockReturnValueOnce(harness.client);
+    let startedClient: CodexAppServerClient | undefined;
+    const pendingAcquire = getLeasedSharedCodexAppServerClient({
+      timeoutMs: 1_000,
+      onStartedClient: (client) => {
+        startedClient = client;
+      },
+    });
+    await vi.waitFor(() => expect(startedClient).toBe(harness.client));
+
+    const releaseCleanupLease = retainSharedCodexAppServerClientIfCurrent(startedClient);
+    expect(releaseCleanupLease).toBeTypeOf("function");
+    expect(retireSharedCodexAppServerClientIfCurrent(startedClient)).toEqual({
+      activeLeases: 1,
+      closed: false,
+    });
+    expect(harness.process.stdin.destroyed).toBe(false);
+
+    const rejectedAcquire = expect(pendingAcquire).rejects.toThrow(
+      "codex app-server client is closed",
+    );
+    await sendInitializeResult(harness, "openclaw/0.147.0 (Linux; test)");
+    await rejectedAcquire;
+    expect(harness.process.stdin.destroyed).toBe(false);
+
+    expect(
+      retireSharedCodexAppServerClientIfCurrent(startedClient, { failActiveLeases: true }),
+    ).toEqual({ activeLeases: 1, closed: true });
+    expect(harness.process.stdin.destroyed).toBe(true);
+    releaseCleanupLease?.();
+  });
+
   it("closes a retired shared app-server and forces active leases onto the retryable close path", async () => {
     const first = createClientHarness();
     const second = createClientHarness();

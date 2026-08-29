@@ -734,8 +734,11 @@ async function acquireSharedCodexAppServerClient(
       options?.abandonSignal,
       "codex app-server authentication timed out",
     );
-    if (entry.closeError) {
-      throw entry.closeError;
+    // Retirement removes the entry from future lookup, but an acquire that
+    // already captured it can still wake after startup. Never admit that stale
+    // waiter onto a client whose leases are draining or about to be failed.
+    if (entry.closeError || entry.closeWhenIdle) {
+      throw entry.closeError ?? new Error("codex app-server client is closed");
     }
     // Later leases of the same keyed client may carry fresher config; the
     // runtime install itself stays one-per-physical-client.

@@ -4,7 +4,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WebSocketServer, type RawData } from "ws";
+import WebSocket, { WebSocketServer, type RawData } from "ws";
 import { CodexAppServerClient } from "./client.js";
 import { createWebSocketTransport } from "./transport-websocket.js";
 import { CODEX_APP_SERVER_VERSION } from "./version.js";
@@ -18,6 +18,7 @@ describe("Codex app-server websocket transport", () => {
 
   afterEach(async () => {
     vi.useRealTimers();
+    vi.restoreAllMocks();
     for (const client of clients) {
       client.close();
     }
@@ -181,6 +182,75 @@ describe("Codex app-server websocket transport", () => {
 
     await expect(exited).resolves.toBe(1006);
     expect(transport.killed).toBe(true);
+  });
+
+  it("suspends heartbeat during ingress backpressure and resumes ordered delivery", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    servers.push(server);
+    let serverSocket: WebSocket | undefined;
+    let resolveConnected!: () => void;
+    const connected = new Promise<void>((resolve) => {
+      resolveConnected = resolve;
+    });
+    server.once("connection", (socket) => {
+      serverSocket = socket;
+      resolveConnected();
+    });
+    await new Promise<void>((resolve) => {
+      server.once("listening", resolve);
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected websocket test server port");
+    }
+    const transport = createWebSocketTransport({
+      transport: "websocket",
+      command: "codex",
+      args: [],
+      url: `ws://127.0.0.1:${address.port}`,
+      headers: {},
+    });
+    transports.push(transport);
+    await connected;
+
+    const pauseSpy = vi.spyOn(WebSocket.prototype, "pause");
+    const resumeSpy = vi.spyOn(WebSocket.prototype, "resume");
+
+    const payloads = [`first:${"a".repeat(512 * 1024)}`, `second:${"b".repeat(512 * 1024)}`];
+    for (const payload of payloads) {
+      serverSocket?.send(payload);
+    }
+    await vi.waitFor(() => expect(pauseSpy).toHaveBeenCalled());
+
+    // Five missed-pong windows used to terminate a legitimately paused socket.
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(transport.killed).toBe(false);
+
+    let output = "";
+    let resolveDelivered!: () => void;
+    const delivered = new Promise<void>((resolve) => {
+      resolveDelivered = resolve;
+    });
+    transport.stdout.setEncoding("utf8");
+    transport.stdout.on("data", (chunk: string) => {
+      output += chunk;
+      if (output.length >= payloads.reduce((total, payload) => total + payload.length + 1, 0)) {
+        resolveDelivered();
+      }
+    });
+    await vi.waitFor(() => expect(resumeSpy).toHaveBeenCalled());
+    await delivered;
+    expect(output).toBe(payloads.map((payload) => `${payload}\n`).join(""));
+
+    let resolvePing!: () => void;
+    const receivedPing = new Promise<void>((resolve) => {
+      resolvePing = resolve;
+    });
+    serverSocket?.once("ping", () => resolvePing());
+    await vi.advanceTimersByTimeAsync(20_000);
+    await expect(receivedPing).resolves.toBeUndefined();
+    expect(transport.killed).toBe(false);
   });
 
   it.each([401, 403])("surfaces a rejected HTTP %i websocket upgrade", async (statusCode) => {

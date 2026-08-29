@@ -372,7 +372,9 @@ export async function activateCodexAttemptTurn(
       })().finally(completeTurn);
       return;
     }
-    void interruptTurn(activeTurnId).finally(completeTurn);
+    void interruptTurn(activeTurnId, {
+      cleanBackgroundTerminals: terminalState.explicitCancellationObserved,
+    }).finally(completeTurn);
   };
   runAbortController.signal.addEventListener("abort", abortListener, { once: true });
   if (runAbortController.signal.aborted) {
