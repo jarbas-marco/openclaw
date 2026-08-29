@@ -14,21 +14,44 @@ import {
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 
-async function fixture() {
+async function fixture(options: { forcePsIdentityFallback?: boolean } = {}) {
   const root = tempDirs.make("openclaw-quiescence-test-");
   const home = path.join(root, "home");
   let workspace = path.join(root, "workspace");
   const bin = path.join(root, "bin");
   const extraProcessPath = path.join(root, "extra-process.txt");
+  const procFallbackPreload = path.join(root, "force-ps-identity.cjs");
   await fs.mkdir(home);
   await fs.mkdir(workspace);
   workspace = await fs.realpath(workspace);
   await fs.mkdir(bin);
   await fs.writeFile(
     path.join(bin, "ps"),
-    '#!/bin/sh\ncase "$*" in\n  *"stat=,lstart= -p"*|*"lstart= -p"*) exec /bin/ps "$@" ;;\n  *) printf "%s %s %s S Tue Jul 15 08:00:00 2026\\n" "$$" "$PPID" "$(id -u)"; if [ -f "$OPENCLAW_TEST_PS_EXTRA" ]; then extra_pid=$(cat "$OPENCLAW_TEST_PS_EXTRA"); /bin/ps -o pid=,ppid=,uid=,stat=,lstart= -p "$extra_pid" || true; fi ;;\nesac\n',
+    '#!/bin/sh\ncase "$*" in\n  *"stat=,lstart= -p"*) for arg do target_pid=$arg; done; state=$(/bin/ps -o stat= -p "$target_pid") || exit 1; set -- $state; [ "$#" -gt 0 ] || exit 1; printf "%s Tue Jul 15 08:00:00 2026\\n" "$1" ;;\n  *"lstart= -p"*) for arg do target_pid=$arg; done; /bin/ps -p "$target_pid" >/dev/null || exit 1; printf "Tue Jul 15 08:00:00 2026\\n" ;;\n  *) printf "%s %s %s S Tue Jul 15 08:00:00 2026\\n" "$$" "$PPID" "$(id -u)"; if [ -f "$OPENCLAW_TEST_PS_EXTRA" ]; then extra_pid=$(cat "$OPENCLAW_TEST_PS_EXTRA"); /bin/ps -o pid=,ppid=,uid=,stat=,lstart= -p "$extra_pid" || true; fi ;;\nesac\n',
   );
   await fs.chmod(path.join(bin, "ps"), 0o755);
+  if (options.forcePsIdentityFallback !== false) {
+    // Most cases exercise the portable ps recovery path. One Linux-specific case below leaves
+    // procfs intact to prove that wall-clock corrections cannot change a frozen pid's identity.
+    await fs.writeFile(
+      procFallbackPreload,
+      `const fs = require("node:fs");
+const readFileSync = fs.readFileSync;
+fs.readFileSync = function (target, ...args) {
+  if (typeof target === "string" && /^\\/proc\\/\\d+\\/stat$/u.test(target)) {
+    const error = new Error("procfs identity disabled by test fixture");
+    error.code = "EACCES";
+    throw error;
+  }
+  return readFileSync.call(this, target, ...args);
+};
+`,
+    );
+  }
+  const nodeOptions =
+    options.forcePsIdentityFallback === false
+      ? process.env.NODE_OPTIONS
+      : `${process.env.NODE_OPTIONS ?? ""} --require=${procFallbackPreload}`.trim();
   return {
     bin,
     home,
@@ -39,6 +62,7 @@ async function fixture() {
       HOME: home,
       OPENCLAW_TEST_PS_EXTRA: extraProcessPath,
       PATH: `${bin}:${process.env.PATH ?? ""}`,
+      NODE_OPTIONS: nodeOptions,
     },
   };
 }
@@ -90,6 +114,17 @@ async function waitForProcessState(pid: number, pattern: RegExp) {
     state = await processState(pid);
   }
   return state;
+}
+
+async function replaceFixturePs(
+  input: Awaited<ReturnType<typeof fixture>>,
+  contents: string,
+): Promise<void> {
+  const target = path.join(input.bin, "ps");
+  const replacement = path.join(input.bin, "ps.replacement");
+  await fs.writeFile(replacement, contents, { mode: 0o755 });
+  await fs.chmod(replacement, 0o755);
+  await fs.rename(replacement, target);
 }
 
 // A ps that ignores SIGTERM: execFileSync's timeout signals and then waits for the child, so
@@ -495,14 +530,20 @@ esac
     }
   });
 
-  it("thaws a real stopped worker and clears the lease", async () => {
-    const input = await fixture();
+  it("thaws a real stopped worker with a stable process identity", async () => {
+    const input = await fixture({ forcePsIdentityFallback: false });
     const child = spawnIdleWorker();
     await fs.writeFile(input.extraProcessPath, `${child.pid}\n`);
 
     try {
       const nonce = await quiesce(input);
       expect(await waitForProcessState(child.pid!, /^T/u)).toMatch(/^T/u);
+      if (process.platform === "linux") {
+        await replaceFixturePs(
+          input,
+          '#!/bin/sh\ncase "$*" in\n  *"stat=,lstart= -p"*) printf "S Mon Jan  1 00:00:00 2001\\n" ;;\n  *"lstart= -p"*) printf "Mon Jan  1 00:00:00 2001\\n" ;;\n  *) exec /bin/ps "$@" ;;\nesac\n',
+        );
+      }
 
       await resume(input, nonce);
 
@@ -513,6 +554,37 @@ esac
       await fs.rm(input.extraProcessPath, { force: true });
     }
   });
+
+  it.runIf(process.platform === "linux")(
+    "renews and thaws a lease created with the legacy ps process identity",
+    async () => {
+      const input = await fixture({ forcePsIdentityFallback: false });
+      const child = spawnIdleWorker();
+      await fs.writeFile(input.extraProcessPath, `${child.pid}\n`);
+
+      try {
+        const nonce = await quiesce(input);
+        const target = leasePath(input.home, input.workspace, nonce);
+        const lease = JSON.parse(await fs.readFile(target, "utf8")) as {
+          processes: Array<{ pid: number; start: string }>;
+          watchdog: { pid: number; start: string };
+        };
+        const entry = lease.processes.find((candidate) => candidate.pid === child.pid);
+        expect(entry).toBeDefined();
+        entry!.start = "Tue Jul 15 08:00:00 2026";
+        lease.watchdog.start = "Tue Jul 15 08:00:00 2026";
+        await fs.writeFile(target, JSON.stringify(lease));
+
+        await renew(input, nonce);
+        await resume(input, nonce);
+
+        expect(await waitForProcessState(child.pid!, /^[^T]/u)).not.toMatch(/^T/u);
+      } finally {
+        await stopIdleWorker(child);
+        await fs.rm(input.extraProcessPath, { force: true });
+      }
+    },
+  );
 
   it("keeps the watchdog resumer alive when the identity sweep aborts partway", async () => {
     const input = await fixture();
@@ -573,8 +645,7 @@ esac
 
       // ps stays stalled across the failed resume and past lease expiry, so only a
       // watchdog that keeps re-probing identity can still thaw this worker.
-      await fs.writeFile(path.join(input.bin, "ps"), STALLED_PS);
-      await fs.chmod(path.join(input.bin, "ps"), 0o755);
+      await replaceFixturePs(input, STALLED_PS);
 
       const failed = await runCommandWithTimeout(
         [process.execPath, "-e", REMOTE_WORKSPACE_RESUME_JS, input.workspace, nonce],
@@ -589,9 +660,7 @@ esac
       // The watchdog must still be holding the lease well past expiry, not retired by a cap.
       expect(() => process.kill(lease.watchdog.pid, 0)).not.toThrow();
 
-      await fs.writeFile(path.join(input.bin, "ps"), healthyPs);
-      await fs.chmod(path.join(input.bin, "ps"), 0o755);
-
+      await replaceFixturePs(input, healthyPs);
       expect(await waitForProcessState(child.pid!, /^[^T]/u)).not.toMatch(/^T/u);
       await expect(fs.stat(leasePath(input.home, input.workspace, nonce))).rejects.toThrow();
     } finally {
