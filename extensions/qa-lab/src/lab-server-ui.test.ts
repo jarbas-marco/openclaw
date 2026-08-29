@@ -5,6 +5,7 @@ import net, { type NetConnectOpts, type Server, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
+import { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   detectContentType,
@@ -101,7 +102,6 @@ const BAD_GATEWAY_RESPONSE = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\
 const GATEWAY_TIMEOUT_RESPONSE = "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n";
 
 const TEST_TLS_OPTIONS = {
-  ciphers: "aNULL:@SECLEVEL=0",
   minVersion: "TLSv1.2",
   maxVersion: "TLSv1.2",
 } as const;
@@ -286,7 +286,14 @@ describe("proxyUpgradeRequest loopback transport", () => {
       resolveRequest = resolve;
     });
     const upstreamServer = trackServer(
-      tls.createServer(TEST_TLS_OPTIONS, (socket) => collectUpgradeRequest(socket, resolveRequest)),
+      tls.createServer(
+        {
+          ...TEST_TLS_OPTIONS,
+          cert: TEST_TLS_CERT_PEM,
+          key: TEST_TLS_KEY_PEM,
+        },
+        (socket) => collectUpgradeRequest(socket, resolveRequest),
+      ),
     );
     const upstreamPort = await listenLoopback(upstreamServer, "localhost");
     const { browser, proxySocket } = await openBrowserPair();
