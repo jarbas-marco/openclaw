@@ -8,6 +8,8 @@ import { clearAgentRunUsage, resetAgentRunUsageForTest } from "./agent-run-usage
 /** Per-run metadata used to stamp events and gate Control UI visibility. */
 type AgentRunContext = {
   sessionKey?: string;
+  /** Routes private one-shot run events only to the durable audit projection. */
+  eventAudience?: "shared" | "audit";
   /** Resolved agent owner, including for unscoped session keys. */
   agentId?: string;
   /** Owning run's sessionId; stamped onto lifecycle events. */
@@ -169,6 +171,9 @@ export function registerAgentRunContext(
   if (context.sessionKey && existing.sessionKey !== context.sessionKey) {
     existing.sessionKey = context.sessionKey;
     runIndexChanged = true;
+  }
+  if (context.eventAudience && existing.eventAudience !== context.eventAudience) {
+    existing.eventAudience = context.eventAudience;
   }
   if (context.sessionId && existing.sessionId !== context.sessionId) {
     existing.sessionId = context.sessionId;

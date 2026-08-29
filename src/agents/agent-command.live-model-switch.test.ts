@@ -3706,6 +3706,13 @@ describe("agentCommand – LiveSessionModelSwitchError retry", () => {
 
     await runInternalModelCommand("model-run-success");
 
+    expect(state.registerAgentRunContextMock).toHaveBeenCalledWith(
+      "model-run-success",
+      expect.objectContaining({
+        eventAudience: "audit",
+        isControlUiVisible: false,
+      }),
+    );
     expect(state.createTrajectoryRuntimeRecorderMock).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionFile: "sqlite:default:internal-session:/tmp/openclaw-session-store.json",
