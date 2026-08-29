@@ -28,6 +28,7 @@ function buildColdStartAgentLocalStatuses() {
 /** Builds an empty summary for cold-start status paths that skip network and session work. */
 export function buildColdStartStatusSummary() {
   return {
+    ok: true,
     runtimeVersion: null,
     heartbeat: {
       defaultAgentId: "main",

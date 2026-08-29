@@ -5009,6 +5009,30 @@ describe("gateway healthHandlers.health cache freshness", () => {
     }
   });
 
+  it("clears cached queue degradation after the live queue recovers", async () => {
+    const openClawState = await createOpenClawTestState({
+      layout: "state-only",
+      prefix: "openclaw-health-cached-dq-recovered-",
+    });
+    try {
+      const cached = createHealthSnapshot({
+        ok: false,
+        deliveryQueues: {
+          failed: [{ queueName: "outbound", count: 1, oldestFailedAt: 1_000 }],
+        },
+      });
+
+      const { respond } = await requestHealthSnapshot({ cached });
+
+      const payload = mockCallArg(respond, 0, 1) as HealthSummary | undefined;
+      expect(payload?.ok).toBe(true);
+      expect(payload?.deliveryQueues).toBeUndefined();
+      expect(mockCallArg(respond, 0, 3)).toEqual({ cached: true });
+    } finally {
+      await openClawState.cleanup();
+    }
+  });
+
   it("merges a live disabled config hot-reload status into cached health responses", async () => {
     const cached = createHealthSnapshot({ configReload: { hotReloadStatus: "active" } });
     const getConfigReloaderHotReloadStatus = vi.fn(() => "disabled" as const);

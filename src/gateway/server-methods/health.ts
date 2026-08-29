@@ -124,7 +124,7 @@ function mergeCachedHealthRuntimeState(params: {
   const contextEngines = buildContextEngineHealthSummary();
   return {
     ...cached,
-    ok: cached.ok && deliveryQueues === undefined,
+    ok: deliveryQueues === undefined,
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
     ...(contextEngines ? { contextEngines } : {}),
     ...(deliveryQueues ? { deliveryQueues } : {}),

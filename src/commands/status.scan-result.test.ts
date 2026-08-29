@@ -5,6 +5,10 @@ import { buildColdStartStatusSummary } from "./status.scan.bootstrap-shared.ts";
 import type { GatewayProbeSnapshot } from "./status.scan.shared.ts";
 
 describe("buildStatusScanResult", () => {
+  it("marks the empty cold-start summary healthy", () => {
+    expect(buildColdStartStatusSummary()).toMatchObject({ ok: true });
+  });
+
   it("builds the full shared scan result shape", () => {
     const osSummary = {
       platform: "linux" as const,
