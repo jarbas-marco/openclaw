@@ -5,8 +5,27 @@ import { isDirectRunUrl } from "../lib/direct-run.mjs";
 import { execGhJson, execGhRead, execPlainGh, workflowRunsApiArgs } from "../lib/plain-gh.mjs";
 
 const SHA_PATTERN = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const REPOSITORY_COMPONENT_PATTERN = /^[A-Za-z0-9_.-]+$/u;
 
-function requirePrRecord({ pr, headRefName, headRefOid, isCrossRepository }) {
+function isRepositoryNameWithOwner(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const components = value.split("/");
+  return (
+    components.length === 2 &&
+    components.every((component) => {
+      return (
+        REPOSITORY_COMPONENT_PATTERN.test(component) &&
+        component !== "." &&
+        component !== ".." &&
+        !component.startsWith("-")
+      );
+    })
+  );
+}
+
+function requirePrRecord({ pr, headRefName, headRefOid, isCrossRepository, repo }) {
   if (!Number.isSafeInteger(pr) || pr <= 0) {
     throw new Error("Expected a positive PR number.");
   }
@@ -15,6 +34,9 @@ function requirePrRecord({ pr, headRefName, headRefOid, isCrossRepository }) {
   }
   if (!SHA_PATTERN.test(headRefOid)) {
     throw new Error("Expected a full PR headRefOid.");
+  }
+  if (!isRepositoryNameWithOwner(repo)) {
+    throw new Error("Expected repo to be an owner/repository slug.");
   }
   if (isCrossRepository === true) {
     throw new Error(
@@ -29,6 +51,8 @@ function buildCiDispatchArgs(record) {
     "workflow",
     "run",
     "ci.yml",
+    "--repo",
+    record.repo,
     "--ref",
     record.headRefName,
     "-f",
@@ -40,17 +64,20 @@ function buildCiDispatchArgs(record) {
   ];
 }
 
-function listCiRuns(headRefOid) {
-  return execGhJson(workflowRunsApiArgs("openclaw/openclaw", headRefOid, "workflow_dispatch", 20), {
+function listCiRuns(repo, headRefOid) {
+  return execGhJson(workflowRunsApiArgs(repo, headRefOid, "workflow_dispatch", 20), {
     stdio: ["ignore", "pipe", "pipe"],
   }).workflow_runs;
 }
 
-function readCurrentPrHeadOid(pr) {
-  return execGhRead(["pr", "view", String(pr), "--json", "headRefOid", "--jq", ".headRefOid"], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  }).trim();
+function readCurrentPrHeadOid(repo, pr) {
+  return execGhRead(
+    ["pr", "view", String(pr), "--repo", repo, "--json", "headRefOid", "--jq", ".headRefOid"],
+    {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    },
+  ).trim();
 }
 
 function delay(milliseconds) {
@@ -72,8 +99,8 @@ async function dispatchCiForPr(
   } = {},
 ) {
   requirePrRecord(record);
-  const priorRunIds = new Set(listRuns(record.headRefOid).map((run) => run.id));
-  const headBeforeDispatch = readHeadOid(record.pr);
+  const priorRunIds = new Set(listRuns(record.repo, record.headRefOid).map((run) => run.id));
+  const headBeforeDispatch = readHeadOid(record.repo, record.pr);
   if (headBeforeDispatch !== record.headRefOid) {
     throw new Error(
       `PR #${record.pr} head changed before CI dispatch (expected ${record.headRefOid}, got ${headBeforeDispatch}).`,
@@ -82,7 +109,7 @@ async function dispatchCiForPr(
   runDispatch(buildCiDispatchArgs(record));
 
   for (let attempt = 1; attempt <= pollAttempts; attempt += 1) {
-    const run = listRuns(record.headRefOid).find(
+    const run = listRuns(record.repo, record.headRefOid).find(
       (candidate) =>
         candidate.head_sha === record.headRefOid &&
         !priorRunIds.has(candidate.id) &&
@@ -90,7 +117,7 @@ async function dispatchCiForPr(
         candidate.html_url.length > 0,
     );
     if (run) {
-      const headAtObservation = readHeadOid(record.pr);
+      const headAtObservation = readHeadOid(record.repo, record.pr);
       if (headAtObservation !== record.headRefOid) {
         throw new Error(
           `PR #${record.pr} head changed before an exact-SHA CI run became visible (expected ${record.headRefOid}, got ${headAtObservation}); verify the run before retrying.`,
@@ -102,7 +129,7 @@ async function dispatchCiForPr(
       await wait(pollIntervalMs);
     }
   }
-  const headAfterDispatch = readHeadOid(record.pr);
+  const headAfterDispatch = readHeadOid(record.repo, record.pr);
   if (headAfterDispatch !== record.headRefOid) {
     throw new Error(
       `PR #${record.pr} head changed while CI dispatch was being indexed (expected ${record.headRefOid}, got ${headAfterDispatch}); verify the run before retrying.`,
@@ -133,8 +160,10 @@ function warnOnLocalHeadDrift(record) {
 }
 
 async function main(argv = process.argv.slice(2)) {
-  if (argv.length !== 4 || !["true", "false"].includes(argv[3])) {
-    console.error("Usage: ci-dispatch.mjs <PR> <headRefName> <headRefOid> <isCrossRepository>");
+  if (argv.length !== 5 || !["true", "false"].includes(argv[3])) {
+    console.error(
+      "Usage: ci-dispatch.mjs <PR> <headRefName> <headRefOid> <isCrossRepository> <owner/repository>",
+    );
     process.exitCode = 2;
     return;
   }
@@ -143,6 +172,7 @@ async function main(argv = process.argv.slice(2)) {
     headRefName: argv[1],
     headRefOid: argv[2],
     isCrossRepository: argv[3] === "true",
+    repo: argv[4],
   };
   requirePrRecord(record);
   warnOnLocalHeadDrift(record);
@@ -163,7 +193,7 @@ async function main(argv = process.argv.slice(2)) {
       "run_url=pending (GitHub accepted the dispatch, but Actions has not indexed it yet)",
     );
     console.log(
-      `inspect_with=gh api --method GET repos/openclaw/openclaw/actions/workflows/ci.yml/runs -f event=workflow_dispatch -f head_sha=${record.headRefOid} -f per_page=20`,
+      `inspect_with=gh api --method GET repos/${record.repo}/actions/workflows/ci.yml/runs -f event=workflow_dispatch -f head_sha=${record.headRefOid} -f per_page=20`,
     );
   }
 }

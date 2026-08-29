@@ -6,6 +6,8 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const tempDirs = useAutoCleanupTempDirTracker(afterEach);
 const dispatchScript = join(process.cwd(), "scripts/pr-lib/ci-dispatch.mjs");
+const gatesScriptDirectory = join(process.cwd(), "scripts");
+const repo = "jarbas-marco/openclaw";
 const sha = "0123456789abcdef0123456789abcdef01234567";
 const changedSha = "fedcba9876543210fedcba9876543210fedcba98";
 const describePosix = process.platform === "win32" ? describe.skip : describe;
@@ -28,7 +30,7 @@ case "$1 $2" in
     if [ "\${OPENCLAW_TEST_GH_MODE:-}" = "pending-head-change" ]; then
       printf '{"workflow_runs":[]}\\n'
     elif [ -e "$OPENCLAW_TEST_GH_SEEN_RUN_LIST" ]; then
-      printf '{"workflow_runs":[{"id":99,"html_url":"https://github.com/openclaw/openclaw/actions/runs/99","head_sha":"%s","created_at":"2026-01-01T00:00:00Z","status":"queued"}]}\\n' "$OPENCLAW_TEST_HEAD_SHA"
+      printf '{"workflow_runs":[{"id":99,"html_url":"https://github.com/jarbas-marco/openclaw/actions/runs/99","head_sha":"%s","created_at":"2026-01-01T00:00:00Z","status":"queued"}]}\\n' "$OPENCLAW_TEST_HEAD_SHA"
     else
       : > "$OPENCLAW_TEST_GH_SEEN_RUN_LIST"
       printf '{"workflow_runs":[]}\\n'
@@ -94,7 +96,7 @@ function runDispatch(
   }
   return spawnSync(
     process.execPath,
-    [dispatchScript, "12345", "contributor/fix-hosted-gates", sha, "false"],
+    [dispatchScript, "12345", "contributor/fix-hosted-gates", sha, "false", repo],
     {
       cwd: options.cwd,
       encoding: "utf8",
@@ -104,6 +106,35 @@ function runDispatch(
 }
 
 describePosix("scripts/pr ci-dispatch", () => {
+  it("propagates the current repository through the shell wrapper", () => {
+    const result = spawnSync(
+      "bash",
+      [
+        "-c",
+        `set -euo pipefail
+script_parent_dir="$1"
+source "$script_parent_dir/pr-lib/gates.sh"
+gh() {
+  case "$1 $2" in
+    "pr view") printf '{"headRefName":"contributor/fix-hosted-gates","headRefOid":"${sha}","isCrossRepository":false}\\n' ;;
+    "repo view") printf '${repo}\\n' ;;
+    *) return 2 ;;
+  esac
+}
+node() { printf '%s\\n' "$*"; }
+ci_dispatch 12345`,
+        "bash",
+        gatesScriptDirectory,
+      ],
+      { encoding: "utf8" },
+    );
+
+    expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+    expect(result.stdout.trim()).toBe(
+      `${gatesScriptDirectory}/pr-lib/ci-dispatch.mjs 12345 contributor/fix-hosted-gates ${sha} false ${repo}`,
+    );
+  });
+
   it("warns when a same-named local branch points away from the dispatched remote head", () => {
     const repo = tempDirs.make("openclaw-pr-ci-dispatch-repo-");
     const git = (...args: string[]) =>
@@ -137,18 +168,20 @@ describePosix("scripts/pr ci-dispatch", () => {
 
     expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     expect(result.stdout).toContain(
-      "observed_run_url=https://github.com/openclaw/openclaw/actions/runs/99",
+      "observed_run_url=https://github.com/jarbas-marco/openclaw/actions/runs/99",
     );
     const calls = readFileSync(fakeGh.calls, "utf8");
     const callLines = calls.trim().split("\n");
     expect(callLines).toContain(
-      `real-gh\tworkflow run ci.yml --ref contributor/fix-hosted-gates -f target_ref=${sha} -f release_gate=true -f pull_request_number=12345`,
+      `real-gh\tworkflow run ci.yml --repo ${repo} --ref contributor/fix-hosted-gates -f target_ref=${sha} -f release_gate=true -f pull_request_number=12345`,
     );
     expect(callLines).toContain("gh\tauth token");
     expect(callLines).toContain(
-      `gh\tapi --method GET repos/openclaw/openclaw/actions/workflows/ci.yml/runs -f event=workflow_dispatch -f head_sha=${sha} -f per_page=20`,
+      `gh\tapi --method GET repos/${repo}/actions/workflows/ci.yml/runs -f event=workflow_dispatch -f head_sha=${sha} -f per_page=20`,
     );
-    expect(callLines.some((call) => call.startsWith("gh\tpr view 12345"))).toBe(true);
+    expect(callLines.some((call) => call.startsWith(`gh\tpr view 12345 --repo ${repo}`))).toBe(
+      true,
+    );
     expect(callLines.some((call) => /^real-gh\t(?:api|pr view)/u.test(call))).toBe(false);
   });
 
@@ -156,7 +189,7 @@ describePosix("scripts/pr ci-dispatch", () => {
     const fakeGh = createFakeGh();
     const result = spawnSync(
       process.execPath,
-      [dispatchScript, "12345", "fix-hosted-gates", sha, "true"],
+      [dispatchScript, "12345", "fix-hosted-gates", sha, "true", repo],
       {
         encoding: "utf8",
         env: {
@@ -173,6 +206,27 @@ describePosix("scripts/pr ci-dispatch", () => {
 
     expect(result.status).not.toBe(0);
     expect(`${result.stdout}\n${result.stderr}`).toMatch(/comes from a fork/u);
+    expect(existsSync(fakeGh.calls)).toBe(false);
+  });
+
+  it("rejects an invalid repository before invoking GitHub", () => {
+    const fakeGh = createFakeGh();
+    const result = spawnSync(
+      process.execPath,
+      [dispatchScript, "12345", "fix-hosted-gates", sha, "false", "../.."],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_GH_BIN: fakeGh.realGh,
+          OPENCLAW_TEST_GH_CALLS: fakeGh.calls,
+          PATH: `${fakeGh.binDir}:${process.env.PATH ?? ""}`,
+        },
+      },
+    );
+
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout}\n${result.stderr}`).toMatch(/owner\/repository slug/u);
     expect(existsSync(fakeGh.calls)).toBe(false);
   });
 
