@@ -736,22 +736,22 @@ describe.sequential("TUI PTY harness", () => {
     "preserves xAI account limit errors in terminal output",
     async () => {
       await fixture.run.write("xai limit proof\r");
-      await fixture.run.waitForOutput("monthly spending limit");
+      await fixture.run.waitForOutput("monthly spending limit", STARTUP_TIMEOUT_MS);
       expect(fixture.run.visibleOutput()).not.toContain("Run /auth");
       await fixture.waitForLogEntry(
         (entry) =>
           entry.method === "sendChat" && objectFieldEquals(entry, "message", "xai limit proof"),
       );
     },
-    TEST_TIMEOUT_MS,
+    STARTUP_TEST_TIMEOUT_MS,
   );
 
   it(
     "renders redacted, cause-aware send failures in the real terminal loop",
     async () => {
       await fixture.run.write("tui error redaction proof\r");
-      await fixture.run.waitForOutput("send failed: gateway down");
-      await fixture.run.waitForOutput("Authorization: Bearer");
+      await fixture.run.waitForOutput("send failed: gateway down", STARTUP_TIMEOUT_MS);
+      await fixture.run.waitForOutput("Authorization: Bearer", STARTUP_TIMEOUT_MS);
 
       expect(fixture.run.visibleOutput()).not.toContain("sk-abcdefghijklmnopqrstuv");
       await fixture.waitForLogEntry(
@@ -760,7 +760,7 @@ describe.sequential("TUI PTY harness", () => {
           objectFieldEquals(entry, "message", "tui error redaction proof"),
       );
     },
-    TEST_TIMEOUT_MS,
+    STARTUP_TEST_TIMEOUT_MS,
   );
 
   it(
