@@ -131,6 +131,13 @@ describe("registerBackupCommand", () => {
     expect(options.onlyConfig).toBe(true);
   });
 
+  it("forwards --recovery-profile to backup create", async () => {
+    await runCli(["backup", "create", "--recovery-profile"]);
+
+    const options = expectForwardedOptions(backupCreateCommand);
+    expect(options.recoveryProfile).toBe(true);
+  });
+
   it("runs backup verify with forwarded options", async () => {
     await runCli(["backup", "verify", "/tmp/openclaw-backup.tar.gz", "--json"]);
 

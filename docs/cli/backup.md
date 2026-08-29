@@ -20,6 +20,7 @@ openclaw backup create --dry-run --json
 openclaw backup create --verify
 openclaw backup create --no-include-workspace
 openclaw backup create --only-config
+openclaw backup create --recovery-profile
 openclaw backup verify ./2026-03-09T08-00-00.000+08-00-openclaw-backup.tar.gz
 openclaw backup restore ./2026-03-09T08-00-00.000+08-00-openclaw-backup.tar.gz --target ./restored-openclaw
 openclaw backup sqlite create --global --repository ~/Backups/openclaw-sqlite
@@ -47,6 +48,11 @@ Archive `create`, `verify`, and `restore`, plus SQLite `create`, `list`, `verify
 - Existing archive files are never overwritten. Output paths inside the source state/workspace trees are rejected to avoid self-inclusion.
 - `openclaw backup verify <archive>` checks that the archive contains exactly one root manifest, rejects traversal-style archive paths, absolute or archive-escaping symbolic links, and SQLite sidecars, confirms every manifest-declared payload exists, validates every SQLite snapshot's file shape, and runs full integrity and role checks on canonical OpenClaw databases. Dedicated plugin schemas remain opaque because they may require owner-defined SQLite capabilities. `openclaw backup create --verify` runs that validation immediately after writing the archive.
 - `openclaw backup create --only-config` backs up just the active JSON config file.
+- `openclaw backup create --recovery-profile` omits only `backups/` and
+  `internal-agent-runs/` below the state directory, because those are rebuildable
+  local backup and internal-run artifacts. Config, credentials, configured
+  workspaces, SQLite, browser, media, agents, and sessions remain in scope; an
+  explicitly configured durable path beneath either omitted root is retained.
 
 ## Restore a full archive
 

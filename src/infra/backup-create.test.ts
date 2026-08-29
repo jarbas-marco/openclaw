@@ -731,6 +731,91 @@ describe("createBackupArchive", () => {
     );
   });
 
+  it("keeps durable state while the recovery profile excludes only rebuildable roots", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-recovery-profile-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("archive-output");
+        const nestedWorkspace = state.statePath("backups", "workspace");
+        await fs.mkdir(outputDir, { recursive: true });
+        await fs.mkdir(nestedWorkspace, { recursive: true });
+        await state.writeConfig({
+          agents: { entries: { main: { default: true, workspace: nestedWorkspace } } },
+        });
+        await state.writeText("backups/prior.tar.gz", "old backup\n");
+        await state.writeText("backups/workspace/KEEP.md", "configured workspace\n");
+        await state.writeText("internal-agent-runs/run.json", "transient run\n");
+        await state.writeText("credentials/auth.json", "credential\n");
+        await state.writeText("browser/profile/state.json", "browser\n");
+        await state.writeText("media/photo.txt", "media\n");
+
+        const result = await createBackupArchive({
+          output: outputDir,
+          includeWorkspace: false,
+          recoveryProfile: true,
+          nowMs: Date.UTC(2026, 4, 9, 8, 0, 0),
+        });
+        const entries = await listArchiveEntries(result.archivePath);
+
+        expect(result.recoveryProfile).toBe(true);
+        expect(result.skipped).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: "local backup artifacts",
+              sourcePath: state.statePath("backups"),
+              reason: "recovery-profile: rebuildable local backups",
+            }),
+            expect.objectContaining({
+              kind: "internal agent run artifacts",
+              sourcePath: state.statePath("internal-agent-runs"),
+              reason: "recovery-profile: rebuildable internal runs",
+            }),
+          ]),
+        );
+        for (const suffix of ["/backups/prior.tar.gz", "/internal-agent-runs/run.json"]) {
+          expect(
+            entries.some((entry) => entry.endsWith(suffix)),
+            suffix,
+          ).toBe(false);
+        }
+        for (const suffix of [
+          "/credentials/auth.json",
+          "/browser/profile/state.json",
+          "/media/photo.txt",
+          "/backups/workspace/KEEP.md",
+        ]) {
+          expect(
+            entries.some((entry) => entry.endsWith(suffix)),
+            suffix,
+          ).toBe(true);
+        }
+        const runtime: RuntimeEnv = { log: vi.fn(), error: vi.fn(), exit: vi.fn() };
+        await expect(
+          backupVerifyCommand(runtime, { archive: result.archivePath }),
+        ).resolves.toMatchObject({
+          ok: true,
+          recoveryProfile: true,
+        });
+
+        const normal = await createBackupArchive({
+          output: outputDir,
+          includeWorkspace: false,
+          nowMs: Date.UTC(2026, 4, 9, 8, 1, 0),
+        });
+        const normalEntries = await listArchiveEntries(normal.archivePath);
+        expect(normal.recoveryProfile).toBeUndefined();
+        expect(normalEntries.some((entry) => entry.endsWith("/backups/prior.tar.gz"))).toBe(true);
+        expect(normalEntries.some((entry) => entry.endsWith("/internal-agent-runs/run.json"))).toBe(
+          true,
+        );
+      },
+    );
+  });
+
   it("creates a verifiable archive for highly compressible sparse state", async () => {
     await withOpenClawTestState(
       {

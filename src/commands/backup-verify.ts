@@ -46,6 +46,7 @@ type BackupVerifyResult = {
   assetCount: number;
   entryCount: number;
   symlinkCount: number;
+  recoveryProfile?: true;
 };
 
 type ArchiveEntry = {
@@ -156,6 +157,9 @@ function formatResult(result: BackupVerifyResult): string {
     `Assets verified: ${result.assetCount}`,
     `Archive entries scanned: ${result.entryCount}`,
     `Symbolic links checked: ${result.symlinkCount}`,
+    ...(result.recoveryProfile
+      ? ["Recovery profile: local backup and internal-run artifacts were intentionally omitted."]
+      : []),
   ].join("\n");
 }
 
@@ -641,6 +645,7 @@ async function verifyResolvedBackupArchive(archivePath: string): Promise<BackupV
     assetCount: manifest.assets.length,
     entryCount: rawEntries.length,
     symlinkCount: symbolicLinks.length,
+    ...(manifest.options?.recoveryProfile === true ? { recoveryProfile: true as const } : {}),
   };
 
   return result;

@@ -16,6 +16,7 @@ export type BackupManifest = {
   nodeVersion: string;
   options?: {
     includeWorkspace?: boolean;
+    recoveryProfile?: boolean;
   };
   paths?: {
     stateDir?: string;
@@ -92,7 +93,10 @@ export function parseBackupManifest(raw: string): BackupManifest {
     platform: typeof parsed.platform === "string" ? parsed.platform : "unknown",
     nodeVersion: typeof parsed.nodeVersion === "string" ? parsed.nodeVersion : "unknown",
     options: isRecord(parsed.options)
-      ? { includeWorkspace: parsed.options.includeWorkspace as boolean | undefined }
+      ? {
+          includeWorkspace: parsed.options.includeWorkspace as boolean | undefined,
+          recoveryProfile: parsed.options.recoveryProfile as boolean | undefined,
+        }
       : undefined,
     paths: isRecord(parsed.paths)
       ? {
