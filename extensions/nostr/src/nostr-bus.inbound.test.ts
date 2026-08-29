@@ -750,6 +750,9 @@ describe("startNostrBus inbound guards", () => {
   });
 
   it("retries a replayed event after the message handler fails", async () => {
+    const currentTime = Date.now();
+    let testTime = currentTime;
+    const now = vi.spyOn(Date, "now").mockImplementation(() => testTime);
     const onMessage = vi
       .fn<(sender: string, plaintext: string) => Promise<void>>()
       .mockRejectedValueOnce(new Error("boom"))
@@ -764,16 +767,27 @@ describe("startNostrBus inbound guards", () => {
       id: "retry-after-handler-failure",
     });
 
-    await emitEvent(event);
-    await emitEvent(event);
-    await vi.waitFor(() => expect(onMessage).toHaveBeenCalledTimes(2), { timeout: 3_000 });
+    try {
+      // Record the first release outside its retry window; this test owns replay semantics,
+      // not the shared ingress backoff timer's behavior under a loaded test process.
+      testTime = currentTime - 5_000;
+      await emitEvent(event);
+      await vi.waitFor(async () => {
+        expect(await ingressQueue.listPending()).toEqual([
+          expect.objectContaining({ id: event.id, attempts: 1, lastError: "boom" }),
+        ]);
+      });
+      testTime = currentTime;
+      await emitEvent(event);
 
-    expect(mockState.verifyEvent).toHaveBeenCalledTimes(2);
-    expect(mockState.decrypt).toHaveBeenCalledTimes(2);
-    expect(onMessage).toHaveBeenCalledTimes(2);
-    expect(bus.getMetrics().eventsProcessed).toBe(1);
-
-    await bus.close();
+      expect(mockState.verifyEvent).toHaveBeenCalledTimes(2);
+      expect(mockState.decrypt).toHaveBeenCalledTimes(2);
+      expect(onMessage).toHaveBeenCalledTimes(2);
+      expect(bus.getMetrics().eventsProcessed).toBe(1);
+    } finally {
+      now.mockRestore();
+      await bus.close();
+    }
   });
 
   it("does not rate limit an allowed sender while another authorization is still pending", async () => {
