@@ -106,6 +106,16 @@ const TEST_TLS_OPTIONS = {
   maxVersion: "TLSv1.2",
 } as const;
 
+function mockTlsConnectToIpv4Loopback(overrides: tls.ConnectionOptions = {}) {
+  const connectTls = tls.connect;
+  vi.spyOn(tls, "connect").mockImplementation(((options: tls.ConnectionOptions) =>
+    connectTls({
+      ...options,
+      ...overrides,
+      host: "127.0.0.1",
+    })) as typeof tls.connect);
+}
+
 function trackServer<T extends Server>(server: T): T {
   const sockets = new Set<Socket>();
   server.on("connection", (socket) => {
@@ -273,13 +283,10 @@ describe("proxyUpgradeRequest loopback transport", () => {
   });
 
   it("forwards HTTPS upgrades only after the TLS handshake and clears the opening timeout", async () => {
-    const connectTls = tls.connect;
-    vi.spyOn(tls, "connect").mockImplementation(((options: tls.ConnectionOptions) =>
-      connectTls({
-        ...options,
-        ...TEST_TLS_OPTIONS,
-        rejectUnauthorized: false,
-      })) as typeof tls.connect);
+    mockTlsConnectToIpv4Loopback({
+      ...TEST_TLS_OPTIONS,
+      rejectUnauthorized: false,
+    });
 
     let resolveRequest!: (request: string) => void;
     const requestPromise = new Promise<string>((resolve) => {
@@ -295,7 +302,7 @@ describe("proxyUpgradeRequest loopback transport", () => {
         (socket) => collectUpgradeRequest(socket, resolveRequest),
       ),
     );
-    const upstreamPort = await listenLoopback(upstreamServer, "localhost");
+    const upstreamPort = await listenLoopback(upstreamServer);
     const { browser, proxySocket } = await openBrowserPair();
     const setTimeoutSpy = vi.spyOn(net.Socket.prototype, "setTimeout");
     const removeListenerSpy = vi.spyOn(net.Socket.prototype, "removeListener");
@@ -314,6 +321,7 @@ describe("proxyUpgradeRequest loopback transport", () => {
   });
 
   it("returns a flushed 504 and closes both sockets when TLS stays silent after TCP connect", async () => {
+    mockTlsConnectToIpv4Loopback();
     let resolveUpstream!: (socket: Socket) => void;
     const upstreamPromise = new Promise<Socket>((resolve) => {
       resolveUpstream = resolve;
@@ -324,7 +332,7 @@ describe("proxyUpgradeRequest loopback transport", () => {
         resolveUpstream(socket);
       }),
     );
-    const upstreamPort = await listenLoopback(upstreamServer, "localhost");
+    const upstreamPort = await listenLoopback(upstreamServer);
     const { browser, proxySocket } = await openBrowserPair();
     const setTimeoutSpy = vi.spyOn(net.Socket.prototype, "setTimeout");
     const endSpy = vi.spyOn(proxySocket, "end");
