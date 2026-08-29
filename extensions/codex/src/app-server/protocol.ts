@@ -229,6 +229,10 @@ export type CodexThreadUnsubscribeParams = JsonObject & {
   threadId: string;
 };
 
+export type CodexThreadBackgroundTerminalsCleanParams = JsonObject & {
+  threadId: string;
+};
+
 export type CodexTurnInterruptParams = JsonObject & {
   threadId: string;
   turnId: string;
@@ -645,6 +649,7 @@ type CodexAppServerRequestParamsOverride = {
   "thread/name/set": CodexThreadSetNameParams;
   "thread/read": CodexThreadReadParams;
   "thread/start": CodexThreadStartParams;
+  "thread/backgroundTerminals/clean": CodexThreadBackgroundTerminalsCleanParams;
   "thread/unarchive": CodexThreadArchiveParams;
   "thread/unsubscribe": CodexThreadUnsubscribeParams;
   "turn/interrupt": CodexTurnInterruptParams;
@@ -680,6 +685,7 @@ type CodexAppServerRequestResultMap = {
   "thread/read": CodexThreadReadResponse;
   "thread/resume": CodexThreadResumeResponse;
   "thread/start": CodexThreadStartResponse;
+  "thread/backgroundTerminals/clean": JsonValue;
   "thread/unarchive": CodexThreadUnarchiveResponse;
   "thread/unsubscribe": JsonValue;
   "turn/interrupt": JsonValue;

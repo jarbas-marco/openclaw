@@ -27,6 +27,7 @@ export function createWebSocketTransport(
   const socket = new WebSocket(options.url, { headers });
   const pendingFrames: string[] = [];
   let killed = false;
+  let ingressPaused = false;
 
   const sendFrame = (frame: string) => {
     const trimmed = frame.trim();
@@ -52,9 +53,21 @@ export function createWebSocketTransport(
     killed = true;
     events.emit("exit", code, reason.toString("utf8"));
   });
+  stdout.on("drain", () => {
+    if (!ingressPaused) {
+      return;
+    }
+    ingressPaused = false;
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.resume();
+    }
+  });
   socket.on("message", (data) => {
     const text = websocketFrameToText(data);
-    stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+    if (!stdout.write(text.endsWith("\n") ? text : `${text}\n`) && !ingressPaused) {
+      ingressPaused = true;
+      socket.pause();
+    }
   });
 
   const stdin = new Writable({

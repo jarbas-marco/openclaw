@@ -61,6 +61,7 @@ import {
   CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
   interruptCodexTurnBestEffort,
   retireCodexAppServerClientAfterTimedOutTurn,
+  stopCodexTurnAndBackgroundTerminalsBestEffort,
   unsubscribeCodexThreadBestEffort,
 } from "./attempt-client-cleanup.js";
 import {
@@ -3193,6 +3194,22 @@ export async function runCodexAppServerAttempt(
           threadId: thread.threadId,
           turnId: activeTurnId,
           reason: String(runAbortController.signal.reason ?? "timeout"),
+        });
+      })().finally(() => {
+        resolveCompletion?.();
+      });
+      return;
+    }
+    if (explicitCancellationObserved) {
+      void (async () => {
+        await stopCodexTurnAndBackgroundTerminalsBestEffort(client, {
+          threadId: thread.threadId,
+          turnId: activeTurnId,
+          timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
+        });
+        await unsubscribeCodexThreadBestEffort(client, {
+          threadId: thread.threadId,
+          timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
         });
       })().finally(() => {
         resolveCompletion?.();

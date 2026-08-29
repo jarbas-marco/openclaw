@@ -33,6 +33,9 @@ function createClient() {
     async notify(notification: CodexServerNotification) {
       await Promise.all([...handlers].map(async (handler) => await handler(notification)));
     },
+    dispatch(notification: CodexServerNotification) {
+      return [...handlers].map((handler) => handler(notification));
+    },
     close() {
       for (const handler of closeHandlers) {
         handler();
@@ -180,6 +183,19 @@ function childTurnCompletedNotification(params: {
 }
 
 describe("CodexNativeSubagentMonitor", () => {
+  it("keeps ordinary notifications on the synchronous fast path", () => {
+    const client = createClient();
+    const monitor = new CodexNativeSubagentMonitor(client, createRuntime());
+
+    expect(
+      client.dispatch({
+        method: "item/agentMessage/delta",
+        params: { threadId: "untracked", turnId: "turn", itemId: "item", delta: "x" },
+      }),
+    ).toEqual([undefined]);
+    monitor.dispose();
+  });
+
   it("keeps native subagent task mirroring alive on the shared client", async () => {
     const client = createClient();
     const runtime = createRuntime();

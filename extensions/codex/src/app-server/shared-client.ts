@@ -212,6 +212,11 @@ async function acquireSharedCodexAppServerClient(
       options?.timeoutMs ?? 0,
       "codex app-server initialize timed out",
     );
+    // A waiter can wake after retirement detached this entry from new lookup.
+    // Never lease a physical client whose existing leases are already draining.
+    if (entry.closeWhenIdle) {
+      throw new Error("codex app-server client is closed");
+    }
     // Later leases of the same keyed client may carry fresher config; the
     // runtime install itself stays one-per-physical-client.
     ensureCodexAppServerClientRuntime(client, {

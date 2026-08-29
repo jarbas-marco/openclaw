@@ -96,7 +96,7 @@ import { resolveGatewayPluginConfig } from "./runtime-plugin-config.js";
 import type { ChannelAutostartSuppression } from "./server-channels.js";
 import { resolveGatewayControlUiRootState } from "./server-control-ui-root.js";
 import { createLazyGatewayCronState } from "./server-cron-lazy.js";
-import { applyGatewayLaneConcurrency } from "./server-lanes.js";
+import { applyGatewayLaneConcurrency, startGatewayLaneAdmissionMonitor } from "./server-lanes.js";
 import { createGatewayServerLiveState, type GatewayServerLiveState } from "./server-live-state.js";
 import { GATEWAY_EVENTS } from "./server-methods-list.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./server-methods/types.js";
@@ -960,7 +960,26 @@ export async function startGatewayServer(
       (cfgAtStart.gateway?.terminal?.detachedSessionTimeoutSeconds ??
         DEFAULT_TERMINAL_DETACH_SECONDS) * 1000,
   });
-  applyGatewayLaneConcurrency(cfgAtStart);
+  applyGatewayLaneConcurrency(cfgAtStart, { gatewayStart: true });
+  const gatewayLaneAdmissionMonitor = startGatewayLaneAdmissionMonitor(
+    readinessEventLoopHealth.snapshot,
+    (transition) => {
+      const details = {
+        configured: transition.configured,
+        effective: transition.effective,
+        pressureFactor: transition.pressureFactor,
+        pressureLevel: transition.pressureLevel,
+        reasons: transition.reasons,
+      };
+      if (transition.degraded) {
+        log.warn("gateway lane admissions reduced under event-loop pressure", details);
+      } else if (transition.pressureFactor === 1) {
+        log.info("gateway lane admission ceilings restored after event-loop recovery", details);
+      } else {
+        log.info("gateway lane admissions recovering after event-loop pressure", details);
+      }
+    },
+  );
 
   runtimeState = createGatewayServerLiveState({
     hooksConfig: initialHooksConfig,
@@ -994,6 +1013,7 @@ export async function startGatewayServer(
   };
   const runClosePrelude = async () => {
     markClosePreludeStarted();
+    gatewayLaneAdmissionMonitor.stop();
     clearPluginMetadataLifecycleCaches();
     const { runGatewayClosePrelude } = await loadGatewayCloseModule();
     await runGatewayClosePrelude({

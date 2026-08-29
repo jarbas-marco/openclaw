@@ -225,7 +225,7 @@ export class CodexNativeSubagentMonitor {
     }
   }
 
-  async handleNotification(notification: CodexServerNotification): Promise<void> {
+  handleNotification(notification: CodexServerNotification): Promise<void> | void {
     const state = this.resolveMirrorState(notification);
     if (state?.mirror) {
       try {
@@ -238,10 +238,20 @@ export class CodexNativeSubagentMonitor {
       }
     }
     this.markChildTurnStarted(notification);
-    await this.handleChildSystemError(notification);
+    const childSystemError = this.handleChildSystemError(notification);
+    if (childSystemError) {
+      return childSystemError.then(() => this.finishNotification(notification));
+    }
+    return this.finishNotification(notification);
+  }
+
+  private finishNotification(notification: CodexServerNotification): Promise<void> | void {
     this.captureChildAssistantMessage(notification);
-    await this.handleChildTurnCompletion(notification);
-    await this.handleCompletionNotification(notification);
+    const childTurnCompletion = this.handleChildTurnCompletion(notification);
+    if (childTurnCompletion) {
+      return childTurnCompletion.then(() => this.handleCompletionNotification(notification));
+    }
+    return this.handleCompletionNotification(notification);
   }
 
   private markChildTurnStarted(notification: CodexServerNotification): void {
@@ -256,7 +266,7 @@ export class CodexNativeSubagentMonitor {
     }
   }
 
-  private async handleChildSystemError(notification: CodexServerNotification): Promise<void> {
+  private handleChildSystemError(notification: CodexServerNotification): Promise<void> | void {
     if (notification.method !== "thread/status/changed") {
       return;
     }
@@ -269,7 +279,7 @@ export class CodexNativeSubagentMonitor {
     const childState = childThreadId ? this.childStates.get(childThreadId) : undefined;
     if (childState) {
       childState.settledWithoutCompletion = true;
-      await this.flushDeferredParentSettlements(childState.parentThreadId);
+      return this.flushDeferredParentSettlements(childState.parentThreadId);
     }
   }
 
@@ -351,7 +361,9 @@ export class CodexNativeSubagentMonitor {
     return undefined;
   }
 
-  private async handleCompletionNotification(notification: CodexServerNotification): Promise<void> {
+  private handleCompletionNotification(
+    notification: CodexServerNotification,
+  ): Promise<void> | void {
     const params = isJsonObject(notification.params) ? notification.params : undefined;
     const parentThreadId = params ? readString(params, "threadId")?.trim() : undefined;
     const state = parentThreadId ? this.parentStates.get(parentThreadId) : undefined;
@@ -359,6 +371,16 @@ export class CodexNativeSubagentMonitor {
       return;
     }
     const completions = extractCodexNativeSubagentCompletions(notification);
+    if (completions.length === 0) {
+      return;
+    }
+    return this.processCompletionNotifications(state, completions);
+  }
+
+  private async processCompletionNotifications(
+    state: ParentState,
+    completions: ReturnType<typeof extractCodexNativeSubagentCompletions>,
+  ): Promise<void> {
     for (const nativeCompletion of completions) {
       const childThreadId = this.resolveChildThreadIdForAgentPath(
         state.parentThreadId,
@@ -480,7 +502,7 @@ export class CodexNativeSubagentMonitor {
     return assistantMessages;
   }
 
-  private async handleChildTurnCompletion(notification: CodexServerNotification): Promise<void> {
+  private handleChildTurnCompletion(notification: CodexServerNotification): Promise<void> | void {
     if (notification.method !== "turn/completed") {
       return;
     }
@@ -497,8 +519,7 @@ export class CodexNativeSubagentMonitor {
       // Codex keeps interrupted agents resumable but intentionally sends no
       // parent completion, so one-shot cleanup may settle until another turn starts.
       childState.settledWithoutCompletion = true;
-      await this.flushDeferredParentSettlements(childState.parentThreadId);
-      return;
+      return this.flushDeferredParentSettlements(childState.parentThreadId);
     }
     if (childState && turn) {
       this.captureChildTurnAssistantMessages(childState, turn);
@@ -507,7 +528,7 @@ export class CodexNativeSubagentMonitor {
     if (!state || !childState || childState.transcriptTerminal || !completion) {
       return;
     }
-    await this.processChildCompletion(state, childState, completion);
+    return this.processChildCompletion(state, childState, completion);
   }
 
   private async processChildCompletion(
