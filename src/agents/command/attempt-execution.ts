@@ -1241,6 +1241,7 @@ export function runAgentAttempt(params: {
     onAgentEvent: params.onAgentEvent,
     deferTerminalLifecycle: params.deferTerminalLifecycle,
     suppressNextUserMessagePersistence: params.suppressPromptPersistenceOnRetry === true,
+    suppressTranscriptOnlyAssistantPersistence: params.opts.modelRun === true,
     userTurnTranscriptRecorder: params.userTurnTranscriptRecorder,
     contextEngineLogicalTurnLease: params.contextEngineLogicalTurnLease,
     onContextEngineTurnCandidate: params.onContextEngineTurnCandidate,
