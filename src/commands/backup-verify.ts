@@ -158,7 +158,7 @@ function formatResult(result: BackupVerifyResult): string {
     `Archive entries scanned: ${result.entryCount}`,
     `Symbolic links checked: ${result.symlinkCount}`,
     ...(result.recoveryProfile
-      ? ["Recovery profile: local backup and internal-run artifacts were intentionally omitted."]
+      ? ["Recovery profile: legacy internal-run traces were verified as omitted."]
       : []),
   ].join("\n");
 }
@@ -645,7 +645,7 @@ async function verifyResolvedBackupArchive(archivePath: string): Promise<BackupV
     assetCount: manifest.assets.length,
     entryCount: rawEntries.length,
     symlinkCount: symbolicLinks.length,
-    ...(manifest.options?.recoveryProfile === true ? { recoveryProfile: true as const } : {}),
+    ...(manifest.options?.recoveryProfile ? { recoveryProfile: true as const } : {}),
   };
 
   return result;

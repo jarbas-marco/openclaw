@@ -95,6 +95,25 @@ describe("backupCreateCommand verify wrapper", () => {
     expect(typeof verifyLog).toBe("function");
   });
 
+  it("does not repeat verification already completed by recovery archive creation", async () => {
+    createBackupArchiveMock.mockResolvedValue({
+      archivePath: "/tmp/openclaw-recovery-backup.tar.gz",
+      assets: [],
+      verified: true,
+      dryRun: false,
+      includeWorkspace: false,
+      onlyConfig: false,
+    });
+
+    const result = await backupCreateCommand(createRuntime(), {
+      recoveryProfile: true,
+      verify: true,
+    });
+
+    expect(result.verified).toBe(true);
+    expect(backupVerifyCommandMock).not.toHaveBeenCalled();
+  });
+
   it("does not claim completion when both backup and outcome recording fail", async () => {
     const backupError = new Error("snapshot failed");
     createBackupArchiveMock.mockRejectedValue(backupError);

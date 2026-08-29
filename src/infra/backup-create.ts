@@ -25,7 +25,10 @@ import {
 } from "../state/openclaw-state-snapshot-sanitizer.js";
 import { resolveHomeDir, resolveUserPath, shortenHomePath } from "../utils.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
-import { assertArchiveSymbolicLinkTarget } from "./backup-archive-path-policy.js";
+import {
+  assertArchiveSymbolicLinkTarget,
+  normalizeArchivePath,
+} from "./backup-archive-path-policy.js";
 import {
   cleanupBackupArchivePublication,
   createBackupArchivePublication,
@@ -37,6 +40,13 @@ import {
   removePreparedBackupArchive,
   writeArchiveStreamToFile,
 } from "./backup-create-stream.js";
+import {
+  BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+  BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+  BACKUP_RECOVERY_PROFILE_STATE_ROOTS,
+  type BackupRecoveryProfileManifest,
+  buildBackupRecoveryProfileManifest,
+} from "./backup-recovery-profile.js";
 import { writeTarArchiveWithRetry } from "./backup-tar-retry.js";
 import { isTransientSqliteBackupPath, isVolatileBackupPath } from "./backup-volatile-filter.js";
 import {
@@ -64,8 +74,8 @@ export type BackupCreateOptions = {
   includeWorkspace?: boolean;
   onlyConfig?: boolean;
   /**
-   * Omit rebuildable recovery artifacts from the state asset. Durable paths
-   * configured beneath those roots are still retained.
+   * Omit non-authoritative legacy internal-run traces from the state asset.
+   * Configured paths beneath that root are refused.
    */
   recoveryProfile?: boolean;
   verify?: boolean;
@@ -86,7 +96,7 @@ type BackupManifestAsset = {
 };
 
 type BackupManifest = {
-  schemaVersion: 1;
+  schemaVersion: 1 | 2;
   createdAt: string;
   archiveRoot: string;
   runtimeVersion: string;
@@ -95,7 +105,7 @@ type BackupManifest = {
   options: {
     includeWorkspace: boolean;
     onlyConfig?: boolean;
-    recoveryProfile?: boolean;
+    recoveryProfile?: BackupRecoveryProfileManifest;
   };
   paths: {
     stateDir: string;
@@ -295,7 +305,10 @@ function buildManifest(params: {
   workspaceDirs: string[];
 }): BackupManifest {
   return {
-    schemaVersion: 1,
+    // Recovery-profile manifests have stricter omission semantics. Keep the
+    // normal format at v1 so existing readers continue to accept it, while an
+    // older reader rejects the new profile rather than restoring it blindly.
+    schemaVersion: params.recoveryProfile ? 2 : 1,
     createdAt: params.createdAt,
     archiveRoot: params.archiveRoot,
     runtimeVersion: resolveRuntimeServiceVersion(),
@@ -304,7 +317,7 @@ function buildManifest(params: {
     options: {
       includeWorkspace: params.includeWorkspace,
       onlyConfig: params.onlyConfig,
-      recoveryProfile: params.recoveryProfile || undefined,
+      recoveryProfile: params.recoveryProfile ? buildBackupRecoveryProfileManifest() : undefined,
     },
     paths: {
       stateDir: params.stateDir,
@@ -329,7 +342,7 @@ function buildManifest(params: {
 export function formatBackupCreateSummary(result: BackupCreateResult): string[] {
   const lines = [`Backup archive: ${result.archivePath}`];
   if (result.recoveryProfile) {
-    lines.push("Recovery profile: excluded rebuildable local backup and internal-run artifacts.");
+    lines.push("Recovery profile: excluded non-authoritative legacy internal-run traces.");
   }
   lines.push(`Included ${result.assets.length} path${result.assets.length === 1 ? "" : "s"}:`);
   for (const asset of result.assets) {
@@ -386,6 +399,49 @@ function normalizeBackupFilterPath(value: string): string {
 
 const NON_AUTHORITATIVE_STATE_ROOTS = new Set(["dev", "git", "npm", "npm-runtime", "tmp", "tools"]);
 
+function portableCasefoldArchivePath(value: string, label: string): string {
+  return normalizeArchivePath(value, label).normalize("NFC").toLocaleLowerCase("en-US");
+}
+
+function isPortableCasefoldArchivePathWithin(child: string, parent: string): boolean {
+  const normalizedChild = portableCasefoldArchivePath(child, "Backup archive path");
+  const normalizedParent = portableCasefoldArchivePath(parent, "Backup archive path");
+  return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
+}
+
+function resolveRecoveryProfileStateAsset(assets: readonly BackupAsset[]): BackupAsset {
+  const stateAssets = assets.filter((asset) => asset.kind === "state");
+  if (stateAssets.length !== 1 || !stateAssets[0]) {
+    throw new Error("Recovery-profile backup requires exactly one state asset.");
+  }
+  return stateAssets[0];
+}
+
+async function assertRecoveryProfilePreservedPaths(params: {
+  archiveRoot: string;
+  stateAsset: BackupAsset;
+  configPath: string;
+  oauthDir: string;
+  workspaceDirs: readonly string[];
+}): Promise<void> {
+  const preservedPaths = [params.configPath, params.oauthDir, ...params.workspaceDirs];
+  for (const excludedRoot of BACKUP_RECOVERY_PROFILE_STATE_ROOTS) {
+    const excludedArchiveRoot = path.posix.join(params.stateAsset.archivePath, excludedRoot);
+    for (const preservedPath of preservedPaths) {
+      const canonicalPreservedPath = await canonicalizePathForContainment(preservedPath);
+      const preservedArchivePath = buildBackupArchivePath(
+        params.archiveRoot,
+        canonicalPreservedPath,
+      );
+      if (isPortableCasefoldArchivePathWithin(preservedArchivePath, excludedArchiveRoot)) {
+        throw new Error(
+          `Recovery-profile backup cannot preserve excluded state path: ${preservedPath}`,
+        );
+      }
+    }
+  }
+}
+
 function buildStateBackupFilter(
   stateDir: string,
   preservedStatePaths: readonly string[] = [],
@@ -409,10 +465,13 @@ function buildStateBackupFilter(
           isPathWithin(resolvedFilePath, preservedPath) ||
           isPathWithin(preservedPath, resolvedFilePath),
       );
-    if (recoveryProfile && (segments[0] === "backups" || segments[0] === "internal-agent-runs")) {
-      // A configured config, credentials directory, or workspace can live
-      // below either rebuildable root. Keep only its path and ancestors.
-      return preservesPath();
+    if (
+      recoveryProfile &&
+      BACKUP_RECOVERY_PROFILE_STATE_ROOTS.some(
+        (root) => root === segments[0]?.normalize("NFC").toLocaleLowerCase("en-US"),
+      )
+    ) {
+      return false;
     }
     if (NON_AUTHORITATIVE_STATE_ROOTS.has(segments[0] ?? "")) {
       // Configured workspaces nested under a managed root remain authoritative
@@ -806,9 +865,36 @@ export async function createBackupArchive(
   const nowMs = resolveDateTimestampMs(opts.nowMs);
   const archiveRoot = buildBackupArchiveRoot(nowMs);
   const onlyConfig = Boolean(opts.onlyConfig);
-  const recoveryProfile = !onlyConfig && Boolean(opts.recoveryProfile);
+  if (onlyConfig && opts.recoveryProfile) {
+    throw new Error(
+      "--only-config cannot be combined with --recovery-profile. Choose one backup scope and try again.",
+    );
+  }
+  const recoveryProfile = Boolean(opts.recoveryProfile);
   const includeWorkspace = onlyConfig ? false : (opts.includeWorkspace ?? true);
   const plan = await resolveBackupPlanFromDisk({ includeWorkspace, onlyConfig, nowMs });
+  const stateAsset = recoveryProfile
+    ? resolveRecoveryProfileStateAsset(plan.included)
+    : plan.included.find((asset) => asset.kind === "state");
+  const preservedStatePaths = [
+    plan.configPath,
+    plan.oauthDir,
+    ...plan.skipped
+      .filter((asset) => asset.kind === "workspace" && asset.reason === "covered")
+      .map((asset) => asset.sourcePath),
+  ].filter((entry) => stateAsset && isPathWithin(entry, stateAsset.sourcePath));
+  if (recoveryProfile) {
+    if (!stateAsset) {
+      throw new Error("Recovery-profile backup state asset could not be resolved.");
+    }
+    await assertRecoveryProfilePreservedPaths({
+      archiveRoot,
+      stateAsset,
+      configPath: plan.configPath,
+      oauthDir: plan.oauthDir,
+      workspaceDirs: plan.workspaceDirs,
+    });
+  }
   const outputPath = await resolveOutputPath({
     output: opts.output,
     nowMs,
@@ -839,28 +925,19 @@ export async function createBackupArchive(
   }
 
   const createdAt = new Date(nowMs).toISOString();
-  const stateAsset = plan.included.find((asset) => asset.kind === "state");
   const pluginSkillsPath = stateAsset
     ? path.join(stateAsset.sourcePath, "plugin-skills")
     : undefined;
   const recoveryProfileSkipped =
     stateAsset && recoveryProfile
-      ? [
-          {
-            name: "backups",
-            kind: "local backup artifacts",
-            reason:
-              "recovery-profile: rebuildable local backups; configured durable descendants retained",
-          },
-          {
-            name: "internal-agent-runs",
-            kind: "internal agent run artifacts",
-            reason:
-              "recovery-profile: rebuildable internal runs; configured durable descendants retained",
-          },
-        ].map(({ name, kind, reason }) => {
+      ? BACKUP_RECOVERY_PROFILE_STATE_ROOTS.map((name) => {
           const sourcePath = path.join(stateAsset.sourcePath, name);
-          return { kind, sourcePath, displayPath: shortenHomePath(sourcePath), reason };
+          return {
+            kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+            sourcePath,
+            displayPath: shortenHomePath(sourcePath),
+            reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+          };
         })
       : [];
   const result: BackupCreateResult = {
@@ -894,13 +971,6 @@ export async function createBackupArchive(
     throw formatBackupOutputFailure(error, outputPath, "publication");
   }
   const tempArchivePath = publication.tempArchivePath;
-  const preservedStatePaths = [
-    plan.configPath,
-    plan.oauthDir,
-    ...plan.skipped
-      .filter((asset) => asset.kind === "workspace" && asset.reason === "covered")
-      .map((asset) => asset.sourcePath),
-  ].filter((entry) => stateAsset && isPathWithin(entry, stateAsset.sourcePath));
   try {
     // Capture every legacy file first, including active and claimed sources.
     // A concurrent Doctor then leaves each row in this snapshot, the later
@@ -1108,6 +1178,20 @@ export async function createBackupArchive(
     }).catch((error: unknown) => {
       throw formatBackupOutputFailure(error, outputPath, "write", publication.stagingDir);
     });
+    if (recoveryProfile) {
+      try {
+        // Recovery-profile omissions are a restore contract, so prove the
+        // staged archive satisfies that contract before it becomes visible.
+        const { verifyBackupArchive } = await import("../commands/backup-verify.js");
+        await verifyBackupArchive(completedArchive.archivePath);
+        result.verified = true;
+      } catch (error) {
+        if (!removePreparedBackupArchive(completedArchive)) {
+          publication.pendingCleanupArchives.push(completedArchive);
+        }
+        throw error;
+      }
+    }
     result.skippedVolatileCount = skippedVolatileCount;
     if (pluginSkillsPath && skippedPluginSkills) {
       result.skipped.push({

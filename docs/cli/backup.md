@@ -48,11 +48,15 @@ Archive `create`, `verify`, and `restore`, plus SQLite `create`, `list`, `verify
 - Existing archive files are never overwritten. Output paths inside the source state/workspace trees are rejected to avoid self-inclusion.
 - `openclaw backup verify <archive>` checks that the archive contains exactly one root manifest, rejects traversal-style archive paths, absolute or archive-escaping symbolic links, and SQLite sidecars, confirms every manifest-declared payload exists, validates every SQLite snapshot's file shape, and runs full integrity and role checks on canonical OpenClaw databases. Dedicated plugin schemas remain opaque because they may require owner-defined SQLite capabilities. `openclaw backup create --verify` runs that validation immediately after writing the archive.
 - `openclaw backup create --only-config` backs up just the active JSON config file.
-- `openclaw backup create --recovery-profile` omits only `backups/` and
-  `internal-agent-runs/` below the state directory, because those are rebuildable
-  local backup and internal-run artifacts. Config, credentials, configured
-  workspaces, SQLite, browser, media, agents, and sessions remain in scope; an
-  explicitly configured durable path beneath either omitted root is retained.
+- `openclaw backup create --recovery-profile` adds one omission to the normal
+  volatile-state filters: legacy `internal-agent-runs/` traces below the state
+  directory. They are diagnostic artifacts rather than the authoritative SQLite
+  session store. The profile refuses config, credentials, or workspaces located
+  anywhere below that omitted root; move them outside the root before creating
+  a recovery backup. SQLite, browser, media, agents, non-volatile session data,
+  and migration originals under `backups/` remain included. Its manifest uses
+  schema v2 and is fully verified while staged before publication; normal
+  archive manifests remain schema v1.
 
 ## Restore a full archive
 

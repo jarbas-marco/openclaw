@@ -165,9 +165,7 @@ export async function backupRestoreCommand(
     warnings: [
       ...BACKUP_RESTORE_WARNINGS,
       ...(verified.recoveryProfile
-        ? [
-            "This archive used the recovery profile; rebuild local backups and internal-run artifacts after activation.",
-          ]
+        ? ["This archive used the recovery profile; legacy internal-run traces were not included."]
         : []),
     ],
   };

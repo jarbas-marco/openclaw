@@ -46,7 +46,7 @@ export function registerBackupCommand(program: Command) {
     .option("--only-config", "Back up only the active JSON config file", false)
     .option(
       "--recovery-profile",
-      "Exclude rebuildable local backups and internal-run artifacts from the state backup",
+      "Exclude non-authoritative legacy internal-run traces from the state backup",
       false,
     )
     .option("--no-include-workspace", "Exclude workspace directories from the backup")
@@ -74,7 +74,7 @@ export function registerBackupCommand(program: Command) {
           ["openclaw backup create --only-config", "Back up only the active JSON config file."],
           [
             "openclaw backup create --recovery-profile",
-            "Back up durable state while omitting rebuildable local backup and internal-run artifacts.",
+            "Back up durable state while omitting non-authoritative legacy internal-run traces.",
           ],
         ])}`,
     )

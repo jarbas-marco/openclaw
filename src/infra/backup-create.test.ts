@@ -731,7 +731,169 @@ describe("createBackupArchive", () => {
     );
   });
 
-  it("keeps durable state while the recovery profile excludes only rebuildable roots", async () => {
+  it("rejects contradictory config-only and recovery profile scopes", async () => {
+    await expect(createBackupArchive({ onlyConfig: true, recoveryProfile: true })).rejects.toThrow(
+      /--only-config cannot be combined with --recovery-profile/iu,
+    );
+  });
+
+  it("rejects a recovery profile without a state asset before writing an archive", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-recovery-no-state-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputPath = state.path("archive.tar.gz");
+        await fs.rm(state.stateDir, { recursive: true, force: true });
+
+        await expect(
+          createBackupArchive({ output: outputPath, recoveryProfile: true }),
+        ).rejects.toThrow(/requires exactly one state asset/iu);
+        await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+      },
+    );
+  });
+
+  it.each([
+    {
+      name: "config",
+      configure: async (state: OpenClawTestState, excludedRoot: string) => {
+        state.envVars.OPENCLAW_CONFIG_PATH = excludedRoot;
+        state.applyEnv();
+        await fs.mkdir(path.dirname(excludedRoot), { recursive: true });
+        await fs.writeFile(excludedRoot, "{}\n", "utf8");
+      },
+    },
+    {
+      name: "oauth",
+      configure: async (state: OpenClawTestState, excludedRoot: string) => {
+        state.envVars.OPENCLAW_OAUTH_DIR = excludedRoot;
+        state.applyEnv();
+        await fs.mkdir(excludedRoot, { recursive: true });
+      },
+    },
+    {
+      name: "workspace",
+      configure: async (state: OpenClawTestState, excludedRoot: string) => {
+        await fs.mkdir(excludedRoot, { recursive: true });
+        await state.writeConfig({
+          agents: { entries: { main: { default: true, workspace: excludedRoot } } },
+        });
+      },
+    },
+  ])(
+    "rejects a recovery profile preserving an excluded $name path before publication",
+    async ({ configure }) => {
+      await withOpenClawTestState(
+        {
+          layout: "state-only",
+          prefix: "openclaw-backup-recovery-preserved-root-",
+          scenario: "minimal",
+        },
+        async (state) => {
+          const excludedRoot = state.statePath("internal-agent-runs", "declared");
+          const outputPath = state.path("archive.tar.gz");
+          await configure(state, excludedRoot);
+
+          await expect(
+            createBackupArchive({ output: outputPath, recoveryProfile: true }),
+          ).rejects.toThrow(/cannot preserve excluded state path/iu);
+          await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+        },
+      );
+    },
+  );
+
+  it.each([
+    {
+      name: "config",
+      configure: async (state: OpenClawTestState, targetPath: string) => {
+        const linkPath = state.path("config-link.json");
+        state.envVars.OPENCLAW_CONFIG_PATH = linkPath;
+        state.applyEnv();
+        await fs.mkdir(path.dirname(targetPath), { recursive: true });
+        await fs.writeFile(targetPath, "{}\n", "utf8");
+        await fs.symlink(targetPath, linkPath);
+      },
+    },
+    {
+      name: "oauth",
+      configure: async (state: OpenClawTestState, targetPath: string) => {
+        const linkPath = state.path("oauth-link");
+        state.envVars.OPENCLAW_OAUTH_DIR = linkPath;
+        state.applyEnv();
+        await fs.mkdir(targetPath, { recursive: true });
+        await fs.symlink(targetPath, linkPath);
+      },
+    },
+    {
+      name: "workspace",
+      configure: async (state: OpenClawTestState, targetPath: string) => {
+        const linkPath = state.path("workspace-link");
+        await fs.mkdir(targetPath, { recursive: true });
+        await fs.symlink(targetPath, linkPath);
+        await state.writeConfig({
+          agents: { entries: { main: { default: true, workspace: linkPath } } },
+        });
+      },
+    },
+  ])(
+    "rejects a recovery profile whose $name symlink resolves under the excluded root",
+    async ({ configure }) => {
+      await withOpenClawTestState(
+        {
+          layout: "state-only",
+          prefix: "openclaw-backup-recovery-symlinked-root-",
+          scenario: "minimal",
+        },
+        async (state) => {
+          const outputPath = state.path("archive.tar.gz");
+          await configure(state, state.statePath("internal-agent-runs", "linked"));
+
+          await expect(
+            createBackupArchive({ output: outputPath, recoveryProfile: true }),
+          ).rejects.toThrow(/cannot preserve excluded state path/iu);
+          await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+        },
+      );
+    },
+  );
+
+  it("removes a rejected staged recovery archive without touching source state", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-recovery-staged-validation-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputPath = state.path("archive.tar.gz");
+        const sourcePath = state.statePath("durable.txt");
+        await state.writeText("durable.txt", "keep\n");
+        const verifyModule = await import("../commands/backup-verify.js");
+        const verifySpy = vi
+          .spyOn(verifyModule, "verifyBackupArchive")
+          .mockRejectedValueOnce(new Error("recovery profile validation failed"));
+        try {
+          await expect(
+            createBackupArchive({ output: outputPath, recoveryProfile: true }),
+          ).rejects.toThrow(/recovery profile validation failed/iu);
+        } finally {
+          verifySpy.mockRestore();
+        }
+
+        await expect(fs.access(outputPath)).rejects.toMatchObject({ code: "ENOENT" });
+        await expect(fs.readFile(sourcePath, "utf8")).resolves.toBe("keep\n");
+        await expect(fs.readdir(path.dirname(outputPath))).resolves.not.toContain(
+          expect.stringMatching(/^\.openclaw-backup-publish-/u),
+        );
+      },
+    );
+  });
+
+  it("keeps durable state while the recovery profile excludes legacy internal-run traces", async () => {
     await withOpenClawTestState(
       {
         layout: "state-only",
@@ -740,16 +902,21 @@ describe("createBackupArchive", () => {
       },
       async (state) => {
         const outputDir = state.path("archive-output");
-        const nestedWorkspace = state.statePath("backups", "workspace");
+        const nestedWorkspace = state.statePath("workspace");
         await fs.mkdir(outputDir, { recursive: true });
         await fs.mkdir(nestedWorkspace, { recursive: true });
         await state.writeConfig({
           agents: { entries: { main: { default: true, workspace: nestedWorkspace } } },
         });
-        await state.writeText("backups/prior.tar.gz", "old backup\n");
-        createEmptySqliteDatabase(state.statePath("backups", "ignored.sqlite"));
-        await state.writeText("backups/workspace/KEEP.md", "configured workspace\n");
+        await state.writeText(
+          "backups/heartbeat-migration/HEARTBEAT.md",
+          "preserved migration original\n",
+        );
+        await state.writeText("backups/tools-md-migration/TOOLS.md", "preserved tools original\n");
+        createEmptySqliteDatabase(state.statePath("backups", "preserved.sqlite"));
+        await state.writeText("workspace/KEEP.md", "configured workspace\n");
         await state.writeText("internal-agent-runs/run.json", "transient run\n");
+        await state.writeText("Internal-Agent-Runs/case-variant-run.json", "transient run\n");
         await state.writeText("credentials/auth.json", "credential\n");
         await state.writeText("browser/profile/state.json", "browser\n");
         await state.writeText("media/photo.txt", "media\n");
@@ -765,23 +932,16 @@ describe("createBackupArchive", () => {
         expect(result.skipped).toEqual(
           expect.arrayContaining([
             expect.objectContaining({
-              kind: "local backup artifacts",
-              sourcePath: state.statePath("backups"),
-              reason:
-                "recovery-profile: rebuildable local backups; configured durable descendants retained",
-            }),
-            expect.objectContaining({
-              kind: "internal agent run artifacts",
+              kind: "legacy internal run artifacts",
               sourcePath: state.statePath("internal-agent-runs"),
               reason:
-                "recovery-profile: rebuildable internal runs; configured durable descendants retained",
+                "recovery-profile: non-authoritative legacy internal-run traces excluded in full",
             }),
           ]),
         );
         for (const suffix of [
-          "/backups/prior.tar.gz",
-          "/backups/ignored.sqlite",
           "/internal-agent-runs/run.json",
+          "/Internal-Agent-Runs/case-variant-run.json",
         ]) {
           expect(
             entries.some((entry) => entry.endsWith(suffix)),
@@ -792,7 +952,10 @@ describe("createBackupArchive", () => {
           "/credentials/auth.json",
           "/browser/profile/state.json",
           "/media/photo.txt",
-          "/backups/workspace/KEEP.md",
+          "/backups/heartbeat-migration/HEARTBEAT.md",
+          "/backups/tools-md-migration/TOOLS.md",
+          "/backups/preserved.sqlite",
+          "/workspace/KEEP.md",
         ]) {
           expect(
             entries.some((entry) => entry.endsWith(suffix)),
@@ -806,6 +969,26 @@ describe("createBackupArchive", () => {
           ok: true,
           recoveryProfile: true,
         });
+        const extractDir = state.path("recovery-profile-extract");
+        await fs.mkdir(extractDir);
+        await tar.x({ file: result.archivePath, gzip: true, cwd: extractDir });
+        const manifest = JSON.parse(
+          await fs.readFile(path.join(extractDir, result.archiveRoot, "manifest.json"), "utf8"),
+        ) as Record<string, unknown>;
+        expect(manifest).toMatchObject({
+          schemaVersion: 2,
+          options: {
+            recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] },
+          },
+        });
+        expect(manifest.skipped).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: "legacy internal run artifacts",
+              sourcePath: state.statePath("internal-agent-runs"),
+            }),
+          ]),
+        );
 
         const normal = await createBackupArchive({
           output: outputDir,
@@ -813,8 +996,14 @@ describe("createBackupArchive", () => {
         });
         const normalEntries = await listArchiveEntries(normal.archivePath);
         expect(normal.recoveryProfile).toBeUndefined();
-        expect(normalEntries.some((entry) => entry.endsWith("/backups/prior.tar.gz"))).toBe(true);
-        expect(normalEntries.some((entry) => entry.endsWith("/backups/ignored.sqlite"))).toBe(true);
+        expect(
+          normalEntries.some((entry) =>
+            entry.endsWith("/backups/heartbeat-migration/HEARTBEAT.md"),
+          ),
+        ).toBe(true);
+        expect(normalEntries.some((entry) => entry.endsWith("/backups/preserved.sqlite"))).toBe(
+          true,
+        );
         expect(normalEntries.some((entry) => entry.endsWith("/internal-agent-runs/run.json"))).toBe(
           true,
         );
