@@ -4,7 +4,7 @@ import { withExistingOpenClawStateDatabaseArtifactPreservingReadOnly } from "../
 import type { OpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { INGRESS_CLAIM_LEASE_MS } from "./ingress-claim-owner.js";
-import { getChannelIngressKysely, openChannelIngressDatabase } from "./ingress-queue.js";
+import { getChannelIngressKysely } from "./ingress-queue.js";
 import { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } from "./ingress-retry-policy.js";
 
 /** Count failed channel ingress events per channel account for operator health surfaces. */
@@ -108,7 +108,7 @@ export function countChannelIngressQueuePressureInDatabase(database: OpenClawSta
 
 function withExistingIngressState<T>(
   stateDir: string | undefined,
-  read: (database: ReturnType<typeof openChannelIngressDatabase>) => T[],
+  read: (database: { db: OpenClawStateDatabase["db"] }) => T[],
 ): T[] {
   return (
     withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(
