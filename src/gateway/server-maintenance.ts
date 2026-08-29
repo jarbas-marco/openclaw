@@ -130,8 +130,8 @@ export function startGatewayMaintenanceTimers(params: {
     logger: params.logHealth,
   });
 
-  let nextTelemetryCheckAtMs =
-    Date.now() + Math.floor(Math.random() * TELEMETRY_MAINTENANCE_INTERVAL_MS);
+  const initialTelemetryJitterMs = Math.floor(Math.random() * TELEMETRY_MAINTENANCE_INTERVAL_MS);
+  let nextTelemetryCheckAtMs = Date.now() + initialTelemetryJitterMs;
   // periodic keepalive
   const tickInterval = setInterval(() => {
     void hostThawRecovery.tick();
