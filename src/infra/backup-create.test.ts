@@ -747,6 +747,7 @@ describe("createBackupArchive", () => {
           agents: { entries: { main: { default: true, workspace: nestedWorkspace } } },
         });
         await state.writeText("backups/prior.tar.gz", "old backup\n");
+        createEmptySqliteDatabase(state.statePath("backups", "ignored.sqlite"));
         await state.writeText("backups/workspace/KEEP.md", "configured workspace\n");
         await state.writeText("internal-agent-runs/run.json", "transient run\n");
         await state.writeText("credentials/auth.json", "credential\n");
@@ -755,7 +756,6 @@ describe("createBackupArchive", () => {
 
         const result = await createBackupArchive({
           output: outputDir,
-          includeWorkspace: false,
           recoveryProfile: true,
           nowMs: Date.UTC(2026, 4, 9, 8, 0, 0),
         });
@@ -767,16 +767,22 @@ describe("createBackupArchive", () => {
             expect.objectContaining({
               kind: "local backup artifacts",
               sourcePath: state.statePath("backups"),
-              reason: "recovery-profile: rebuildable local backups",
+              reason:
+                "recovery-profile: rebuildable local backups; configured durable descendants retained",
             }),
             expect.objectContaining({
               kind: "internal agent run artifacts",
               sourcePath: state.statePath("internal-agent-runs"),
-              reason: "recovery-profile: rebuildable internal runs",
+              reason:
+                "recovery-profile: rebuildable internal runs; configured durable descendants retained",
             }),
           ]),
         );
-        for (const suffix of ["/backups/prior.tar.gz", "/internal-agent-runs/run.json"]) {
+        for (const suffix of [
+          "/backups/prior.tar.gz",
+          "/backups/ignored.sqlite",
+          "/internal-agent-runs/run.json",
+        ]) {
           expect(
             entries.some((entry) => entry.endsWith(suffix)),
             suffix,
@@ -803,12 +809,12 @@ describe("createBackupArchive", () => {
 
         const normal = await createBackupArchive({
           output: outputDir,
-          includeWorkspace: false,
           nowMs: Date.UTC(2026, 4, 9, 8, 1, 0),
         });
         const normalEntries = await listArchiveEntries(normal.archivePath);
         expect(normal.recoveryProfile).toBeUndefined();
         expect(normalEntries.some((entry) => entry.endsWith("/backups/prior.tar.gz"))).toBe(true);
+        expect(normalEntries.some((entry) => entry.endsWith("/backups/ignored.sqlite"))).toBe(true);
         expect(normalEntries.some((entry) => entry.endsWith("/internal-agent-runs/run.json"))).toBe(
           true,
         );

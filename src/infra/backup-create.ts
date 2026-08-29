@@ -849,12 +849,14 @@ export async function createBackupArchive(
           {
             name: "backups",
             kind: "local backup artifacts",
-            reason: "recovery-profile: rebuildable local backups",
+            reason:
+              "recovery-profile: rebuildable local backups; configured durable descendants retained",
           },
           {
             name: "internal-agent-runs",
             kind: "internal agent run artifacts",
-            reason: "recovery-profile: rebuildable internal runs",
+            reason:
+              "recovery-profile: rebuildable internal runs; configured durable descendants retained",
           },
         ].map(({ name, kind, reason }) => {
           const sourcePath = path.join(stateAsset.sourcePath, name);
