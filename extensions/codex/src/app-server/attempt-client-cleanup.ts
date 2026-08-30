@@ -2,13 +2,19 @@
  * Best-effort cleanup helpers for Codex app-server startup attempts and turns.
  */
 import { embeddedAgentLog } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { resolvePositiveTimerTimeoutMs } from "openclaw/plugin-sdk/number-runtime";
 import { unsubscribeCodexAppServerLiveThread } from "./client-runtime.js";
 import { CodexAppServerRpcError, type CodexAppServerClient } from "./client.js";
-import { retireSharedCodexAppServerClientIfCurrent } from "./shared-client.js";
+import {
+  retainSharedCodexAppServerClientIfCurrent,
+  retireSharedCodexAppServerClientIfCurrent,
+} from "./shared-client.js";
 import { getCodexAppServerTurnRouter } from "./turn-router.js";
 
 /** Timeout for best-effort app-server turn interruption during cleanup. */
 export const CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS = 5_000;
+/** Timeout for best-effort cleanup of background terminals owned by a thread. */
+const CODEX_APP_SERVER_BACKGROUND_TERMINAL_CLEAN_TIMEOUT_MS = 5_000;
 /** Timeout for best-effort thread unsubscribe during cleanup. */
 export const CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
 const CODEX_NO_ACTIVE_TURN_ERROR_CODE = -32_600;
@@ -109,10 +115,10 @@ export async function interruptCodexTurnAndWaitBestEffort(
     timeoutMs?: number;
   },
 ): Promise<boolean> {
-  const timeoutMs =
-    params.timeoutMs && Number.isFinite(params.timeoutMs) && params.timeoutMs > 0
-      ? params.timeoutMs
-      : CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS;
+  const timeoutMs = resolvePositiveTimerTimeoutMs(
+    params.timeoutMs,
+    CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
+  );
   const requestParams = { threadId: params.threadId, turnId: params.turnId };
   let completion: { completion: Promise<boolean>; cancel: () => void } | undefined;
   try {
@@ -136,6 +142,51 @@ export async function interruptCodexTurnAndWaitBestEffort(
   } finally {
     completion?.cancel();
   }
+}
+
+/** Cleans background terminal processes after an explicit stop or timeout. */
+async function cleanCodexBackgroundTerminalsBestEffort(
+  client: CodexAppServerClient,
+  params: {
+    threadId: string;
+    timeoutMs?: number;
+  },
+): Promise<boolean> {
+  const timeoutMs = resolvePositiveTimerTimeoutMs(
+    params.timeoutMs,
+    CODEX_APP_SERVER_BACKGROUND_TERMINAL_CLEAN_TIMEOUT_MS,
+  );
+  try {
+    await client.request(
+      "thread/backgroundTerminals/clean",
+      { threadId: params.threadId },
+      { timeoutMs },
+    );
+    return true;
+  } catch (error) {
+    embeddedAgentLog.debug("codex app-server background terminal cleanup failed", {
+      threadId: params.threadId,
+      error,
+    });
+    return false;
+  }
+}
+
+/** Stops one turn and then removes terminal processes that can outlive it. */
+export async function stopCodexTurnAndBackgroundTerminalsBestEffort(
+  client: CodexAppServerClient,
+  params: {
+    threadId: string;
+    turnId: string;
+    timeoutMs?: number;
+  },
+): Promise<boolean> {
+  const interrupted = await interruptCodexTurnAndWaitBestEffort(client, params);
+  const cleaned = await cleanCodexBackgroundTerminalsBestEffort(client, {
+    threadId: params.threadId,
+    timeoutMs: params.timeoutMs,
+  });
+  return interrupted && cleaned;
 }
 
 /** Unsubscribes from a thread while swallowing cleanup-only failures. */
@@ -177,26 +228,36 @@ export async function retireCodexAppServerClientAfterTimedOutTurn(
     suspectPhysicalClient: boolean;
   },
 ): Promise<void> {
-  const retiredSharedClient = retireSharedCodexAppServerClientIfCurrent(client, {
-    failActiveLeases: params.suspectPhysicalClient,
-  });
+  // A terminal-idle timeout makes the physical client suspect. Pin it while
+  // detaching from the acquisition pool so bounded remote cleanup can run
+  // before the forced close fails sibling leases onto their retry path.
+  const releaseCleanupLease = params.suspectPhysicalClient
+    ? retainSharedCodexAppServerClientIfCurrent(client)
+    : undefined;
+  const retiredSharedClient = retireSharedCodexAppServerClientIfCurrent(client);
   const detachedSharedClient = Boolean(retiredSharedClient);
-  const clientAlreadyClosed =
-    params.suspectPhysicalClient && (retiredSharedClient?.closed ?? false);
-  // Best-effort interrupt/unsubscribe only make sense while the transport is
-  // still open; a suspect client was just closed (child gets SIGKILLed).
-  if (!clientAlreadyClosed) {
-    await interruptCodexTurnAndWaitBestEffort(client, {
-      threadId: params.threadId,
-      turnId: params.turnId,
-      timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
-    });
-    await unsubscribeCodexThreadBestEffort(client, {
-      threadId: params.threadId,
-      timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
-    });
-  }
   let closedClient = retiredSharedClient?.closed ?? false;
+  try {
+    if (!closedClient) {
+      await stopCodexTurnAndBackgroundTerminalsBestEffort(client, {
+        threadId: params.threadId,
+        turnId: params.turnId,
+        timeoutMs: CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
+      });
+      await unsubscribeCodexThreadBestEffort(client, {
+        threadId: params.threadId,
+        timeoutMs: CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS,
+      });
+    }
+  } finally {
+    if (params.suspectPhysicalClient && detachedSharedClient) {
+      const forcedRetirement = retireSharedCodexAppServerClientIfCurrent(client, {
+        failActiveLeases: true,
+      });
+      closedClient = forcedRetirement?.closed ?? closedClient;
+    }
+    releaseCleanupLease?.();
+  }
   if (!detachedSharedClient) {
     const close = (client as { close?: () => void }).close;
     if (typeof close === "function") {
@@ -218,6 +279,9 @@ export async function retireCodexAppServerClientAfterTimedOutTurn(
     reason: params.reason,
     detachedSharedClient,
     closedClient,
-    activeSharedClientLeases: retiredSharedClient?.activeLeases ?? 0,
+    activeSharedClientLeases: Math.max(
+      0,
+      (retiredSharedClient?.activeLeases ?? 0) - (releaseCleanupLease ? 1 : 0),
+    ),
   });
 }

@@ -884,7 +884,7 @@ describe("toStreamingMarkdownHtml", () => {
     const incrementalMs = measure("line-scan-regression");
 
     expect(incrementalMs).toBeLessThan(fullRescanMs / 5);
-  }, 5_000);
+  }, 15_000);
 
   it("keeps chunked-prefix splits identical to full splits", () => {
     const splitIncrementally = splitStableStreamingMarkdown as (

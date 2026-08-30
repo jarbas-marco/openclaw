@@ -10,6 +10,7 @@ import {
   setCommandLaneConcurrency,
 } from "../process/command-queue.js";
 import { CommandLane } from "../process/lanes.js";
+import type { GatewayEventLoopHealth } from "./server/event-loop-health.js";
 
 type GatewayLaneConcurrency = {
   cron: number;
@@ -25,11 +26,38 @@ type GatewayLaneConcurrency = {
   subagent: number;
 };
 
+type GatewayLaneHealthSample = Pick<GatewayEventLoopHealth, "degraded"> &
+  Partial<Pick<GatewayEventLoopHealth, "reasons">>;
+
+type GatewayLanePressureTransition = {
+  configured: GatewayLaneConcurrency;
+  degraded: boolean;
+  effective: GatewayLaneConcurrency;
+  pressureFactor: number;
+  pressureLevel: number;
+  reasons: GatewayEventLoopHealth["reasons"];
+};
+
 /** Capacity held inside the cron budget so hook dispatch cannot be starved. */
 const HOOK_DISPATCH_LANE_RESERVATION = 1;
 
 /** Group bounding cron inner work and hook dispatch to one shared budget. */
 const CRON_HOOK_LANE_GROUP = "cron-hooks";
+
+// Five seconds is longer than the event-loop monitor's one-second load window,
+// yet reacts well before its 60-second persistent-degradation warning.
+const GATEWAY_LANE_HEALTH_SAMPLE_INTERVAL_MS = 5_000;
+// Fifteen healthy seconds per step prevents one quiet sample from reopening a
+// bursty queue and immediately re-triggering pressure.
+const GATEWAY_LANE_HEALTHY_SAMPLES_TO_RECOVER = 3;
+// Ratchet capacity over three samples instead of collapsing on one spike; the
+// positive-lane floor below keeps every configured capability available.
+const GATEWAY_LANE_PRESSURE_FACTORS = [1, 0.75, 0.5, 0.25] as const;
+
+let configuredGatewayLaneConcurrency: GatewayLaneConcurrency | undefined;
+let gatewayLanePressureLevel = 0;
+let consecutiveHealthyGatewayLaneSamples = 0;
+let lastObservedGatewayLaneHealth: GatewayLaneHealthSample | undefined;
 
 export function resolveGatewayLaneConcurrency(cfg: OpenClawConfig): GatewayLaneConcurrency {
   const cron = resolveCronMaxConcurrentRuns();
@@ -49,7 +77,95 @@ export function applyGatewayLaneConcurrency(
 ): void {
   if (opts.gatewayStart) {
     enableSessionSuspensionWritesForGatewayStart();
+    gatewayLanePressureLevel = 0;
+    consecutiveHealthyGatewayLaneSamples = 0;
+    lastObservedGatewayLaneHealth = undefined;
   }
+  configuredGatewayLaneConcurrency = { ...concurrency };
+  applyEffectiveGatewayLaneConcurrency(scaleGatewayLaneConcurrency(concurrency), opts);
+}
+
+/** Adjusts only future admissions while preserving configured healthy ceilings. */
+function observeGatewayLaneHealth(
+  health: GatewayLaneHealthSample | undefined,
+): GatewayLanePressureTransition | undefined {
+  // `snapshot()` returns its cached object when no fresh measurement exists.
+  // Count equal-valued new objects as new samples, but never ratchet twice on
+  // the same cached reference observed by adjacent lifecycle consumers.
+  if (!health || !configuredGatewayLaneConcurrency || health === lastObservedGatewayLaneHealth) {
+    return undefined;
+  }
+  lastObservedGatewayLaneHealth = health;
+  const previousPressureLevel = gatewayLanePressureLevel;
+  if (health.degraded) {
+    consecutiveHealthyGatewayLaneSamples = 0;
+    gatewayLanePressureLevel = Math.min(
+      GATEWAY_LANE_PRESSURE_FACTORS.length - 1,
+      gatewayLanePressureLevel + 1,
+    );
+  } else if (gatewayLanePressureLevel > 0) {
+    consecutiveHealthyGatewayLaneSamples += 1;
+    if (consecutiveHealthyGatewayLaneSamples >= GATEWAY_LANE_HEALTHY_SAMPLES_TO_RECOVER) {
+      consecutiveHealthyGatewayLaneSamples = 0;
+      gatewayLanePressureLevel -= 1;
+    }
+  } else {
+    consecutiveHealthyGatewayLaneSamples = 0;
+  }
+  if (gatewayLanePressureLevel === previousPressureLevel) {
+    return undefined;
+  }
+  const effective = scaleGatewayLaneConcurrency(configuredGatewayLaneConcurrency);
+  applyEffectiveGatewayLaneConcurrency(effective);
+  return {
+    configured: { ...configuredGatewayLaneConcurrency },
+    degraded: health.degraded,
+    effective,
+    pressureFactor: resolveGatewayLanePressureFactor(),
+    pressureLevel: gatewayLanePressureLevel,
+    reasons: health.reasons ?? [],
+  };
+}
+
+/** Starts the lifecycle-owned event-loop sampler that controls new admissions. */
+export function startGatewayLaneAdmissionMonitor(
+  sampleHealth: () => GatewayLaneHealthSample | undefined,
+  onPressureTransition?: (transition: GatewayLanePressureTransition) => void,
+): { stop: () => void } {
+  const timer = setInterval(() => {
+    try {
+      const transition = observeGatewayLaneHealth(sampleHealth());
+      if (transition) {
+        onPressureTransition?.(transition);
+      }
+    } catch {
+      // Health sampling and observability callbacks are advisory. A faulty
+      // probe/logger must not escape its timer and terminate the gateway.
+    }
+  }, GATEWAY_LANE_HEALTH_SAMPLE_INTERVAL_MS);
+  timer.unref?.();
+  return { stop: () => clearInterval(timer) };
+}
+
+function scaleGatewayLaneConcurrency(concurrency: GatewayLaneConcurrency): GatewayLaneConcurrency {
+  const factor = resolveGatewayLanePressureFactor();
+  const scale = (value: number) => (value <= 0 ? 0 : Math.max(1, Math.floor(value * factor)));
+  return {
+    cron: scale(concurrency.cron),
+    hookDispatch: scale(concurrency.hookDispatch),
+    main: scale(concurrency.main),
+    subagent: scale(concurrency.subagent),
+  };
+}
+
+function resolveGatewayLanePressureFactor(): number {
+  return GATEWAY_LANE_PRESSURE_FACTORS[gatewayLanePressureLevel] ?? 1;
+}
+
+function applyEffectiveGatewayLaneConcurrency(
+  concurrency: GatewayLaneConcurrency,
+  opts: { gatewayStart?: boolean } = {},
+): void {
   // Resolution is deliberately separate: this commit-edge applier only updates
   // live queue state and cannot reject a config midway through publication.
   setCommandLaneConcurrency(CommandLane.Cron, concurrency.cron);

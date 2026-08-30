@@ -1,4 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
+import type { LookupAddress } from "node:dns";
 import type {
   IncomingHttpHeaders,
   IncomingMessage,
@@ -6,7 +7,7 @@ import type {
   ServerResponse,
 } from "node:http";
 import { request as requestHttp } from "node:http";
-import net, { type Socket } from "node:net";
+import net, { type Socket, type TcpSocketConnectOpts } from "node:net";
 import type { Duplex } from "node:stream";
 
 const PORTAL_AUTH_NAME = "openclaw_portal";
@@ -35,6 +36,35 @@ const HOP_BY_HOP_HEADERS = new Set([
   "transfer-encoding",
   "upgrade",
 ]);
+
+const portalLoopbackLookup: NonNullable<TcpSocketConnectOpts["lookup"]> = (
+  _hostname,
+  options,
+  callback,
+) => {
+  const ipv4Loopback: LookupAddress = { address: "127.0.0.1", family: 4 };
+  const addresses: LookupAddress[] = [ipv4Loopback, { address: "::1", family: 6 }];
+  const requestedFamily =
+    options.family === "IPv4" ? 4 : options.family === "IPv6" ? 6 : options.family;
+  const eligible = requestedFamily
+    ? addresses.filter((address) => address.family === requestedFamily)
+    : addresses;
+  if (options.all) {
+    callback(null, eligible);
+    return;
+  }
+  const address = eligible[0] ?? ipv4Loopback;
+  callback(null, address.address, address.family);
+};
+
+function connectPortalLoopback(port: number): Socket {
+  return net.connect({
+    host: "localhost",
+    autoSelectFamily: true,
+    lookup: portalLoopbackLookup,
+    port,
+  });
+}
 
 type PortalProxyTarget = {
   listenPort: number;
@@ -270,8 +300,7 @@ export function handlePortalProxyRequest(params: {
   // Next.js) often bind ::1 only, and family autoselection reaches either stack.
   const proxyReq = requestHttp({
     hostname: "localhost",
-    createConnection: () =>
-      net.connect({ host: "localhost", autoSelectFamily: true, port: target.targetPort }),
+    createConnection: () => connectPortalLoopback(target.targetPort),
     port: target.targetPort,
     method: req.method,
     path: authorization.requestPath,
@@ -391,11 +420,7 @@ export function handlePortalProxyUpgrade(params: {
   }
 
   // Same localhost/dual-stack contract as the HTTP path above.
-  const targetSocket: Socket = net.connect({
-    host: "localhost",
-    autoSelectFamily: true,
-    port: target.targetPort,
-  });
+  const targetSocket = connectPortalLoopback(target.targetPort);
   upgradedSockets.add(socket);
   upgradedSockets.add(targetSocket);
   const release = (stream: Duplex) => upgradedSockets.delete(stream);

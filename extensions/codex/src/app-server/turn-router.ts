@@ -15,6 +15,19 @@ import {
 } from "./protocol.js";
 
 const DEFAULT_PREBIND_NOTIFICATION_LIMIT = 256;
+// Bound each delayed string join so coalescing removes promise pressure without
+// replacing it with a single large allocation or long handler latency spike.
+const MAX_COALESCED_DELTA_LENGTH = 64 * 1024;
+// Empty and tiny deltas also need a count bound; byte length alone would let an
+// arbitrary number of chunks accumulate inside one queue entry.
+const MAX_COALESCED_DELTA_CHUNKS = 256;
+const COALESCIBLE_DELTA_METHODS = new Set([
+  "item/agentMessage/delta",
+  "item/reasoning/summaryTextDelta",
+  "item/reasoning/textDelta",
+  "item/plan/delta",
+  "item/commandExecution/outputDelta",
+]);
 export const CODEX_APP_SERVER_NATIVE_TURN_WAIT_TIMEOUT_MS = 30_000;
 
 export type CodexAppServerServerRequest = Required<Pick<RpcRequest, "id" | "method">> & {
@@ -82,6 +95,12 @@ type PendingNotification = {
   receivedAtMs: number;
   scope: CodexThreadRouteScope;
 };
+type QueuedNotification = {
+  notification: CodexServerNotification;
+  scope: CodexThreadRouteScope;
+  deltaChunks?: string[];
+  deltaLength?: number;
+};
 type Route = {
   threadId: string;
   controller: AbortController;
@@ -93,6 +112,8 @@ type Route = {
   binding?: Deferred;
   turnId?: string;
   pending: PendingNotification[];
+  notificationQueue: QueuedNotification[];
+  notificationDraining: boolean;
   notificationTail: Promise<void>;
   observedNativeTurn?: { id: string; completed: boolean };
   completedNativeTurnIds: Set<string>;
@@ -148,6 +169,8 @@ class ClientTurnRouter implements CodexAppServerTurnRouter {
       activated: createDeferred<void>(),
       gate: "open",
       pending: [],
+      notificationQueue: [],
+      notificationDraining: false,
       notificationTail: Promise.resolve(),
       completedNativeTurnIds: new Set(),
       ignoredTurnNotificationKeys: new Set(),
@@ -311,7 +334,7 @@ class ClientTurnRouter implements CodexAppServerTurnRouter {
     this.assertRoute(route);
   }
 
-  // Returns the route's serialized tail so awaiting the client's notification
+  // Returns the route's current drain so awaiting the client's notification
   // fan-out observes queued processing, not just enqueueing.
   private routeNotification(notification: CodexServerNotification): Promise<void> | undefined {
     if (this.disposed) {
@@ -511,18 +534,50 @@ class ClientTurnRouter implements CodexAppServerTurnRouter {
     if (route.released) {
       return;
     }
-    route.notificationTail = route.notificationTail
-      .then(() => handler(notification, scope))
-      .catch((error: unknown) => {
-        if (!route.released) {
-          embeddedAgentLog.warn("codex app-server keyed notification handler failed", {
-            method: notification.method,
-            threadId: route.threadId,
-            turnId: route.turnId,
-            error,
-          });
+    const queued = { notification, scope } satisfies QueuedNotification;
+    const previous = route.notificationQueue.at(-1);
+    if (!previous || !coalesceQueuedDelta(previous, queued)) {
+      route.notificationQueue.push(queued);
+    }
+    if (route.notificationDraining) {
+      return;
+    }
+    route.notificationDraining = true;
+    // Start the single queue pump in a microtask so every notification already
+    // accepted in this synchronous ingress burst records receipt before any
+    // potentially re-entrant handler begins.
+    route.notificationTail = Promise.resolve().then(() =>
+      this.drainNotificationQueue(route, handler),
+    );
+  }
+
+  private async drainNotificationQueue(
+    route: Route,
+    handler: CodexThreadNotificationHandler,
+  ): Promise<void> {
+    try {
+      while (route.notificationQueue.length > 0) {
+        const queued = route.notificationQueue.shift();
+        if (!queued) {
+          continue;
         }
-      });
+        const notification = materializeQueuedNotification(queued);
+        try {
+          await handler(notification, queued.scope);
+        } catch (error) {
+          if (!route.released) {
+            embeddedAgentLog.warn("codex app-server keyed notification handler failed", {
+              method: notification.method,
+              threadId: route.threadId,
+              turnId: route.turnId,
+              error,
+            });
+          }
+        }
+      }
+    } finally {
+      route.notificationDraining = false;
+    }
   }
 
   private async waitForNotifications(route: Route): Promise<void> {
@@ -560,6 +615,58 @@ class ClientTurnRouter implements CodexAppServerTurnRouter {
       throw route.released;
     }
   }
+}
+
+function coalesceQueuedDelta(previous: QueuedNotification, next: QueuedNotification): boolean {
+  if (
+    previous.notification.method !== next.notification.method ||
+    !COALESCIBLE_DELTA_METHODS.has(next.notification.method) ||
+    previous.scope.threadId !== next.scope.threadId ||
+    previous.scope.turnId !== next.scope.turnId ||
+    !isJsonObject(previous.notification.params) ||
+    !isJsonObject(next.notification.params)
+  ) {
+    return false;
+  }
+  const previousDelta = previous.notification.params.delta;
+  const nextDelta = next.notification.params.delta;
+  if (
+    typeof previousDelta !== "string" ||
+    typeof nextDelta !== "string" ||
+    comparableDeltaParams(previous.notification.params) !==
+      comparableDeltaParams(next.notification.params)
+  ) {
+    return false;
+  }
+  const previousLength = previous.deltaLength ?? previousDelta.length;
+  const previousChunkCount = previous.deltaChunks?.length ?? 1;
+  if (
+    previousLength + nextDelta.length > MAX_COALESCED_DELTA_LENGTH ||
+    previousChunkCount >= MAX_COALESCED_DELTA_CHUNKS
+  ) {
+    return false;
+  }
+  previous.deltaChunks ??= [previousDelta];
+  previous.deltaChunks.push(nextDelta);
+  previous.deltaLength = previousLength + nextDelta.length;
+  return true;
+}
+
+function comparableDeltaParams(params: Record<string, JsonValue>): string {
+  return JSON.stringify(Object.entries(params).filter(([key]) => key !== "delta"));
+}
+
+function materializeQueuedNotification(queued: QueuedNotification): CodexServerNotification {
+  if (!queued.deltaChunks || !isJsonObject(queued.notification.params)) {
+    return queued.notification;
+  }
+  return {
+    ...queued.notification,
+    params: {
+      ...queued.notification.params,
+      delta: queued.deltaChunks.join(""),
+    },
+  };
 }
 
 async function waitForPromiseOrAbort(

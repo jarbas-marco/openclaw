@@ -309,11 +309,11 @@ class Monitor {
     this.claimChildThread = options.claimChildThread;
     this.retainChildThread = options.retainChildThread;
     this.releaseChildThread = options.releaseChildThread;
-    this.removeNotificationHandler = client.addNotificationHandler(async (notification) => {
+    this.removeNotificationHandler = client.addNotificationHandler((notification) => {
       if (!NATIVE_SUBAGENT_NOTIFICATION_METHODS.has(notification.method)) {
         return;
       }
-      await this.handleNotification(notification);
+      return this.handleNotification(notification);
     });
     this.removeCloseHandler = client.addCloseHandler(() => this.dispose());
   }
@@ -488,7 +488,7 @@ class Monitor {
   }
 
   /** Handles one notification from the client-wide router observer. */
-  private async handleNotification(notification: CodexServerNotification): Promise<void> {
+  private handleNotification(notification: CodexServerNotification): Promise<void> | void {
     if (this.disposed) {
       return;
     }
@@ -538,7 +538,21 @@ class Monitor {
       this.emitChildTaskActivity(notification, childState);
     }
     this.captureChildAssistantMessage(notification);
-    await this.handleChildTurnCompletion(notification);
+    const childTurnCompletion = this.handleChildTurnCompletion(notification);
+    if (childTurnCompletion) {
+      return childTurnCompletion.then(() =>
+        this.finishNotification(notification, threadId, threadStatus, childState),
+      );
+    }
+    return this.finishNotification(notification, threadId, threadStatus, childState);
+  }
+
+  private finishNotification(
+    notification: CodexServerNotification,
+    threadId: string | undefined,
+    threadStatus: string | undefined,
+    childState: ChildState | undefined,
+  ): Promise<void> | void {
     if (notification.method === "thread/status/changed" && threadId && threadStatus) {
       if (threadStatus !== "systemerror") {
         if (childState) {
@@ -565,7 +579,7 @@ class Monitor {
           });
       }
     }
-    await this.handleCompletionNotification(notification);
+    return this.handleCompletionNotification(notification);
   }
 
   private emitChildTaskActivity(
@@ -736,7 +750,7 @@ class Monitor {
     return messages;
   }
 
-  private async handleChildTurnCompletion(notification: CodexServerNotification): Promise<void> {
+  private handleChildTurnCompletion(notification: CodexServerNotification): Promise<void> | void {
     if (notification.method !== "turn/completed") {
       return;
     }
@@ -779,7 +793,7 @@ class Monitor {
     if (!completion) {
       return;
     }
-    await this.processObservedCompletion(state, childState, completion);
+    return this.processObservedCompletion(state, childState, completion);
   }
 
   /** Reads one child through app-server history and delivers a terminal result when present. */
@@ -966,14 +980,27 @@ class Monitor {
     this.updateChildThreadOwnership("release", childState.childThreadId, this.releaseChildThread);
   }
 
-  private async handleCompletionNotification(notification: CodexServerNotification): Promise<void> {
+  private handleCompletionNotification(
+    notification: CodexServerNotification,
+  ): Promise<void> | void {
     const params = isJsonObject(notification.params) ? notification.params : undefined;
     const parentThreadId = params ? readString(params, "threadId")?.trim() : undefined;
     const state = parentThreadId ? this.parentStates.get(parentThreadId) : undefined;
     if (!state) {
       return;
     }
-    for (const nativeCompletion of nativeSubagentNotifications.fromNotification(notification)) {
+    const nativeCompletions = nativeSubagentNotifications.fromNotification(notification);
+    if (nativeCompletions.length === 0) {
+      return;
+    }
+    return this.processCompletionNotifications(state, nativeCompletions);
+  }
+
+  private async processCompletionNotifications(
+    state: ParentState,
+    nativeCompletions: ReturnType<typeof nativeSubagentNotifications.fromNotification>,
+  ): Promise<void> {
+    for (const nativeCompletion of nativeCompletions) {
       const childThreadId = this.childThreadIdsByAgentPath.get(
         buildParentAgentPathKey(state.parentThreadId, nativeCompletion.agentPath),
       );

@@ -5,6 +5,7 @@ import net, { type NetConnectOpts, type Server, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import tls from "node:tls";
+import { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   detectContentType,
@@ -101,10 +102,19 @@ const BAD_GATEWAY_RESPONSE = "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\
 const GATEWAY_TIMEOUT_RESPONSE = "HTTP/1.1 504 Gateway Timeout\r\nConnection: close\r\n\r\n";
 
 const TEST_TLS_OPTIONS = {
-  ciphers: "aNULL:@SECLEVEL=0",
   minVersion: "TLSv1.2",
   maxVersion: "TLSv1.2",
 } as const;
+
+function mockTlsConnectToIpv4Loopback(overrides: tls.ConnectionOptions = {}) {
+  const connectTls = tls.connect;
+  vi.spyOn(tls, "connect").mockImplementation(((options: tls.ConnectionOptions) =>
+    connectTls({
+      ...options,
+      ...overrides,
+      host: "127.0.0.1",
+    })) as typeof tls.connect);
+}
 
 function trackServer<T extends Server>(server: T): T {
   const sockets = new Set<Socket>();
@@ -273,22 +283,26 @@ describe("proxyUpgradeRequest loopback transport", () => {
   });
 
   it("forwards HTTPS upgrades only after the TLS handshake and clears the opening timeout", async () => {
-    const connectTls = tls.connect;
-    vi.spyOn(tls, "connect").mockImplementation(((options: tls.ConnectionOptions) =>
-      connectTls({
-        ...options,
-        ...TEST_TLS_OPTIONS,
-        rejectUnauthorized: false,
-      })) as typeof tls.connect);
+    mockTlsConnectToIpv4Loopback({
+      ...TEST_TLS_OPTIONS,
+      rejectUnauthorized: false,
+    });
 
     let resolveRequest!: (request: string) => void;
     const requestPromise = new Promise<string>((resolve) => {
       resolveRequest = resolve;
     });
     const upstreamServer = trackServer(
-      tls.createServer(TEST_TLS_OPTIONS, (socket) => collectUpgradeRequest(socket, resolveRequest)),
+      tls.createServer(
+        {
+          ...TEST_TLS_OPTIONS,
+          cert: TEST_TLS_CERT_PEM,
+          key: TEST_TLS_KEY_PEM,
+        },
+        (socket) => collectUpgradeRequest(socket, resolveRequest),
+      ),
     );
-    const upstreamPort = await listenLoopback(upstreamServer, "localhost");
+    const upstreamPort = await listenLoopback(upstreamServer);
     const { browser, proxySocket } = await openBrowserPair();
     const setTimeoutSpy = vi.spyOn(net.Socket.prototype, "setTimeout");
     const removeListenerSpy = vi.spyOn(net.Socket.prototype, "removeListener");
@@ -307,6 +321,7 @@ describe("proxyUpgradeRequest loopback transport", () => {
   });
 
   it("returns a flushed 504 and closes both sockets when TLS stays silent after TCP connect", async () => {
+    mockTlsConnectToIpv4Loopback();
     let resolveUpstream!: (socket: Socket) => void;
     const upstreamPromise = new Promise<Socket>((resolve) => {
       resolveUpstream = resolve;
@@ -317,7 +332,7 @@ describe("proxyUpgradeRequest loopback transport", () => {
         resolveUpstream(socket);
       }),
     );
-    const upstreamPort = await listenLoopback(upstreamServer, "localhost");
+    const upstreamPort = await listenLoopback(upstreamServer);
     const { browser, proxySocket } = await openBrowserPair();
     const setTimeoutSpy = vi.spyOn(net.Socket.prototype, "setTimeout");
     const endSpy = vi.spyOn(proxySocket, "end");

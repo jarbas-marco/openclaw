@@ -189,8 +189,8 @@ export function createGatewayEventLoopHealthMonitor(
 
   return {
     snapshot,
-    // The diagnostic heartbeat is the timer owner. This filtered pull keeps
-    // persistence policy with the monitor without adding another gateway loop.
+    // Gateway lifecycle owns scheduled pulls. This filtered view keeps the
+    // diagnostic persistence policy here while sharing samples with admission control.
     persistentDegradationSnapshot: () => {
       const current = snapshot();
       return current?.degradedSinceMs != null &&

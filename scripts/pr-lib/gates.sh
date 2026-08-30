@@ -73,7 +73,7 @@ EOF_RECOVERY
 
 ci_dispatch() {
   local pr="$1"
-  local record head_ref head_sha is_cross_repository
+  local record head_ref head_sha is_cross_repository repo
   record=$(gh pr view "$pr" --json headRefName,headRefOid,isCrossRepository)
   head_ref=$(printf '%s\n' "$record" | jq -r .headRefName)
   head_sha=$(printf '%s\n' "$record" | jq -r .headRefOid)
@@ -87,8 +87,10 @@ ci_dispatch() {
     return 1
   fi
 
+  repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+
   mark_pr_operation_side_effects_if_available
-  node "$script_parent_dir/pr-lib/ci-dispatch.mjs" "$pr" "$head_ref" "$head_sha" false
+  node "$script_parent_dir/pr-lib/ci-dispatch.mjs" "$pr" "$head_ref" "$head_sha" false "$repo"
 }
 
 mark_pr_operation_side_effects_if_available() {
