@@ -1201,28 +1201,41 @@ function commandApprovalCapabilities(requestParams: JsonObject | undefined): {
 } {
   const available = requestParams?.availableDecisions;
   if (!Array.isArray(available)) {
-    return { once: true, sessionDecision: "acceptForSession" };
+    return commandApprovalRequestsPolicyAmendment(requestParams)
+      ? { once: true }
+      : { once: true, sessionDecision: "acceptForSession" };
   }
   return {
     once: available.includes("accept"),
-    ...(available.includes("acceptForSession")
+    ...(available.includes("acceptForSession") &&
+    !commandApprovalRequestsPolicyAmendment(requestParams)
       ? { sessionDecision: "acceptForSession" }
-      : { sessionDecision: findAvailableCommandAmendmentDecision(requestParams) }),
+      : {}),
   };
 }
 
-function findAvailableCommandAmendmentDecision(
-  requestParams: JsonObject | undefined,
-): JsonValue | undefined {
-  const available = requestParams?.availableDecisions;
-  if (!Array.isArray(available)) {
-    return undefined;
+function commandApprovalRequestsPolicyAmendment(requestParams: JsonObject | undefined): boolean {
+  // A generic operator "allow always" does not authorize a native structured
+  // amendment payload. Keep grant-shaped command requests one-shot.
+  if (!requestParams) {
+    return false;
   }
-  return available.find(
-    (entry): entry is JsonObject =>
-      isJsonObject(entry) &&
-      (isJsonObject(entry.acceptWithExecpolicyAmendment) ||
-        isJsonObject(entry.applyNetworkPolicyAmendment)),
+  if (
+    Object.hasOwn(requestParams, "additionalPermissions") ||
+    Object.hasOwn(requestParams, "proposedExecpolicyAmendment") ||
+    Object.hasOwn(requestParams, "proposedNetworkPolicyAmendments")
+  ) {
+    return true;
+  }
+  const available = requestParams.availableDecisions;
+  return (
+    Array.isArray(available) &&
+    available.some(
+      (entry) =>
+        isJsonObject(entry) &&
+        (isJsonObject(entry.acceptWithExecpolicyAmendment) ||
+          isJsonObject(entry.applyNetworkPolicyAmendment)),
+    )
   );
 }
 

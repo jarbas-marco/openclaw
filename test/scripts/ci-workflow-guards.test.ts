@@ -4821,7 +4821,7 @@ server.listen(0, "127.0.0.1", () => writeFileSync(readyPath, String(server.addre
       expect(gate.if).toContain("vars.OPENCLAW_CI_RUNNER_BACKEND != 'github'");
     }
     expect(hostedLintCache.if).toBe(
-      "needs.preflight.outputs.cache_mode != 'off' && matrix.task == 'lint' && (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository))",
+      "needs.preflight.outputs.cache_mode != 'off' && matrix.task == 'lint' && (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository))",
     );
     expect(hostedLintCache.uses).toBe(CACHE_V5);
     expect(hostedLintCache.with).toEqual(boundaryCache.with);
@@ -6317,9 +6317,15 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       runnerBackend: "",
       runAttempt: 1,
     } as const;
+    const manualReleaseGate = {
+      eventName: "workflow_dispatch",
+      repository: "jarbas-marco/openclaw",
+      runnerBackend: "",
+      runAttempt: 1,
+    } as const;
 
     expect(manifestStep.env.OPENCLAW_CI_RUNNER_BACKEND).toBe(
-      "${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND }}",
+      "${{ (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'github' || vars.OPENCLAW_CI_RUNNER_BACKEND }}",
     );
     expect(
       evaluateWorkflowExpression(
@@ -6330,6 +6336,12 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     expect(
       evaluateWorkflowExpression(checkShardStep.env.RUNNER_BACKEND, untrustedForkPullRequest),
     ).toBe("github");
+    expect(
+      evaluateWorkflowExpression(manifestStep.env.OPENCLAW_CI_RUNNER_BACKEND, manualReleaseGate),
+    ).toBe("github");
+    expect(evaluateWorkflowExpression(checkShardStep.env.RUNNER_BACKEND, manualReleaseGate)).toBe(
+      "github",
+    );
     expect(manifestStep.run).toContain("runnerBackend: process.env.OPENCLAW_CI_RUNNER_BACKEND");
     expect(checkShardRun).toContain('if [ "$RUNNER_BACKEND" = "github" ]; then');
     expect(checkShardRun).toContain("lint_args=(--only=extensions --only=scripts --threads=1)");
@@ -6345,8 +6357,12 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     expect(hostedCoreLint.if).toContain(
       "github.event.pull_request.head.repo.full_name != github.repository",
     );
+    expect(hostedCoreLint.if).toContain("github.event_name == 'workflow_dispatch'");
     expect(workflow.jobs["check-test-types-hosted-core-shard"].if).toContain(
       "github.event.pull_request.head.repo.full_name != github.repository",
+    );
+    expect(workflow.jobs["check-test-types-hosted-core-shard"].if).toContain(
+      "github.event_name == 'workflow_dispatch'",
     );
     expect(hostedCoreLint["runs-on"]).toBe("ubuntu-24.04");
     expect(hostedCoreLint.strategy).toEqual({
@@ -6474,8 +6490,13 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     expect(checksFastRun.run).toContain(
       'if [[ "${RATCHET_RELEASE_MERGE_TREE:-}" == "true" ]]; then',
     );
+    expect(checksFastRun.run).toContain("export GOMAXPROCS=2");
+    expect(checksFastRun.run).toContain("for core_stripe in {1..5}; do");
     expect(checksFastRun.run).toContain(
-      "node --import tsx scripts/run-oxlint-shards.mts --only=core --only=extensions --threads=1",
+      '--only=core --split-core --core-stripe="${core_stripe}/5" --threads=1',
+    );
+    expect(checksFastRun.run).toContain(
+      "node --import tsx scripts/run-oxlint-shards.mts --only=extensions --threads=1",
     );
     expect(checksFastRun.run).not.toContain(
       "node scripts/run-oxlint.mjs src ui/src packages extensions",

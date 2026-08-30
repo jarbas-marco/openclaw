@@ -27,6 +27,7 @@ export { expectGeneratedTokenPersistedToGatewayAuth } from "../test-utils/auth-t
 export { typedCases } from "../test-utils/typed-cases.js";
 export { createRequireRecord } from "../../test/helpers/record.js";
 export type { RecordRequirementKind, RecordRequirementMessage } from "../../test/helpers/record.js";
+export { TEST_TLS_CERT_PEM, TEST_TLS_KEY_PEM } from "../../test/helpers/tls-fixture.js";
 export {
   bufferedOversizedJsonResponse,
   oversizedJsonResponse,

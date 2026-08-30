@@ -44,6 +44,17 @@ const CODEX_APP_SERVER_STDERR_TAIL_MAX = 2_000;
 const CODEX_APP_SERVER_OVERLOADED_ERROR_CODE = -32_001;
 const CODEX_APP_SERVER_OVERLOAD_MAX_RETRIES = 3;
 const CODEX_APP_SERVER_OVERLOAD_RETRY_BASE_MS = 50;
+// Absorb short notification bursts, then pause before a 512-event regression
+// burst can become 512 retained handler promises. Resume at half capacity to
+// keep flow-control hysteresis from oscillating around the pause boundary.
+const CODEX_APP_SERVER_NOTIFICATION_HIGH_WATERMARK = 256;
+const CODEX_APP_SERVER_NOTIFICATION_LOW_WATERMARK = 128;
+// An RPC started by a notification handler needs extra ingress headroom for
+// its response. Keep that bypass bounded too; if the response is farther back,
+// the request's own deadline unblocks the handler and lets the queue drain.
+const CODEX_APP_SERVER_NOTIFICATION_RPC_HIGH_WATERMARK = 1_024;
+const CODEX_APP_SERVER_NOTIFICATION_RPC_LOW_WATERMARK = 768;
+const CODEX_APP_SERVER_NOTIFICATION_RPC_BACKPRESSURE_TIMEOUT_MS = 30_000;
 const CODEX_APP_SERVER_CLIENT_INSTANCE_IDS = new WeakMap<object, string>();
 const UNPAIRED_SURROGATE_RE =
   /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
@@ -53,6 +64,8 @@ type PendingRequest = {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
   cleanup: () => void;
+  armNotificationBackpressureTimeout: () => void;
+  disarmNotificationBackpressureTimeout: () => void;
 };
 
 /** Process-local generation fence for bindings tied to one app-server client instance. */
@@ -200,10 +213,15 @@ export class CodexAppServerClient {
   private readonly pending = new Map<number | string, PendingRequest>();
   private readonly requestHandlers = new Set<CodexServerRequestHandler>();
   private readonly notificationHandlers = new Set<CodexServerNotificationHandler>();
+  private readonly notificationHandlerCompletions = new Map<Promise<void>, Promise<void>>();
+  private readonly notificationCompletionGroups = new Map<Promise<void>, number>();
   private readonly closeHandlers = new Set<(client: CodexAppServerClient) => void>();
   private nextId = 1;
   private initialized = false;
   private closed = false;
+  private pendingNotificationDispatches = 0;
+  private notificationInputPaused = false;
+  private notificationInputPauseMode: "normal" | "rpc" | undefined;
   private transportExited = false;
   private closeError: Error | undefined;
   private serverVersion: string | undefined;
@@ -567,13 +585,21 @@ export class CodexAppServerClient {
     const message: RpcRequest = { id, method, params: params as JsonValue | undefined };
     return new Promise<T>((resolve, reject) => {
       let timeout: ReturnType<typeof setTimeout> | undefined;
+      let notificationBackpressureTimeout: ReturnType<typeof setTimeout> | undefined;
       let cleanupAbort: (() => void) | undefined;
       let mayHaveWritten = false;
+      const disarmNotificationBackpressureTimeout = () => {
+        if (notificationBackpressureTimeout) {
+          clearTimeout(notificationBackpressureTimeout);
+          notificationBackpressureTimeout = undefined;
+        }
+      };
       const cleanup = () => {
         if (timeout) {
           clearTimeout(timeout);
           timeout = undefined;
         }
+        disarmNotificationBackpressureTimeout();
         cleanupAbort?.();
         cleanupAbort = undefined;
       };
@@ -582,6 +608,7 @@ export class CodexAppServerClient {
           return;
         }
         this.pending.delete(id);
+        this.updateNotificationInputBackpressure();
         cleanup();
         reject(
           mayHaveWritten &&
@@ -628,7 +655,28 @@ export class CodexAppServerClient {
           );
         },
         cleanup,
+        armNotificationBackpressureTimeout: () => {
+          if (notificationBackpressureTimeout) {
+            return;
+          }
+          notificationBackpressureTimeout = setTimeout(
+            () =>
+              rejectPending(
+                new CodexAppServerLocalRequestCancellationError(
+                  method,
+                  "timed out",
+                  mayHaveWritten,
+                ),
+              ),
+            CODEX_APP_SERVER_NOTIFICATION_RPC_BACKPRESSURE_TIMEOUT_MS,
+          );
+          notificationBackpressureTimeout.unref?.();
+        },
+        disarmNotificationBackpressureTimeout,
       });
+      // A notification handler may need this response to drain. Never leave
+      // the shared response channel paused while an outbound RPC is pending.
+      this.updateNotificationInputBackpressure();
       if (options.signal?.aborted) {
         rejectPending(new CodexAppServerLocalRequestCancellationError(method, "aborted", false));
         return;
@@ -811,6 +859,7 @@ export class CodexAppServerClient {
       return;
     }
     this.pending.delete(response.id);
+    this.updateNotificationInputBackpressure();
     if (response.error) {
       pending.reject(new CodexAppServerRpcError(response.error, pending.method));
       return;
@@ -895,13 +944,116 @@ export class CodexAppServerClient {
   }
 
   private handleNotification(notification: CodexServerNotification): void {
+    const pendingHandlers: Promise<void>[] = [];
     for (const handler of this.notificationHandlers) {
       try {
-        Promise.resolve(handler(notification)).catch((error: unknown) => {
-          embeddedAgentLog.warn("codex app-server notification handler failed", { error });
-        });
+        const result = handler(notification);
+        if (result) {
+          pendingHandlers.push(this.resolveNotificationHandlerCompletion(Promise.resolve(result)));
+        }
       } catch (error) {
         embeddedAgentLog.warn("codex app-server notification handler failed", { error });
+      }
+    }
+    if (pendingHandlers.length === 0) {
+      return;
+    }
+
+    const firstCompletion = pendingHandlers[0];
+    if (!firstCompletion) {
+      return;
+    }
+    const completion =
+      pendingHandlers.length === 1
+        ? firstCompletion
+        : Promise.allSettled(pendingHandlers).then(() => undefined);
+    const groupedDispatches = this.notificationCompletionGroups.get(completion);
+    this.pendingNotificationDispatches += 1;
+    if (groupedDispatches !== undefined) {
+      this.notificationCompletionGroups.set(completion, groupedDispatches + 1);
+      this.updateNotificationInputBackpressure();
+      return;
+    }
+    this.notificationCompletionGroups.set(completion, 1);
+    this.updateNotificationInputBackpressure();
+    void completion.then(() => {
+      const completedDispatches = this.notificationCompletionGroups.get(completion) ?? 0;
+      this.notificationCompletionGroups.delete(completion);
+      this.pendingNotificationDispatches = Math.max(
+        0,
+        this.pendingNotificationDispatches - completedDispatches,
+      );
+      this.updateNotificationInputBackpressure();
+    });
+  }
+
+  private resolveNotificationHandlerCompletion(completion: Promise<void>): Promise<void> {
+    const existing = this.notificationHandlerCompletions.get(completion);
+    if (existing) {
+      return existing;
+    }
+    const safeCompletion = completion.then(undefined, (error: unknown) => {
+      try {
+        embeddedAgentLog.warn("codex app-server notification handler failed", { error });
+      } catch {
+        // Logging cannot turn an isolated notification failure into a rejected
+        // completion that permanently holds ingress backpressure.
+      }
+    });
+    this.notificationHandlerCompletions.set(completion, safeCompletion);
+    void safeCompletion.then(() => {
+      this.notificationHandlerCompletions.delete(completion);
+    });
+    return safeCompletion;
+  }
+
+  private updateNotificationInputBackpressure(): void {
+    if (this.closed) {
+      return;
+    }
+    const hasPendingRequests = this.pending.size > 0;
+    if (this.notificationInputPaused && !hasPendingRequests) {
+      // Once the last bypassing RPC settles, any remaining pause belongs to
+      // ordinary notification pressure. A later RPC may reopen fresh headroom.
+      this.notificationInputPauseMode = "normal";
+    }
+    const highWatermark = hasPendingRequests
+      ? CODEX_APP_SERVER_NOTIFICATION_RPC_HIGH_WATERMARK
+      : CODEX_APP_SERVER_NOTIFICATION_HIGH_WATERMARK;
+    if (!this.notificationInputPaused && this.pendingNotificationDispatches >= highWatermark) {
+      // Pausing readline propagates through stdio's pipe (and the websocket
+      // adapter's bounded stream) instead of allocating an unbounded promise
+      // backlog while keyed handlers catch up.
+      this.notificationInputPaused = true;
+      this.notificationInputPauseMode = hasPendingRequests ? "rpc" : "normal";
+      this.lines.pause();
+    }
+    if (!this.notificationInputPaused) {
+      return;
+    }
+    const lowWatermark = hasPendingRequests
+      ? CODEX_APP_SERVER_NOTIFICATION_RPC_LOW_WATERMARK
+      : CODEX_APP_SERVER_NOTIFICATION_LOW_WATERMARK;
+    // A request arriving behind a normal pause gets the whole bounded RPC
+    // window. Hysteresis applies only after that window itself has saturated.
+    const canUpgradeNormalPauseToRpc =
+      hasPendingRequests &&
+      this.notificationInputPauseMode === "normal" &&
+      this.pendingNotificationDispatches < CODEX_APP_SERVER_NOTIFICATION_RPC_HIGH_WATERMARK;
+    const shouldResume =
+      canUpgradeNormalPauseToRpc || this.pendingNotificationDispatches <= lowWatermark;
+    if (shouldResume) {
+      this.notificationInputPaused = false;
+      this.notificationInputPauseMode = undefined;
+      for (const pending of this.pending.values()) {
+        pending.disarmNotificationBackpressureTimeout();
+      }
+      this.lines.resume();
+      return;
+    }
+    if (hasPendingRequests) {
+      for (const pending of this.pending.values()) {
+        pending.armNotificationBackpressureTimeout();
       }
     }
   }
@@ -918,6 +1070,10 @@ export class CodexAppServerClient {
     }
     this.closed = true;
     this.closeError = error;
+    this.notificationCompletionGroups.clear();
+    this.notificationHandlerCompletions.clear();
+    this.pendingNotificationDispatches = 0;
+    this.notificationInputPauseMode = undefined;
     this.lines.close();
     this.rejectPendingRequests(error);
     return true;

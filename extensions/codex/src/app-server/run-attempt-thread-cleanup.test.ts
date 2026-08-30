@@ -31,6 +31,7 @@ import {
   createClientHarness,
   type CodexTestAppServerClientFactory,
 } from "./test-support.js";
+import { getCodexAppServerTurnRouter, type CodexThreadRouteReservation } from "./turn-router.js";
 import { CODEX_APP_SERVER_VERSION } from "./version.js";
 
 // The keyed router, client runtime, and subagent monitor each add handlers on
@@ -645,7 +646,7 @@ describe("Codex app-server main thread cleanup", () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
-  it("keeps an interrupted shared turn subscribed until its exact terminal arrives", async () => {
+  it("cleans an interrupted turn's background terminals before releasing its thread", async () => {
     const sessionFile = path.join(tempDir, "cancelled-session.jsonl");
     const workspaceDir = path.join(tempDir, "cancelled-workspace");
     const sessionKey = "agent:main:dashboard:incognito-cancelled-turn";
@@ -708,10 +709,75 @@ describe("Codex app-server main thread cleanup", () => {
         turn: { id: "turn-1", status: "interrupted" },
       },
     });
+    const backgroundCleanup = await waitForHarnessRequest(
+      harness,
+      "thread/backgroundTerminals/clean",
+    );
+    expect(backgroundCleanup.params).toEqual({ threadId: "thread-1" });
+    harness.send({ id: backgroundCleanup.id, result: {} });
+    const unsubscribe = await waitForHarnessRequest(harness, "thread/unsubscribe");
+    harness.send({ id: unsubscribe.id, result: {} });
+
+    const requestMethods = harness.writes.map((entry) => JSON.parse(entry).method);
+    expect(requestMethods.indexOf("thread/backgroundTerminals/clean")).toBeLessThan(
+      requestMethods.indexOf("thread/unsubscribe"),
+    );
+
+    expect(readAttemptTerminal(await run)).toMatchObject({ aborted: true, timedOut: false });
+  });
+
+  it("preserves background terminals when an internal route aborts", async () => {
+    const sessionFile = path.join(tempDir, "route-abort-session.jsonl");
+    const workspaceDir = path.join(tempDir, "route-abort-workspace");
+    const sessionKey = "agent:main:dashboard:incognito-route-abort";
+    const harness = createClientHarness();
+    vi.spyOn(CodexAppServerClient, "start").mockReturnValueOnce(harness.client);
+    const router = getCodexAppServerTurnRouter(harness.client);
+    const reserveThread = router.reserveThread.bind(router);
+    let capturedRoute: CodexThreadRouteReservation | undefined;
+    vi.spyOn(router, "reserveThread").mockImplementation((options) => {
+      capturedRoute = reserveThread(options);
+      return capturedRoute;
+    });
+
+    const run = runCodexAppServerAttempt(createParams(sessionFile, workspaceDir, sessionKey), {
+      bindingStore: testCodexAppServerBindingStore,
+    });
+    const initialize = await waitForHarnessRequest(harness, "initialize");
+    harness.send({
+      id: initialize.id,
+      result: { userAgent: `openclaw/${CODEX_APP_SERVER_VERSION} (macOS; test)` },
+    });
+    const threadStart = await waitForHarnessRequest(harness, "thread/start");
+    harness.send({ id: threadStart.id, result: threadStartResult() });
+    const turnStart = await waitForHarnessRequest(harness, "turn/start");
+    harness.send({ id: turnStart.id, result: turnStartResult() });
+    await vi.waitFor(() => expect(capturedRoute).toBeDefined());
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+
+    if (!capturedRoute) {
+      throw new Error("Codex harness did not capture the active turn route");
+    }
+    capturedRoute.release();
+    const interrupt = await waitForHarnessRequest(harness, "turn/interrupt");
+    harness.send({ id: interrupt.id, result: {} });
+    harness.send({
+      method: "turn/completed",
+      params: {
+        threadId: "thread-1",
+        turn: { id: "turn-1", status: "interrupted" },
+      },
+    });
     const unsubscribe = await waitForHarnessRequest(harness, "thread/unsubscribe");
     harness.send({ id: unsubscribe.id, result: {} });
 
     expect(readAttemptTerminal(await run)).toMatchObject({ aborted: true, timedOut: false });
+    expect(harness.writes.map((entry) => JSON.parse(entry).method)).not.toContain(
+      "thread/backgroundTerminals/clean",
+    );
+    expect(harness.process.stdin.destroyed).toBe(false);
   });
 
   it("gracefully retires a shared Codex client when a failed turn cannot unsubscribe", async () => {

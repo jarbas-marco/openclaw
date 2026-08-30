@@ -1,5 +1,5 @@
 // Codex tests cover attempt client cleanup plugin behavior.
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   closeCodexStartupClientBestEffort,
   interruptCodexTurnAndWaitBestEffort,
@@ -9,7 +9,23 @@ import {
 } from "./attempt-client-cleanup.js";
 import { createClientHarness } from "./test-support.js";
 
+const sharedClientMocks = vi.hoisted(() => ({
+  retainSharedCodexAppServerClientIfCurrent: vi.fn(),
+  retireSharedCodexAppServerClientIfCurrent: vi.fn(),
+}));
+
+vi.mock("./shared-client.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./shared-client.js")>()),
+  ...sharedClientMocks,
+}));
+
 describe("Codex app-server attempt client cleanup", () => {
+  afterEach(() => {
+    sharedClientMocks.retainSharedCodexAppServerClientIfCurrent.mockReset();
+    sharedClientMocks.retireSharedCodexAppServerClientIfCurrent.mockReset();
+    vi.restoreAllMocks();
+  });
+
   it("keeps strict startup retirement failures visible to lifecycle owners", async () => {
     const closeAndWait = vi.fn(async () => {
       throw new Error("strict client retirement failed");
@@ -203,10 +219,84 @@ describe("Codex app-server attempt client cleanup", () => {
       { timeoutMs: 5_000 },
     );
     expect(request).toHaveBeenCalledWith(
+      "thread/backgroundTerminals/clean",
+      { threadId: "thread-1" },
+      { timeoutMs: 5_000 },
+    );
+    expect(request).toHaveBeenCalledWith(
       "thread/unsubscribe",
       { threadId: "thread-1" },
       { timeoutMs: 5_000 },
     );
     expect(close).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans a suspect shared remote client before forcing its transport closed", async () => {
+    const events: string[] = [];
+    const notificationHandlers = new Set<(notification: unknown) => void>();
+    const releaseCleanupLease = vi.fn(() => events.push("release-cleanup-lease"));
+    sharedClientMocks.retainSharedCodexAppServerClientIfCurrent.mockImplementation(() => {
+      events.push("retain-cleanup-lease");
+      return releaseCleanupLease;
+    });
+    sharedClientMocks.retireSharedCodexAppServerClientIfCurrent
+      .mockImplementationOnce((_client, opts) => {
+        expect(opts).toBeUndefined();
+        events.push("detach-shared-client");
+        return { activeLeases: 3, closed: false };
+      })
+      .mockImplementationOnce((_client, opts) => {
+        expect(opts).toEqual({ failActiveLeases: true });
+        events.push("force-close-shared-client");
+        return { activeLeases: 3, closed: true };
+      });
+    const request = vi.fn(async (method: string) => {
+      events.push(method);
+      if (method === "turn/interrupt") {
+        queueMicrotask(() => {
+          for (const handler of notificationHandlers) {
+            handler({
+              method: "turn/completed",
+              params: {
+                threadId: "thread-remote",
+                turn: { id: "turn-remote", status: "interrupted" },
+              },
+            });
+          }
+        });
+      }
+      return {};
+    });
+    const close = vi.fn(() => events.push("direct-close"));
+
+    await retireCodexAppServerClientAfterTimedOutTurn(
+      {
+        request,
+        close,
+        addNotificationHandler: (handler: (notification: unknown) => void) => {
+          notificationHandlers.add(handler);
+          return () => notificationHandlers.delete(handler);
+        },
+        addRequestHandler: () => () => undefined,
+        addCloseHandler: () => () => undefined,
+      } as never,
+      {
+        threadId: "thread-remote",
+        turnId: "turn-remote",
+        reason: "turn_terminal_idle_timeout",
+        suspectPhysicalClient: true,
+      },
+    );
+
+    expect(events).toEqual([
+      "retain-cleanup-lease",
+      "detach-shared-client",
+      "turn/interrupt",
+      "thread/backgroundTerminals/clean",
+      "thread/unsubscribe",
+      "force-close-shared-client",
+      "release-cleanup-lease",
+    ]);
+    expect(close).not.toHaveBeenCalled();
   });
 });

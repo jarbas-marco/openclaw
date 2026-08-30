@@ -27,32 +27,58 @@ function ancestors(rows) {
   }
   return result;
 }
-function processIdentity(pid) {
+function processSnapshot(pid, forcePortable = false) {
+  if (process.platform === "linux" && !forcePortable) {
+    const processFs = require("node:fs");
+    try {
+      const statPath = "/proc/" + pid + "/stat";
+      const raw = processFs.readFileSync(statPath, "utf8");
+      const bootId = processFs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+      const commandEnd = raw.lastIndexOf(") ");
+      const fields = commandEnd >= 0 ? raw.slice(commandEnd + 2).trim().split(/\s+/u) : [];
+      const state = fields[0];
+      const startTicks = fields[19];
+      if (!state || !/^[0-9a-f-]{36}$/iu.test(bootId) || !/^\d+$/u.test(startTicks || "")) {
+        throw new Error("invalid Linux process identity");
+      }
+      // The boot id scopes monotonic start ticks across restarts; ps lstart moves with wall time.
+      return { state, start: "linux:" + bootId + ":" + startTicks };
+    } catch (error) {
+      const procfsExists = processFs.existsSync("/proc/self/stat");
+      if (error && error.code === "ENOENT" && error.path === "/proc/" + pid + "/stat" && procfsExists) return null;
+      const fallback = error && (error.code === "EACCES" || error.code === "EPERM" || error.code === "ENOSYS" || error.code === "ENOTDIR" || error.code === "ENOENT");
+      if (!fallback) throw error;
+    }
+  }
   try {
-    // Identity gates every thaw, and execFileSync's timeout only signals before waiting for
-    // the child: under the default SIGTERM a ps that ignores it still blocks forever, so every
-    // probe here must be killable to stay bounded.
-    const start = require("node:child_process").execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    // execFileSync's timeout only signals before waiting for the child, so a fallback ps probe
+    // must be killable when procfs is unavailable or the host is not Linux.
+    const output = require("node:child_process").execFileSync("ps", ["-o", "stat=,lstart=", "-p", String(pid)], {
       encoding: "utf8",
       maxBuffer: 4096,
       timeout: 2000,
       killSignal: "SIGKILL",
     }).trim();
-    return start || null;
-  } catch (error) {
-    if (error && error.status === 1) return null;
-    throw error;
-  }
-}
-function processStatus(pid) {
-  try {
-    const output = childProcess.execFileSync("ps", ["-o", "stat=,lstart=", "-p", String(pid)], { encoding: "utf8", maxBuffer: 4096, timeout: 2000, killSignal: "SIGKILL" }).trim();
     const match = /^(\S+)\s+(.+)$/u.exec(output);
     return match ? { state: match[1], start: match[2] } : null;
   } catch (error) {
     if (error && error.status === 1) return null;
     throw error;
   }
+}
+function processIdentity(pid) {
+  return processSnapshot(pid)?.start || null;
+}
+function processSnapshotForIdentity(pid, expected) {
+  // Leases created before Linux start ticks used ps lstart; retire them through the fallback.
+  const forcePortable = process.platform === "linux" && !expected.startsWith("linux:");
+  return processSnapshot(pid, forcePortable);
+}
+function processIdentityMatches(pid, expected) {
+  return processSnapshotForIdentity(pid, expected)?.start === expected;
+}
+function candidateIdentity(pid, row) {
+  return process.platform === "linux" ? processIdentity(pid) : row.start;
 }
 function quiescenceCandidates(rows, expectedUid, excludedPids, frozen) {
   const preserved = ancestors(rows);
@@ -142,7 +168,7 @@ function writeLease(expiresAtMs = Date.now() + watchdogTimeoutMs) {
 // identical for SIGSTOP and SIGCONT, so any process this uid successfully stopped can be resumed.
 function resumeProcesses(entries) {
   for (const entry of entries) {
-    if (processIdentity(entry.pid) !== entry.start) continue;
+    if (!processIdentityMatches(entry.pid, entry.start)) continue;
     try {
       process.kill(entry.pid, "SIGCONT");
     } catch (error) {
@@ -164,12 +190,12 @@ for (const name of orphanNames) {
   let retainLeaseForRetry = false;
   if (lease.watchdog !== null) {
     try {
-      let watchdogMatches = processIdentity(lease.watchdog.pid) === lease.watchdog.start;
+      let watchdogMatches = processIdentityMatches(lease.watchdog.pid, lease.watchdog.start);
       if (watchdogMatches) {
         try { process.kill(lease.watchdog.pid, "SIGTERM"); } catch (error) { if (!error || (error.code !== "ESRCH" && error.code !== "EPERM")) throw error; }
         for (let attempt = 0; attempt < 100 && watchdogMatches; attempt += 1) {
           Atomics.wait(sleeper, 0, 0, 10);
-          watchdogMatches = processIdentity(lease.watchdog.pid) === lease.watchdog.start;
+          watchdogMatches = processIdentityMatches(lease.watchdog.pid, lease.watchdog.start);
         }
         if (watchdogMatches) throw new Error("prior workspace quiescence watchdog did not retire");
       }
@@ -192,7 +218,7 @@ if (!sharedHost && sawUnverifiedEmptyLeaseWatchdog) {
 writeLease();
 const watchdog = childProcess.spawn(
   process.execPath,
-  ["-e", processIdentity.toString() + "\n(" + watchdogMain.toString() + ")(process.argv[1], process.argv[2])", leasePath, nonce],
+  ["-e", processSnapshot.toString() + "\n" + processIdentity.toString() + "\n" + processSnapshotForIdentity.toString() + "\n" + processIdentityMatches.toString() + "\n(" + watchdogMain.toString() + ")(process.argv[1], process.argv[2])", leasePath, nonce],
   { detached: true, stdio: "ignore" },
 );
 watchdog.unref();
@@ -237,9 +263,11 @@ try {
     }
     for (const [pid, row] of candidates) {
       try {
-        frozen.set(pid, row.start);
+        const start = candidateIdentity(pid, row);
+        if (!start) continue;
+        frozen.set(pid, start);
         writeLease();
-        if (processIdentity(pid) !== row.start) {
+        if (processIdentity(pid) !== start) {
           frozen.delete(pid);
           writeLease();
           continue;
@@ -312,14 +340,14 @@ function watchdogMain(watchedLeasePath, watchedNonce) {
           !Number.isSafeInteger(entry.pid) ||
           entry.pid < 1 ||
           typeof entry.start !== "string" ||
-          processIdentity(entry.pid) !== entry.start
+          !processIdentityMatches(entry.pid, entry.start)
         ) continue;
         try { process.kill(entry.pid, "SIGCONT"); } catch (error) { if (!error || (error.code !== "ESRCH" && error.code !== "EPERM")) throw error; }
       }
       watchdogFs.unlinkSync(watchedLeasePath);
     } catch (error) {
-      // Only the lease disappearing or being unusable retires this watchdog. A missing ps also throws
-      // ENOENT, and treating that as "someone else finished" would exit with the workers
+      // Only the lease disappearing or being unusable retires this watchdog. A missing fallback
+      // process probe can also throw ENOENT, and treating that as completion would exit with workers
       // still stopped, which is the freeze this loop exists to prevent.
       if (error && error.code === "ENOENT" && error.path === watchedLeasePath) return;
       // An unreadable lease is terminal: the pids to resume live in that file, so retrying
@@ -372,7 +400,7 @@ function writeLease(processes, expiresAtMs) {
   });
 }
 function assertWatchdogActive() {
-  const status = processStatus(input.watchdog.pid);
+  const status = processSnapshotForIdentity(input.watchdog.pid, input.watchdog.start);
   if (!status || status.start !== input.watchdog.start) {
     throw new Error("workspace quiescence watchdog identity changed unexpectedly");
   }
@@ -387,7 +415,7 @@ function refreshLease(processes) {
   writeLease(processes, input.expiresAtMs);
 }
 for (const entry of input.processes) {
-  const status = processStatus(entry.pid);
+  const status = processSnapshotForIdentity(entry.pid, entry.start);
   if (!status || status.start !== entry.start) continue;
   if (status.state && !status.state.startsWith("T")) throw new Error("workspace quiescence process resumed unexpectedly");
 }
@@ -406,14 +434,19 @@ if (validationMode === "final" && !sharedHost) {
     if (candidates.length + frozen.size > 4096) {
       throw new Error("too many worker processes to quiesce safely");
     }
-    for (const [pid, row] of candidates) frozen.set(pid, row.start);
+    for (const [pid, row] of candidates) {
+      const start = candidateIdentity(pid, row);
+      if (start) frozen.set(pid, start);
+    }
     let frozenEntries = [...frozen].map(([pid, start]) => ({ pid, start }));
     refreshLease(frozenEntries);
-    for (const [pid, row] of candidates) {
+    for (const [pid] of candidates) {
       try {
+        const expectedStart = frozen.get(pid);
+        if (!expectedStart) continue;
         if (input.expiresAtMs - Date.now() < 5000) refreshLease(frozenEntries);
-        const current = processStatus(pid);
-        if (!current || current.start !== row.start) {
+        const current = processSnapshotForIdentity(pid, expectedStart);
+        if (!current || current.start !== expectedStart) {
           frozen.delete(pid);
           continue;
         }
@@ -472,15 +505,15 @@ const input = parseLease(raw, nonce);
 // Thaw before retiring the watchdog: a bounded identity lookup can still fail, and
 // retiring the last resumer first would strand whatever the aborted sweep never reached.
 for (const entry of input.processes) {
-  if (processIdentity(entry.pid) !== entry.start) continue;
+  if (!processIdentityMatches(entry.pid, entry.start)) continue;
   try { process.kill(entry.pid, "SIGCONT"); } catch (error) { if (!error || (error.code !== "ESRCH" && error.code !== "EPERM")) throw error; }
 }
-let watchdogStart = null;
-try { if (input.watchdog !== null) watchdogStart = processIdentity(input.watchdog.pid); } catch (error) {
-  // An empty lease has nothing to strand, so ps cannot block its release.
+let watchdogMatches = false;
+try { if (input.watchdog !== null) watchdogMatches = processIdentityMatches(input.watchdog.pid, input.watchdog.start); } catch (error) {
+  // An empty lease has nothing to strand, so an identity probe cannot block its release.
   if (input.processes.length > 0) throw error;
 }
-if (input.watchdog !== null && watchdogStart === input.watchdog.start) {
+if (input.watchdog !== null && watchdogMatches) {
   try { process.kill(input.watchdog.pid, "SIGTERM"); } catch (error) { if (!error || (error.code !== "ESRCH" && error.code !== "EPERM")) throw error; }
 }
 // The watchdog stays alive across the whole resume loop now, so it can win the unlink race.

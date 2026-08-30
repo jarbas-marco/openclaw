@@ -51,6 +51,7 @@ export function createWebSocketTransport(
   const stdinDecoder = new StringDecoder("utf8");
   let pendingLine = "";
   let killed = false;
+  let ingressPaused = false;
   let pingTimeout: NodeJS.Timeout | undefined;
   let pongTimeout: NodeJS.Timeout | undefined;
   let expectedPong: Buffer | undefined;
@@ -70,7 +71,7 @@ export function createWebSocketTransport(
   };
 
   const sendHeartbeatPing = () => {
-    if (socket.readyState !== WebSocket.OPEN || pongTimeout) {
+    if (ingressPaused || socket.readyState !== WebSocket.OPEN || pongTimeout) {
       return;
     }
 
@@ -96,6 +97,7 @@ export function createWebSocketTransport(
 
   const scheduleHeartbeatPing = () => {
     if (
+      ingressPaused ||
       options.transport !== "websocket" ||
       socket.readyState !== WebSocket.OPEN ||
       pingTimeout ||
@@ -154,12 +156,29 @@ export function createWebSocketTransport(
     killed = true;
     events.emit("exit", code, reason.toString("utf8"));
   });
+  stdout.on("drain", () => {
+    if (!ingressPaused) {
+      return;
+    }
+    ingressPaused = false;
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.resume();
+      scheduleHeartbeatPing();
+    }
+  });
   socket.on("message", (data) => {
     if (options.transport === "websocket") {
       recordConnectionActivity();
     }
     const text = websocketFrameToText(data);
-    stdout.write(text.endsWith("\n") ? text : `${text}\n`);
+    if (!stdout.write(text.endsWith("\n") ? text : `${text}\n`) && !ingressPaused) {
+      // A paused socket cannot process pong frames. Suspend the heartbeat with
+      // ingress and restart it on drain so legitimate backpressure cannot be
+      // mistaken for a dead remote app-server connection.
+      ingressPaused = true;
+      clearConnectionHealthTimers();
+      socket.pause();
+    }
   });
 
   const stdin = new Writable({
