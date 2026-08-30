@@ -337,6 +337,78 @@ describe("backupVerifyCommand", () => {
 
   it.each([
     {
+      name: "archivePath does not encode the state sourcePath",
+      stateSourcePath: "/tmp/.openclaw",
+      stateArchiveSourcePath: "/tmp/decoy-state",
+      error: /state asset archivePath does not match its sourcePath/iu,
+    },
+    {
+      name: "state sourcePath does not match paths.stateDir",
+      stateSourcePath: "/tmp/decoy-state",
+      stateArchiveSourcePath: "/tmp/decoy-state",
+      error: /state asset sourcePath does not match paths\.stateDir/iu,
+    },
+  ])("rejects a recovery-profile state-root decoy: $name", async (fixture) => {
+    const declaredStateDir = "/tmp/.openclaw";
+    const realStateAssetRoot = buildBackupArchivePath(TEST_ARCHIVE_ROOT, declaredStateDir);
+    const decoyStateAssetRoot = buildBackupArchivePath(
+      TEST_ARCHIVE_ROOT,
+      fixture.stateArchiveSourcePath,
+    );
+    const manifest = {
+      ...createBackupManifest(decoyStateAssetRoot, TEST_ARCHIVE_ROOT, fixture.stateSourcePath),
+      schemaVersion: 2,
+      paths: { stateDir: declaredStateDir },
+      options: { recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] } },
+      assets: [
+        {
+          kind: "state",
+          sourcePath: fixture.stateSourcePath,
+          archivePath: decoyStateAssetRoot,
+        },
+        {
+          kind: "workspace",
+          sourcePath: declaredStateDir,
+          archivePath: realStateAssetRoot,
+        },
+      ],
+      skipped: [
+        {
+          kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+          sourcePath: `${fixture.stateArchiveSourcePath}/internal-agent-runs`,
+          reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+        },
+      ],
+    };
+
+    await withBrokenArchiveFixture(
+      {
+        tempPrefix: "openclaw-backup-recovery-state-decoy-",
+        manifestAssetArchivePath: decoyStateAssetRoot,
+        manifest,
+        payloads: [
+          {
+            fileName: "decoy.txt",
+            contents: "decoy\n",
+            archivePath: `${decoyStateAssetRoot}/operator.json`,
+          },
+          {
+            fileName: "secret.txt",
+            contents: "secret\n",
+            archivePath: `${realStateAssetRoot}/internal-agent-runs/secret.txt`,
+          },
+        ],
+      },
+      async (archivePath) => {
+        await expect(
+          backupVerifyCommand(createBackupVerifyRuntime(), { archive: archivePath }),
+        ).rejects.toThrow(fixture.error);
+      },
+    );
+  });
+
+  it.each([
+    {
       name: "v1 recovery profile",
       schemaVersion: 1,
       recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] },

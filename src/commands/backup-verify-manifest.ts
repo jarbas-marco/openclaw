@@ -234,6 +234,28 @@ function verifyBackupRecoveryProfileEntries(
     stateAsset.archivePath,
     "Backup manifest state asset path",
   );
+  const expectedStateAssetRoot = normalizeArchivePath(
+    buildBackupArchivePath(normalizeArchiveRoot(manifest.archiveRoot), stateAsset.sourcePath),
+    "Backup manifest expected state asset path",
+  );
+  if (stateAssetRoot !== expectedStateAssetRoot) {
+    throw new Error(
+      "Recovery-profile backup manifest state asset archivePath does not match its sourcePath.",
+    );
+  }
+  const declaredStateDir = manifest.paths?.stateDir;
+  if (!declaredStateDir) {
+    throw new Error("Recovery-profile backup manifest must declare paths.stateDir.");
+  }
+  const declaredStateAssetRoot = normalizeArchivePath(
+    buildBackupArchivePath(normalizeArchiveRoot(manifest.archiveRoot), declaredStateDir),
+    "Backup manifest declared state directory path",
+  );
+  if (stateAssetRoot !== declaredStateAssetRoot) {
+    throw new Error(
+      "Recovery-profile backup manifest state asset sourcePath does not match paths.stateDir.",
+    );
+  }
   const declaredArchivePaths = [
     { kind: "config", sourcePath: manifest.paths?.configPath },
     { kind: "oauth", sourcePath: manifest.paths?.oauthDir },
