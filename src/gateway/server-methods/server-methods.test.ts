@@ -4939,7 +4939,7 @@ describe("gateway healthHandlers.health cache freshness", () => {
     }
   });
 
-  it("retains cached ingress pressure while merging live dead letters", async () => {
+  it("recomputes ingress pressure while merging live dead letters", async () => {
     const openClawState = await createOpenClawTestState({
       layout: "state-only",
       prefix: "openclaw-health-cached-dq-",
@@ -4992,6 +4992,7 @@ describe("gateway healthHandlers.health cache freshness", () => {
       const { respond } = await requestHealthSnapshot({ cached });
 
       const payload = mockCallArg(respond, 0, 1) as HealthSummary | undefined;
+      expect(payload?.ok).toBe(true);
       expect(payload?.deliveryQueues?.failed).toHaveLength(1);
       expect(payload?.deliveryQueues?.failed?.[0]).toMatchObject({
         queueName: "outbound",
@@ -5001,7 +5002,41 @@ describe("gateway healthHandlers.health cache freshness", () => {
       expect(payload?.deliveryQueues?.ingressFailed).toEqual([
         { channelId: "telegram", accountId: "ops", count: 1, oldestFailedAt: 50_000 },
       ]);
-      expect(payload?.deliveryQueues?.ingressPressure).toEqual(cachedPressure);
+      expect(payload?.deliveryQueues?.ingressPressure).toEqual([
+        {
+          channelId: "telegram",
+          accountId: "ops",
+          laneCount: 1,
+          pendingCount: 2,
+          claimedCount: 0,
+          blockedCount: 1,
+          oldestReceivedAt: expect.any(Number),
+        },
+      ]);
+      expect(mockCallArg(respond, 0, 3)).toEqual({ cached: true });
+    } finally {
+      await openClawState.cleanup();
+    }
+  });
+
+  it("clears cached queue degradation after the live queue recovers", async () => {
+    const openClawState = await createOpenClawTestState({
+      layout: "state-only",
+      prefix: "openclaw-health-cached-dq-recovered-",
+    });
+    try {
+      const cached = createHealthSnapshot({
+        ok: false,
+        deliveryQueues: {
+          failed: [{ queueName: "outbound", count: 1, oldestFailedAt: 1_000 }],
+        },
+      });
+
+      const { respond } = await requestHealthSnapshot({ cached });
+
+      const payload = mockCallArg(respond, 0, 1) as HealthSummary | undefined;
+      expect(payload?.ok).toBe(true);
+      expect(payload?.deliveryQueues).toBeUndefined();
       expect(mockCallArg(respond, 0, 3)).toEqual({ cached: true });
     } finally {
       await openClawState.cleanup();

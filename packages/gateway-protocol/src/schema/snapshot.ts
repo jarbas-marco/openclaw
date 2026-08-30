@@ -60,6 +60,7 @@ const HealthSnapshotSchema = closedObject({
   // Every field is optional because hello snapshots use an empty object until
   // the asynchronous health producer has populated the cache.
   ok: Type.Optional(Type.Literal(true)),
+  deliveryQueuesComplete: Type.Optional(Type.Boolean()),
   ts: Type.Optional(Type.Integer({ minimum: 0 })),
   durationMs: Type.Optional(Type.Integer({ minimum: 0 })),
   eventLoop: Type.Optional(
