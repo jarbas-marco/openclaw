@@ -32,7 +32,7 @@ export async function backupCreateCommand(
       log: opts.log ?? (opts.json ? undefined : (message: string) => runtime.log(message)),
     });
     archivePath = result.archivePath;
-    if (opts.verify && !opts.dryRun) {
+    if (opts.verify && !opts.dryRun && !result.verified) {
       const { backupVerifyCommand } = await loadBackupVerifyRuntime();
       await backupVerifyCommand(
         {
