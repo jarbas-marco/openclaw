@@ -70,7 +70,7 @@ describe("queue health collector", () => {
       await ingressQueue.fail(claim, { reason: "handler-error", failedAt: 50_000 });
 
       const snap = await collectHealth();
-      expect(snap.ok).toBe(false);
+      expect(snap.ok).toBe(true);
       expect(snap.deliveryQueues).toEqual({
         failed: [{ queueName: "outbound", count: 1, oldestFailedAt: expect.any(Number) }],
         ingressFailed: [
@@ -147,7 +147,7 @@ describe("queue health collector", () => {
       }
 
       const snap = await collectHealth();
-      expect(snap.ok).toBe(false);
+      expect(snap.ok).toBe(true);
       expect(snap.deliveryQueues).toEqual({
         failed: [],
         ingressPressure: [

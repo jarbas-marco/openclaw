@@ -120,6 +120,7 @@ function mergeCachedHealthRuntimeState(params: {
   const contextEngines = buildContextEngineHealthSummary();
   return {
     ...cached,
+    ok: true,
     ...deliveryQueueHealth,
     ...(params.eventLoop ? { eventLoop: params.eventLoop } : {}),
     ...(contextEngines ? { contextEngines } : {}),

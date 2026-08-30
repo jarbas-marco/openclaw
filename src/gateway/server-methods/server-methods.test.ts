@@ -4992,7 +4992,7 @@ describe("gateway healthHandlers.health cache freshness", () => {
       const { respond } = await requestHealthSnapshot({ cached });
 
       const payload = mockCallArg(respond, 0, 1) as HealthSummary | undefined;
-      expect(payload?.ok).toBe(false);
+      expect(payload?.ok).toBe(true);
       expect(payload?.deliveryQueues?.failed).toHaveLength(1);
       expect(payload?.deliveryQueues?.failed?.[0]).toMatchObject({
         queueName: "outbound",

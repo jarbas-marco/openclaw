@@ -441,6 +441,7 @@ export async function collectGatewayHealthSnapshot(params: {
   const contextEngineHealth = buildContextEngineHealthSummary();
   const deliveryQueueHealth = buildDeliveryQueueHealthSummary();
   return {
+    ok: true,
     ...deliveryQueueHealth,
     ts: Date.now(),
     durationMs: Date.now() - start,

@@ -51,7 +51,7 @@ export function buildDeliveryQueueHealthSummary() {
     );
   } catch (error) {
     debugHealth("delivery queue health snapshot read failed", error);
-    return { ok: false, deliveryQueuesComplete: false };
+    return { deliveryQueuesComplete: false };
   }
 
   const failed = result?.failed ?? { complete: true, value: [] };
@@ -71,8 +71,16 @@ export function buildDeliveryQueueHealthSummary() {
           ...(ingressPressure.value.length > 0 ? { ingressPressure: ingressPressure.value } : {}),
         };
   return {
-    ok: deliveryQueuesComplete && deliveryQueues === undefined,
     deliveryQueuesComplete,
     ...(deliveryQueues ? { deliveryQueues } : {}),
+  };
+}
+
+/** Adds local operational status without changing the Gateway health RPC success contract. */
+export function buildDeliveryQueueStatusSummary() {
+  const summary = buildDeliveryQueueHealthSummary();
+  return {
+    ok: summary.deliveryQueuesComplete && summary.deliveryQueues === undefined,
+    ...summary,
   };
 }

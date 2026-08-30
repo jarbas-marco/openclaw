@@ -161,7 +161,6 @@ describe("channel ingress queue health", () => {
         const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
 
         expect(buildDeliveryQueueHealthSummary()).toEqual({
-          ok: true,
           deliveryQueuesComplete: true,
         });
         expect(fs.existsSync(databasePath)).toBe(false);
@@ -179,7 +178,6 @@ describe("channel ingress queue health", () => {
         database.db.exec("BEGIN");
         try {
           expect(buildDeliveryQueueHealthSummary()).toEqual({
-            ok: true,
             deliveryQueuesComplete: true,
           });
           expect(database.db.isTransaction).toBe(true);

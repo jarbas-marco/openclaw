@@ -2,7 +2,7 @@
 // Starts update, Tailscale, agent, and gateway probes with cold-start shortcuts for first-run users.
 
 import type { OpenClawConfig } from "../config/types.js";
-import { buildDeliveryQueueHealthSummary } from "../gateway/health/delivery-queue.js";
+import { buildDeliveryQueueStatusSummary } from "../gateway/health/delivery-queue.js";
 import type { UpdateCheckResult } from "../infra/update-check.js";
 import { runExec } from "../process/exec.js";
 import { createEmptyTaskAuditSummary } from "../tasks/task-registry.audit.shared.js";
@@ -28,7 +28,7 @@ function buildColdStartAgentLocalStatuses() {
 
 /** Builds an empty summary for cold-start status paths that skip network and session work. */
 export function buildColdStartStatusSummary() {
-  const deliveryQueueHealth = buildDeliveryQueueHealthSummary();
+  const deliveryQueueHealth = buildDeliveryQueueStatusSummary();
   return {
     ...deliveryQueueHealth,
     runtimeVersion: null,

@@ -34,7 +34,8 @@ vi.mock("../../channels/message/ingress-queue-health.js", async (importOriginal)
   };
 });
 
-const { buildDeliveryQueueHealthSummary } = await import("./delivery-queue.js");
+const { buildDeliveryQueueHealthSummary, buildDeliveryQueueStatusSummary } =
+  await import("./delivery-queue.js");
 const outboundFailed = [{ queueName: "outbound", count: 2, oldestFailedAt: 1_000 }];
 const ingressFailed = [
   { channelId: "telegram", accountId: "ops", count: 1, oldestFailedAt: 2_000 },
@@ -69,7 +70,6 @@ describe("buildDeliveryQueueHealthSummary", () => {
         });
       },
       expected: {
-        ok: false,
         deliveryQueuesComplete: false,
         deliveryQueues: { failed: outboundFailed },
       },
@@ -83,7 +83,6 @@ describe("buildDeliveryQueueHealthSummary", () => {
         countIngressFailed.mockReturnValue(ingressFailed);
       },
       expected: {
-        ok: false,
         deliveryQueuesComplete: false,
         deliveryQueues: { failed: [], ingressFailed },
       },
@@ -97,7 +96,6 @@ describe("buildDeliveryQueueHealthSummary", () => {
         });
       },
       expected: {
-        ok: false,
         deliveryQueuesComplete: false,
         deliveryQueues: { failed: [], ingressFailed },
       },
@@ -111,7 +109,6 @@ describe("buildDeliveryQueueHealthSummary", () => {
         countIngressPressure.mockReturnValue(ingressPressure);
       },
       expected: {
-        ok: false,
         deliveryQueuesComplete: false,
         deliveryQueues: { failed: [], ingressPressure },
       },
@@ -132,13 +129,12 @@ describe("buildDeliveryQueueHealthSummary", () => {
       throw new Error("ingress pressure database unavailable");
     });
 
-    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: false, deliveryQueuesComplete: false });
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ deliveryQueuesComplete: false });
   });
 
   it("recomputes ingress pressure instead of retaining a stale cached value", () => {
     countIngressPressure.mockReturnValue(ingressPressure);
     expect(buildDeliveryQueueHealthSummary()).toEqual({
-      ok: false,
       deliveryQueuesComplete: true,
       deliveryQueues: { failed: [], ingressPressure },
     });
@@ -146,7 +142,7 @@ describe("buildDeliveryQueueHealthSummary", () => {
   });
 
   it("uses one existing read-only snapshot for all three queries", () => {
-    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: true, deliveryQueuesComplete: true });
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ deliveryQueuesComplete: true });
     expect(readOnlySnapshot).toHaveBeenCalledOnce();
     expect(countOutbound).toHaveBeenCalledOnce();
     expect(countIngressFailed).toHaveBeenCalledOnce();
@@ -158,6 +154,16 @@ describe("buildDeliveryQueueHealthSummary", () => {
       throw new Error("snapshot unavailable");
     });
 
-    expect(buildDeliveryQueueHealthSummary()).toEqual({ ok: false, deliveryQueuesComplete: false });
+    expect(buildDeliveryQueueHealthSummary()).toEqual({ deliveryQueuesComplete: false });
+  });
+
+  it("derives degraded local status without changing the health snapshot contract", () => {
+    countIngressPressure.mockReturnValue(ingressPressure);
+
+    expect(buildDeliveryQueueStatusSummary()).toEqual({
+      ok: false,
+      deliveryQueuesComplete: true,
+      deliveryQueues: { failed: [], ingressPressure },
+    });
   });
 });
