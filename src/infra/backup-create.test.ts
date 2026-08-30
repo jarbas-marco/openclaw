@@ -893,6 +893,48 @@ describe("createBackupArchive", () => {
     );
   });
 
+  it("canonicalizes a symlinked state directory in a recovery-profile manifest", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-recovery-symlinked-state-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const stateDirAlias = state.path("state-dir-alias");
+        const outputPath = state.path("archive.tar.gz");
+        await fs.symlink(state.stateDir, stateDirAlias, "dir");
+        state.envVars.OPENCLAW_STATE_DIR = stateDirAlias;
+        state.applyEnv();
+
+        const result = await createBackupArchive({ output: outputPath, recoveryProfile: true });
+        await expect(
+          backupVerifyCommand(
+            { log: vi.fn(), error: vi.fn(), exit: vi.fn() },
+            { archive: outputPath },
+          ),
+        ).resolves.toMatchObject({ ok: true, recoveryProfile: true });
+
+        const extractDir = state.path("symlinked-state-extract");
+        await fs.mkdir(extractDir);
+        await tar.x({ file: outputPath, gzip: true, cwd: extractDir });
+        const manifest = JSON.parse(
+          await fs.readFile(path.join(extractDir, result.archiveRoot, "manifest.json"), "utf8"),
+        ) as {
+          paths: { stateDir: string };
+          assets: Array<{ kind: string; sourcePath: string }>;
+        };
+        const canonicalStateDir = await fs.realpath(state.stateDir);
+        expect(manifest.paths.stateDir).toBe(canonicalStateDir);
+        expect(manifest.assets).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({ kind: "state", sourcePath: canonicalStateDir }),
+          ]),
+        );
+      },
+    );
+  });
+
   it("keeps durable state while the recovery profile excludes legacy internal-run traces", async () => {
     await withOpenClawTestState(
       {

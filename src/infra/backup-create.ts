@@ -1024,7 +1024,7 @@ export async function createBackupArchive(
       recoveryProfile,
       assets: result.assets,
       skipped: result.skipped,
-      stateDir: plan.stateDir,
+      stateDir: recoveryProfile && stateAsset ? stateAsset.sourcePath : plan.stateDir,
       configPath: plan.configPath,
       oauthDir: plan.oauthDir,
       workspaceDirs: plan.workspaceDirs,
