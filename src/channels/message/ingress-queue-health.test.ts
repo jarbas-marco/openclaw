@@ -1,8 +1,11 @@
 // Ingress queue health tests cover conservative active-lane pressure aggregation.
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { buildDeliveryQueueHealthSummary } from "../../gateway/health/delivery-queue.js";
+import { openOpenClawStateDatabase } from "../../state/openclaw-state-db.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
 import { INGRESS_CLAIM_LEASE_MS } from "./ingress-claim-owner.js";
-import { countChannelIngressQueuePressure } from "./ingress-queue-health.js";
 import { createChannelIngressQueue, type ChannelIngressQueue } from "./ingress-queue.js";
 import { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } from "./ingress-retry-policy.js";
 
@@ -29,7 +32,6 @@ describe("channel ingress queue health", () => {
       {
         layout: "state-only",
         prefix: "openclaw-ingress-health-",
-        applyEnv: false,
       },
       async ({ stateDir }) => {
         const now = 10 * INGRESS_CLAIM_LEASE_MS;
@@ -133,7 +135,7 @@ describe("channel ingress queue health", () => {
         }
         clock = now;
 
-        const pressure = countChannelIngressQueuePressure(stateDir);
+        const pressure = buildDeliveryQueueHealthSummary().deliveryQueues?.ingressPressure ?? [];
         expect(pressure).toEqual([
           {
             channelId: "telegram",
@@ -148,6 +150,41 @@ describe("channel ingress queue health", () => {
         expect(JSON.stringify(pressure)).not.toMatch(
           /private-(?:id|lane|owner|payload|error)|retry-private|stale-private|null-(?:pressured|stale)/,
         );
+      },
+    );
+  });
+
+  it("does not create state when the diagnostic database is absent", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-ingress-health-absent-" },
+      async ({ stateDir }) => {
+        const databasePath = path.join(stateDir, "state", "openclaw.sqlite");
+
+        expect(buildDeliveryQueueHealthSummary()).toEqual({
+          deliveryQueuesComplete: true,
+        });
+        expect(fs.existsSync(databasePath)).toBe(false);
+      },
+    );
+  });
+
+  it("reads a snapshot without joining an active writer transaction", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-ingress-health-writer-" },
+      async ({ stateDir }) => {
+        const database = openOpenClawStateDatabase({
+          env: { ...process.env, OPENCLAW_STATE_DIR: stateDir },
+        });
+        database.db.exec("BEGIN");
+        try {
+          expect(buildDeliveryQueueHealthSummary()).toEqual({
+            deliveryQueuesComplete: true,
+          });
+          expect(database.db.isTransaction).toBe(true);
+        } finally {
+          database.db.exec("ROLLBACK");
+          database.walMaintenance.close();
+        }
       },
     );
   });

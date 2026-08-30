@@ -1,15 +1,26 @@
 /** Redacted health diagnostics for durable channel ingress queues. */
 import { executeSqliteQuerySync } from "../../infra/kysely-sync.js";
+import { withExistingOpenClawStateDatabaseArtifactPreservingReadOnly } from "../../state/openclaw-state-db-readonly.js";
+import type { OpenClawStateDatabase } from "../../state/openclaw-state-db.js";
+import { resolveOpenClawStateSqlitePath } from "../../state/openclaw-state-db.paths.js";
 import { INGRESS_CLAIM_LEASE_MS } from "./ingress-claim-owner.js";
-import { getChannelIngressKysely, openChannelIngressDatabase } from "./ingress-queue.js";
+import { getChannelIngressKysely } from "./ingress-queue.js";
 import { DEFAULT_INGRESS_RETRY_MAX_ATTEMPTS } from "./ingress-retry-policy.js";
 
 /** Count failed channel ingress events per channel account for operator health surfaces. */
 export function countFailedChannelIngressQueueEntries(stateDir?: string) {
-  const database = openChannelIngressDatabase(stateDir);
-  const queueDb = getChannelIngressKysely(database.db);
+  return withExistingIngressState(stateDir, (database) =>
+    countFailedChannelIngressQueueEntriesInDatabase(database.db),
+  );
+}
+
+/** Shared health query; callers own the read-only state lifecycle. */
+export function countFailedChannelIngressQueueEntriesInDatabase(
+  database: OpenClawStateDatabase["db"],
+) {
+  const queueDb = getChannelIngressKysely(database);
   const rows = executeSqliteQuerySync(
-    database.db,
+    database,
     queueDb
       .selectFrom("channel_ingress_events")
       .select((eb) => [
@@ -28,10 +39,9 @@ export function countFailedChannelIngressQueueEntries(stateDir?: string) {
   );
 }
 
-/** Aggregate active lanes whose retry or claim state can block later ingress. */
-export function countChannelIngressQueuePressure(stateDir?: string) {
-  const database = openChannelIngressDatabase(stateDir);
-  const queueDb = getChannelIngressKysely(database.db);
+/** Shared health query; callers own the read-only state lifecycle. */
+export function countChannelIngressQueuePressureInDatabase(database: OpenClawStateDatabase["db"]) {
+  const queueDb = getChannelIngressKysely(database);
   const staleClaimCutoff = Date.now() - INGRESS_CLAIM_LEASE_MS;
   const laneTotals = queueDb
     .selectFrom("channel_ingress_events")
@@ -76,7 +86,7 @@ export function countChannelIngressQueuePressure(stateDir?: string) {
     )
     .as("lanes");
   return executeSqliteQuerySync(
-    database.db,
+    database,
     queueDb
       .selectFrom(laneTotals)
       .select((eb) => [
@@ -94,4 +104,16 @@ export function countChannelIngressQueuePressure(stateDir?: string) {
       .orderBy("lanes.channel_id", "asc")
       .orderBy("lanes.account_id", "asc"),
   ).rows;
+}
+
+function withExistingIngressState<T>(
+  stateDir: string | undefined,
+  read: (database: { db: OpenClawStateDatabase["db"] }) => T[],
+): T[] {
+  return (
+    withExistingOpenClawStateDatabaseArtifactPreservingReadOnly(
+      read,
+      stateDir ? { path: resolveOpenClawStateSqlitePath({ OPENCLAW_STATE_DIR: stateDir }) } : {},
+    ) ?? []
+  );
 }

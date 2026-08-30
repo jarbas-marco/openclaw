@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { openOpenClawStateDatabase } from "../state/openclaw-state-db.js";
 import {
   completeDeliveryQueueEntry,
-  countFailedDeliveryQueueEntries,
+  countFailedDeliveryQueueEntriesInDatabase,
   getDeliveryQueueEntryStatus,
   loadDeliveryQueueEntries,
   loadDeliveryQueueEntry,
@@ -264,7 +264,7 @@ describe("delivery queue pending terminal transition", () => {
     vi.useFakeTimers();
     try {
       vi.setSystemTime(10_000);
-      expect(countFailedDeliveryQueueEntries(stateDir)).toEqual([
+      expect(countFailedDeliveryQueueEntriesInDatabase(db)).toEqual([
         { queueName, count: 5, oldestFailedAt: 1_000 },
       ]);
       expect(
@@ -298,7 +298,11 @@ describe("delivery queue pending terminal transition", () => {
 
   it("reports no failed queues when retained entries are pending", () => {
     enqueueRetained("outbound", "pending-1", 1_000);
-    expect(countFailedDeliveryQueueEntries(stateDir)).toEqual([]);
+    expect(
+      countFailedDeliveryQueueEntriesInDatabase(
+        openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } }).db,
+      ),
+    ).toEqual([]);
   });
 
   it("counts failed rows per queue with their oldest failure", () => {
@@ -324,7 +328,7 @@ describe("delivery queue pending terminal transition", () => {
       "UPDATE delivery_queue_entries SET failed_at = NULL WHERE queue_name = 'session'",
     ).run();
 
-    const counts = countFailedDeliveryQueueEntries(stateDir);
+    const counts = countFailedDeliveryQueueEntriesInDatabase(db);
     expect(counts.find((queue) => queue.queueName === "outbound")).toEqual({
       queueName: "outbound",
       count: 2,

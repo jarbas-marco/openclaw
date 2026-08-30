@@ -1,10 +1,48 @@
 // Status scan result tests cover cold-start summaries and gateway probe snapshot aggregation.
+import fs from "node:fs";
 import { describe, expect, it } from "vitest";
+import {
+  moveDeliveryQueueEntryToFailed,
+  upsertDeliveryQueueEntry,
+} from "../infra/delivery-queue-sqlite.ts";
+import { withOpenClawTestState } from "../test-utils/openclaw-test-state.ts";
 import { buildStatusScanResult } from "./status.scan-result.ts";
 import { buildColdStartStatusSummary } from "./status.scan.bootstrap-shared.ts";
 import type { GatewayProbeSnapshot } from "./status.scan.shared.ts";
 
 describe("buildStatusScanResult", () => {
+  it("marks the empty cold-start summary healthy", () => {
+    expect(buildColdStartStatusSummary()).toMatchObject({
+      ok: true,
+      deliveryQueuesComplete: true,
+    });
+  });
+
+  it("reports residual delivery failures without a configured runtime", async () => {
+    await withOpenClawTestState(
+      { layout: "state-only", prefix: "openclaw-status-cold-queue-" },
+      async ({ configPath }) => {
+        expect(fs.existsSync(configPath)).toBe(false);
+        upsertDeliveryQueueEntry({
+          queueName: "outbound",
+          entry: {
+            id: "residual-dead-letter",
+            enqueuedAt: 1_000,
+            retryCount: 5,
+            retainOnFailure: true,
+          },
+        });
+        moveDeliveryQueueEntryToFailed("outbound", "residual-dead-letter");
+
+        expect(buildColdStartStatusSummary()).toMatchObject({
+          ok: false,
+          deliveryQueuesComplete: true,
+          deliveryQueues: { failed: [{ queueName: "outbound", count: 1 }] },
+        });
+      },
+    );
+  });
+
   it("builds the full shared scan result shape", () => {
     const osSummary = {
       platform: "linux" as const,
