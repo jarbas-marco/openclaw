@@ -356,6 +356,7 @@ describe("createOllamaStreamFn thinking events", () => {
       },
       timeoutMs: 2500,
       auditContext: "ollama-stream.chat",
+      configuredLocalOriginBaseUrl: "http://localhost:11434",
     });
   });
 
