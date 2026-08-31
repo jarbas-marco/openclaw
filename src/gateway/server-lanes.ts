@@ -83,6 +83,8 @@ export function applyGatewayLaneConcurrency(
   }
   configuredGatewayLaneConcurrency = { ...concurrency };
   applyEffectiveGatewayLaneConcurrency(scaleGatewayLaneConcurrency(concurrency), opts);
+  setCommandLaneConcurrency("model-run-live", 2);
+  setCommandLaneConcurrency("model-run-maintenance", 1);
 }
 
 /** Adjusts only future admissions while preserving configured healthy ceilings. */

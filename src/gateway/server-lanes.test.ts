@@ -99,6 +99,13 @@ describe("applyGatewayLaneConcurrency", () => {
     await Promise.all([first, second]);
   });
 
+  it("publishes isolated live and maintenance model-run lanes", () => {
+    applyConfigLaneConcurrency({} as OpenClawConfig);
+
+    expect(getCommandLaneSnapshot("model-run-live").maxConcurrent).toBe(2);
+    expect(getCommandLaneSnapshot("model-run-maintenance").maxConcurrent).toBe(1);
+  });
+
   it("restores a suspended shared nested lane on gateway startup", async () => {
     setCommandLaneConcurrency(CommandLane.Nested, 0);
     applyConfigLaneConcurrency({} as OpenClawConfig, { gatewayStart: true });

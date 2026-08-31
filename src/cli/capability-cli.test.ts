@@ -1277,6 +1277,39 @@ describe("capability cli", () => {
     ]);
     expect(gatewayCall?.params?.modelRun).toBe(true);
     expect(gatewayCall?.params?.promptMode).toBe("none");
+    expect(gatewayCall?.params?.lane).toBe("model-run-live");
+  });
+
+  it("routes explicit maintenance model probes to the maintenance lane", async () => {
+    await runCapability(
+      "model",
+      "run",
+      "--prompt",
+      "maintenance",
+      "--gateway",
+      "--lane",
+      "model-run-maintenance",
+      "--json",
+    );
+
+    expect(firstGatewayCall()?.params?.lane).toBe("model-run-maintenance");
+  });
+
+  it("rejects model-run lanes outside gateway transport", async () => {
+    await expect(
+      runCapability(
+        "model",
+        "run",
+        "--prompt",
+        "local",
+        "--lane",
+        "model-run-maintenance",
+        "--json",
+      ),
+    ).rejects.toThrow("exit 1");
+
+    expectRuntimeErrorContains("--lane requires --gateway.");
+    expect(mocks.callGateway).not.toHaveBeenCalled();
   });
 
   it("normalizes HEIC files to JPEG before local model probes", async () => {
