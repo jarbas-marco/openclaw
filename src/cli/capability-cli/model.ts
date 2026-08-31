@@ -72,7 +72,10 @@ function normalizeModelRunLane(
   if (transport !== "gateway") {
     throw new Error("--lane requires --gateway.");
   }
-  const lane = String(value).trim();
+  if (typeof value !== "string") {
+    throw new Error("Invalid model-run lane.");
+  }
+  const lane = value.trim();
   if (lane !== "model-run-live" && lane !== "model-run-maintenance") {
     throw new Error("Invalid model-run lane.");
   }
