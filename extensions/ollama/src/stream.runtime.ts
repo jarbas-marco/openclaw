@@ -30,7 +30,7 @@ import {
   notifyProviderHttpResponse,
   parseTerminalToolCallArguments,
 } from "openclaw/plugin-sdk/provider-transport-runtime";
-import { fetchWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime";
+import { fetchConfiguredLocalOriginWithSsrFGuard } from "openclaw/plugin-sdk/ssrf-runtime-internal";
 import {
   isRecord,
   normalizeOptionalString,
@@ -1056,7 +1056,8 @@ function createRawOllamaStreamFn(
             acquisitionDeadline?.signal,
           )
           .finally(acquisitionDeadline?.cleanup);
-        const guardedFetch = await fetchWithSsrFGuard({
+        const guardedFetch = await fetchConfiguredLocalOriginWithSsrFGuard({
+          configuredLocalOriginBaseUrl: baseUrl,
           url: chatUrl,
           init: {
             method: "POST",

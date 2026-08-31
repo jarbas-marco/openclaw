@@ -98,4 +98,6 @@ export function applyGatewayLaneConcurrency(
     setCommandLaneConcurrency(CommandLane.Nested, 1);
   }
   setCommandLaneConcurrency(CommandLane.Subagent, concurrency.subagent);
+  setCommandLaneConcurrency("model-run-live", 2);
+  setCommandLaneConcurrency("model-run-maintenance", 1);
 }

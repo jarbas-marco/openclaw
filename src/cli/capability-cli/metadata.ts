@@ -33,6 +33,7 @@ export const CAPABILITY_METADATA: CapabilityMetadata[] = [
       "--thinking",
       "--local",
       "--gateway",
+      "--lane",
       "--agent",
       "--json",
     ],
