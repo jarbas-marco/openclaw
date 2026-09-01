@@ -1892,6 +1892,7 @@ NODE
 
   it("keeps Testbox pull request validation off leased runner capacity", () => {
     const workflow = readTestboxWorkflow();
+    const armWorkflow = readWorkflow(".github/workflows/ci-check-arm-testbox.yml");
 
     expect(workflow.on.pull_request).toEqual({
       types: ["opened", "reopened", "synchronize", "ready_for_review"],
@@ -1914,6 +1915,23 @@ NODE
       with: { testbox_id: "${{ inputs.testbox_id }}" },
     });
     expect(runStep).toMatchObject({
+      if: "github.event_name == 'workflow_dispatch' && always()",
+    });
+
+    expect(armWorkflow.jobs["check-arm"]["runs-on"]).toBe(
+      "${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'blacksmith-16vcpu-ubuntu-2404-arm' }}",
+    );
+    const beginArmStep = armWorkflow.jobs["check-arm"].steps.find(
+      (step: { name?: string }) => step.name === "Begin Testbox",
+    );
+    const runArmStep = armWorkflow.jobs["check-arm"].steps.find(
+      (step: { name?: string }) => step.name === "Run Testbox",
+    );
+    expect(beginArmStep).toMatchObject({
+      if: "github.event_name == 'workflow_dispatch'",
+      with: { testbox_id: "${{ inputs.testbox_id }}" },
+    });
+    expect(runArmStep).toMatchObject({
       if: "github.event_name == 'workflow_dispatch' && always()",
     });
   });
