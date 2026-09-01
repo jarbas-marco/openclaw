@@ -3858,7 +3858,9 @@ NODE
     expect(setupPnpm.with?.["cache-mode"]).toContain("'restore' || 'off'");
     expect(actionSteps.indexOf(restore)).toBeLessThan(actionSteps.indexOf(setupPnpm));
 
-    expect(installScript).toContain("install_args+=(--package-import-method=hardlink)");
+    expect(installScript).toContain("export PNPM_CONFIG_PACKAGE_IMPORT_METHOD=hardlink");
+    expect(installScript).toContain("--config.ignore-scripts=false");
+    expect(installScript).toContain('install_args+=("--config.${option_name}=${value}")');
     expect(installScript).toContain("run_pnpm_install --offline");
     expect(installScript).toContain("run_pnpm_install --prefer-offline");
     expect(installScript).toContain('[ "$DEPENDENCY_CACHE_HIT" = "true" ]');
@@ -8438,7 +8440,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       );
       for (const installFlag of [
         "--frozen-lockfile",
-        "--ignore-scripts=false",
+        "--config.ignore-scripts=false",
         "--config.engine-strict=false",
         "--config.enable-pre-post-scripts=true",
         "--config.side-effects-cache=true",
