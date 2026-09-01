@@ -514,9 +514,9 @@ describe("shared Codex app-server client", () => {
 
   it("retains a gracefully detached live client by its persisted instance id", async () => {
     const harness = createClientHarness();
-    vi.spyOn(CodexAppServerClient, "start").mockReturnValue(harness.client);
+    vi.spyOn(CodexAppServerClient, "start").mockResolvedValue(harness.client);
     const acquire = getLeasedSharedCodexAppServerClient({ timeoutMs: 1_000 });
-    await sendInitializeResult(harness, "openclaw/0.147.0 (Linux; test)");
+    await sendInitializeResult(harness, `openclaw/${CODEX_APP_SERVER_VERSION} (Linux; test)`);
     const client = await acquire;
 
     expect(retireSharedCodexAppServerClientIfCurrent(client)).toEqual({
