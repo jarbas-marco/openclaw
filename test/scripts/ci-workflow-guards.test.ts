@@ -1892,6 +1892,7 @@ NODE
 
   it("keeps Testbox pull request validation off leased runner capacity", () => {
     const workflow = readTestboxWorkflow();
+    const armWorkflow = readWorkflow(".github/workflows/ci-check-arm-testbox.yml");
 
     expect(workflow.on.pull_request).toEqual({
       types: ["opened", "reopened", "synchronize", "ready_for_review"],
@@ -1914,6 +1915,23 @@ NODE
       with: { testbox_id: "${{ inputs.testbox_id }}" },
     });
     expect(runStep).toMatchObject({
+      if: "github.event_name == 'workflow_dispatch' && always()",
+    });
+
+    expect(armWorkflow.jobs["check-arm"]["runs-on"]).toBe(
+      "${{ github.event_name == 'pull_request' && 'ubuntu-24.04-arm' || 'blacksmith-16vcpu-ubuntu-2404-arm' }}",
+    );
+    const beginArmStep = armWorkflow.jobs["check-arm"].steps.find(
+      (step: { name?: string }) => step.name === "Begin Testbox",
+    );
+    const runArmStep = armWorkflow.jobs["check-arm"].steps.find(
+      (step: { name?: string }) => step.name === "Run Testbox",
+    );
+    expect(beginArmStep).toMatchObject({
+      if: "github.event_name == 'workflow_dispatch'",
+      with: { testbox_id: "${{ inputs.testbox_id }}" },
+    });
+    expect(runArmStep).toMatchObject({
       if: "github.event_name == 'workflow_dispatch' && always()",
     });
   });
@@ -3858,7 +3876,9 @@ NODE
     expect(setupPnpm.with?.["cache-mode"]).toContain("'restore' || 'off'");
     expect(actionSteps.indexOf(restore)).toBeLessThan(actionSteps.indexOf(setupPnpm));
 
-    expect(installScript).toContain("install_args+=(--package-import-method=hardlink)");
+    expect(installScript).toContain("export PNPM_CONFIG_PACKAGE_IMPORT_METHOD=hardlink");
+    expect(installScript).toContain("--config.ignore-scripts=false");
+    expect(installScript).toContain('install_args+=("--config.${option_name}=${value}")');
     expect(installScript).toContain("run_pnpm_install --offline");
     expect(installScript).toContain("run_pnpm_install --prefer-offline");
     expect(installScript).toContain('[ "$DEPENDENCY_CACHE_HIT" = "true" ]');
@@ -8438,7 +8458,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
       );
       for (const installFlag of [
         "--frozen-lockfile",
-        "--ignore-scripts=false",
+        "--config.ignore-scripts=false",
         "--config.engine-strict=false",
         "--config.enable-pre-post-scripts=true",
         "--config.side-effects-cache=true",

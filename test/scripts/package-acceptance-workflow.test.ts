@@ -2396,7 +2396,16 @@ describe("package acceptance workflow", () => {
     );
     expect(hydrateWindowsPnpm.run).not.toContain("PNPM_CONFIG_PACKAGE_IMPORT_METHOD");
     expect(hydrateWindowsPnpm.run).toContain("--config.side-effects-cache=false");
-    expect(hydrateWindowsPnpm.run).toContain("--ignore-scripts=true");
+    expect(hydrateWindowsPnpm.run).toContain('"--ignore-scripts",');
+    for (const configFlag of [
+      "child-concurrency",
+      "modules-dir",
+      "network-concurrency",
+      "store-dir",
+      "virtual-store-dir",
+    ]) {
+      expect(hydrateWindowsPnpm.run).toContain(`"--config.${configFlag}=`);
+    }
     expect(hydrateWindowsPnpm.run).toContain('$env:PNPM_CONFIG_CHILD_CONCURRENCY = "4"');
     expect(hydrateWindowsPnpm.run).toContain('$env:PNPM_CONFIG_NETWORK_CONCURRENCY = "8"');
     expect(hydrateWindowsPnpm.run).toContain('$env:PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN = "false"');
@@ -4177,7 +4186,7 @@ describe("package artifact reuse", () => {
     expect(checkTestboxSteps.indexOf(closeTestboxSshStep)).toBe(
       checkTestboxSteps.indexOf(runTestboxStep) + 1,
     );
-    expect(runArmTestboxStep.if).toBe("always()");
+    expect(runArmTestboxStep.if).toBe("github.event_name == 'workflow_dispatch' && always()");
     expect(runBuildArtifactsTestboxStep.if).toBe(
       "github.event_name == 'workflow_dispatch' && always()",
     );

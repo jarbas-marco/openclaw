@@ -1,6 +1,13 @@
 // Docker E2E Plan tests cover docker e2e plan script behavior.
 import { execFileSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -1117,6 +1124,51 @@ describe("scripts/lib/docker-e2e-plan", () => {
       "published-upgrade-survivor-2026.6.11-meeting-transcripts-sqlite",
       "published-upgrade-survivor-2026.6.11-cron-scheduled-authority",
     ]);
+  });
+
+  it("reads the 2026.8.1 scenario catalog without executing frozen target code", () => {
+    const targetRoot = tempDirs.make("openclaw-2026-8-1-frozen-upgrade-harness-");
+    const assertionsFile = join(targetRoot, "scripts/e2e/lib/upgrade-survivor/assertions.mjs");
+    const executionMarker = join(targetRoot, "target-code-executed");
+    mkdirSync(dirname(assertionsFile), { recursive: true });
+    writeFileSync(
+      assertionsFile,
+      [
+        "const SCENARIOS = new Set([",
+        '  "base",',
+        '  "acpx-openclaw-tools-bridge",',
+        '  "feishu-channel",',
+        '  "bootstrap-persona",',
+        '  "channel-post-core-restore",',
+        '  "codex-allowlist-survival",',
+        '  "plugin-deps-cleanup",',
+        '  "configured-plugin-installs",',
+        '  "stale-source-plugin-shadow",',
+        '  "prerelease-plugin-registry",',
+        '  "tilde-log-path",',
+        '  "meeting-transcripts-sqlite",',
+        '  "versioned-runtime-deps",',
+        '  "cron-scheduled-authority",',
+        '  "sqlite-volume",',
+        '  "auth-profile-v2026-7-2-beta-5",',
+        "]);",
+        'const { writeFileSync } = await import("node:fs");',
+        `writeFileSync(${JSON.stringify(executionMarker)}, "executed");`,
+        'throw new Error("frozen target code must not execute");',
+      ].join("\n"),
+    );
+
+    const plan = planFor({
+      allowFrozenTargetScenarioOmissions: false,
+      selectedLaneNames: ["published-upgrade-survivor"],
+      upgradeSurvivorBaselines: "2026.6.11",
+      upgradeSurvivorScenarios: "reported-issues",
+      upgradeSurvivorTargetRoot: targetRoot,
+    });
+
+    expect(plan.lanes).not.toEqual([]);
+    expect(plan.omittedUnsupportedLanes).toEqual([]);
+    expect(existsSync(executionMarker)).toBe(false);
   });
 
   it("omits survivor lanes when the target exposes none of the requested scenarios", () => {
