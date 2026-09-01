@@ -12,6 +12,9 @@ const { fetchWithSsrFGuardMock, ollamaStreamWarnMock } = vi.hoisted(() => ({
 vi.mock("openclaw/plugin-sdk/ssrf-runtime", () => ({
   fetchWithSsrFGuard: fetchWithSsrFGuardMock,
 }));
+vi.mock("openclaw/plugin-sdk/ssrf-runtime-internal", () => ({
+  fetchConfiguredLocalOriginWithSsrFGuard: fetchWithSsrFGuardMock,
+}));
 
 vi.mock("openclaw/plugin-sdk/runtime-env", async (importOriginal) => {
   const actual = await importOriginal<typeof import("openclaw/plugin-sdk/runtime-env")>();

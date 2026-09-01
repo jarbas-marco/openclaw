@@ -5,6 +5,7 @@
  */
 import { finiteSecondsToTimerSafeMilliseconds } from "@openclaw/normalization-core/number-coercion";
 import {
+  fetchConfiguredLocalOriginWithSsrFGuard,
   fetchWithSsrFGuard,
   type GuardedFetchOptions,
   type GuardedFetchResult,
@@ -99,14 +100,20 @@ export async function withSelfHostedWebToolsEndpoint<T>(
   params: WebToolEndpointFetchOptions,
   run: (result: { response: Response; finalUrl: string }) => Promise<T>,
 ): Promise<T> {
-  return await withWebToolsNetworkGuard(
-    {
-      ...params,
+  const { timeoutSeconds, ...rest } = params;
+  const { response, finalUrl, release } = await fetchConfiguredLocalOriginWithSsrFGuard({
+    ...withStrictGuardedFetchMode({
+      ...rest,
       policy: WEB_TOOLS_SELF_HOSTED_NETWORK_SSRF_POLICY,
-      useEnvProxy: true,
-    },
-    run,
-  );
+      timeoutMs: resolveTimeoutMs({ timeoutMs: rest.timeoutMs, timeoutSeconds }),
+    }),
+    configuredLocalOriginBaseUrl: params.url,
+  });
+  try {
+    return await run({ response, finalUrl });
+  } finally {
+    await release();
+  }
 }
 
 /** Runs a fetch under strict SSRF protection without env proxy trust. */

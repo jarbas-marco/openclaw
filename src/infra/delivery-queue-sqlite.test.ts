@@ -11,7 +11,7 @@ import {
 import { commitStagedDeliveryQueueEntryOnceAcrossNamespaces } from "./delivery-queue-sqlite-namespace.js";
 import {
   completeDeliveryQueueEntry,
-  countFailedDeliveryQueueEntries,
+  countFailedDeliveryQueueEntriesInDatabase,
   countPendingDeliveryQueueEntries,
   deleteDeliveryQueueEntry,
   getDeliveryQueueEntryStatus,
@@ -378,7 +378,9 @@ describe("delivery-queue-sqlite corrupt JSON resilience", () => {
       expect(getDeliveryQueueEntryStatus(QUEUE, "rt-expired-completed", stateDir)).toBe(
         "completed",
       );
-      countFailedDeliveryQueueEntries(stateDir);
+      countFailedDeliveryQueueEntriesInDatabase(
+        openOpenClawStateDatabase({ env: { ...process.env, OPENCLAW_STATE_DIR: stateDir } }).db,
+      );
       expect(getDeliveryQueueEntryStatus(QUEUE, "rt-expired-completed", stateDir)).toBe(
         "completed",
       );

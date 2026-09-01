@@ -12,6 +12,9 @@ vi.mock("openclaw/plugin-sdk/ssrf-runtime", async (importOriginal) => ({
   ...(await importOriginal<typeof import("openclaw/plugin-sdk/ssrf-runtime")>()),
   fetchWithSsrFGuard: fetchWithSsrFGuardMock,
 }));
+vi.mock("openclaw/plugin-sdk/ssrf-runtime-internal", () => ({
+  fetchConfiguredLocalOriginWithSsrFGuard: fetchWithSsrFGuardMock,
+}));
 
 import {
   buildAssistantMessage,
@@ -356,6 +359,7 @@ describe("createOllamaStreamFn thinking events", () => {
       },
       timeoutMs: 2500,
       auditContext: "ollama-stream.chat",
+      configuredLocalOriginBaseUrl: "http://localhost:11434",
     });
   });
 

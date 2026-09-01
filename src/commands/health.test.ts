@@ -964,6 +964,35 @@ describe("formatDeliveryQueueHealthLine", () => {
     );
   });
 
+  it("warns when queue diagnostics are incomplete without exposing read errors", () => {
+    const summary = createHealthSummary({
+      channels: {},
+      channelOrder: [],
+      channelLabels: {},
+    });
+    summary.deliveryQueuesComplete = false;
+
+    expect(formatDeliveryQueueHealthLine(summary)).toBe(
+      "Delivery queue: warning (queue status incomplete)",
+    );
+  });
+
+  it("combines partial queue counts with an incompleteness warning", () => {
+    const summary = createHealthSummary({
+      channels: {},
+      channelOrder: [],
+      channelLabels: {},
+    });
+    summary.deliveryQueuesComplete = false;
+    summary.deliveryQueues = {
+      failed: [{ queueName: "outbound", count: 2, oldestFailedAt: 90_000 }],
+    };
+
+    expect(formatDeliveryQueueHealthLine(summary, 7_290_000)).toBe(
+      "Delivery queue: warning (queue status incomplete; dead-lettered entries — outbound: 2; oldest 2h ago)",
+    );
+  });
+
   it("returns null when no dead-lettered entries are reported", () => {
     const summary = createHealthSummary({
       channels: {},

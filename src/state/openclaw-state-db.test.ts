@@ -13,7 +13,7 @@ import { loadedCronStoreFromRows, loadCronRows } from "../cron/store/row-codec.j
 import type { CronStoredJob } from "../cron/types.js";
 import { buildApprovalResolutionRef } from "../infra/approval-resolution-ref.js";
 import {
-  countFailedDeliveryQueueEntries,
+  countFailedDeliveryQueueEntriesInDatabase,
   getDeliveryQueueEntryStatus,
   loadDeliveryQueueEntry,
   terminalizePendingDeliveryQueueEntry,
@@ -7343,7 +7343,7 @@ INSERT INTO macos_port_guardian_records VALUES (4242, 18789, '/usr/bin/ssh', 're
       "failed",
     );
     expect(
-      countFailedDeliveryQueueEntries(stateDir).some(
+      countFailedDeliveryQueueEntriesInDatabase(reopened.db).some(
         ({ queueName, count }) => queueName === "outbound" && count > 0,
       ),
     ).toBe(true);
