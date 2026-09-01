@@ -60,6 +60,28 @@ const HEIC_MODEL_RUN_MIMES = new Set([
   "image/heif-sequence",
 ]);
 
+type ModelRunLane = "model-run-live" | "model-run-maintenance";
+
+function normalizeModelRunLane(
+  value: unknown,
+  transport: CapabilityTransport,
+): ModelRunLane | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (transport !== "gateway") {
+    throw new Error("--lane requires --gateway.");
+  }
+  if (typeof value !== "string") {
+    throw new Error("Invalid model-run lane.");
+  }
+  const lane = value.trim();
+  if (lane !== "model-run-live" && lane !== "model-run-maintenance") {
+    throw new Error("Invalid model-run lane.");
+  }
+  return lane;
+}
+
 async function loadModelCatalogForInspection(cfg: OpenClawConfig, agentId?: string) {
   const prepared = await loadPreparedModelCatalog({ config: cfg, agentId, readOnly: true });
   const metadataSnapshot = loadManifestMetadataSnapshot({ config: cfg, env: process.env });
@@ -174,6 +196,7 @@ async function runModelRun(params: {
   model?: string;
   thinking?: ThinkLevel;
   transport: CapabilityTransport;
+  lane?: ModelRunLane;
   agent?: string;
 }) {
   const explicitModelOverride = requireProviderModelOverride(params.model);
@@ -317,6 +340,7 @@ async function runModelRun(params: {
       ...(params.thinking ? { thinking: params.thinking } : {}),
       modelRun: true,
       promptMode: "none",
+      lane: params.lane ?? "model-run-live",
       cleanupBundleMcpOnRunEnd: true,
       idempotencyKey: randomIdempotencyKey(),
     },
@@ -463,6 +487,7 @@ export function registerModelCapabilityCommands(capability: Command): void {
     .option("--thinking <level>", "Thinking level override")
     .option("--local", "Force local execution", false)
     .option("--gateway", "Force gateway execution", false)
+    .option("--lane <name>", "Gateway scheduling lane")
     .option(
       "--agent <id>",
       "Agent whose model and credentials own the run (default: agents.defaults.systemAgent.agentId, then the sole agent)",
@@ -478,6 +503,7 @@ export function registerModelCapabilityCommands(capability: Command): void {
           supported: ["local", "gateway"],
           defaultTransport: "local",
         });
+        const lane = normalizeModelRunLane(opts.lane, transport);
         const result = await runModelRun({
           prompt,
           agent: resolveCapabilityAgentOption(command, opts.agent),
@@ -485,6 +511,7 @@ export function registerModelCapabilityCommands(capability: Command): void {
           model: opts.model as string | undefined,
           thinking,
           transport,
+          lane,
         });
         emitJsonOrText(defaultRuntime, Boolean(opts.json), result, formatEnvelopeForText);
       });

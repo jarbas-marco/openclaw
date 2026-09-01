@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { releaseExecutionPlanSha256 } from "../../scripts/full-release-validation-policy.mjs";
 import {
   affectedActiveRunIds,
@@ -23,6 +23,9 @@ const SCRIPT = resolve("scripts/full-release-validation-state.mjs");
 const SHA = "a".repeat(40);
 const TARGET_SHA = "b".repeat(40);
 const TRUSTED_MAIN = { fullRef: "refs/heads/main", ref: "main", sha: SHA };
+
+beforeEach(() => vi.stubEnv("GITHUB_REPOSITORY", "openclaw/openclaw"));
+afterEach(() => vi.unstubAllEnvs());
 
 function evidenceManifest() {
   return { runAttempt: 1, runId: "99", targetSha: TARGET_SHA };
