@@ -47,6 +47,7 @@ type BackupVerifyResult = {
   assetCount: number;
   entryCount: number;
   symlinkCount: number;
+  recoveryProfile?: true;
 };
 
 type PreparedBackupArchive = {
@@ -137,6 +138,9 @@ function formatResult(result: BackupVerifyResult): string {
     `Assets verified: ${result.assetCount}`,
     `Archive entries scanned: ${result.entryCount}`,
     `Symbolic links checked: ${result.symlinkCount}`,
+    ...(result.recoveryProfile
+      ? ["Recovery profile: legacy internal-run traces were verified as omitted."]
+      : []),
   ].join("\n");
 }
 
@@ -660,6 +664,7 @@ async function verifyResolvedBackupArchive(archivePath: string): Promise<Prepare
     assetCount: manifest.assets.length,
     entryCount: rawEntries.length,
     symlinkCount: symbolicLinks.length,
+    ...(manifest.options?.recoveryProfile ? { recoveryProfile: true as const } : {}),
   };
 
   return { result, hardlinkTargets };

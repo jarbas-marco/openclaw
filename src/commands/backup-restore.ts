@@ -40,6 +40,7 @@ type BackupRestoreResult = {
   assetCount: number;
   entryCount: number;
   symlinkCount: number;
+  recoveryProfile?: true;
   warnings: string[];
 };
 
@@ -176,7 +177,12 @@ export async function backupRestoreCommand(
   const result: BackupRestoreResult = {
     ...verified,
     targetPath,
-    warnings: [...BACKUP_RESTORE_WARNINGS],
+    warnings: [
+      ...BACKUP_RESTORE_WARNINGS,
+      ...(verified.recoveryProfile
+        ? ["This archive used the recovery profile; legacy internal-run traces were not included."]
+        : []),
+    ],
   };
   if (options.json) {
     writeRuntimeJson(runtime, result);

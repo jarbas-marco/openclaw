@@ -376,6 +376,43 @@ describe("backupRestoreCommand", () => {
     );
   });
 
+  it("reports verified recovery-profile omissions after restore", async () => {
+    await withOpenClawTestState(
+      {
+        layout: "state-only",
+        prefix: "openclaw-backup-restore-recovery-profile-",
+        scenario: "minimal",
+      },
+      async (state) => {
+        const outputDir = state.path("backups");
+        const targetPath = state.path("restored");
+        await fs.mkdir(outputDir, { recursive: true });
+        await state.writeText("operator-note.txt", "restore me\n");
+        await state.writeText("internal-agent-runs/legacy.jsonl", "omit me\n");
+
+        const backup = await createBackupArchive({
+          output: outputDir,
+          includeWorkspace: false,
+          recoveryProfile: true,
+          nowMs: Date.UTC(2026, 7, 12, 13, 0, 0),
+        });
+        const restored = await backupRestoreCommand(createRuntime(), {
+          archive: backup.archivePath,
+          target: targetPath,
+          json: true,
+        });
+
+        expect(restored).toMatchObject({ ok: true, recoveryProfile: true });
+        expect(restored.warnings).toContain(
+          "This archive used the recovery profile; legacy internal-run traces were not included.",
+        );
+        expect(await listFilesystemLeafEntries(targetPath)).not.toContainEqual(
+          expect.stringContaining("/internal-agent-runs/"),
+        );
+      },
+    );
+  });
+
   it("accepts an empty directory and refuses a non-empty target", async () => {
     await withOpenClawTestState(
       {

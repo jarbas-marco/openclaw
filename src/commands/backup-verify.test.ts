@@ -8,6 +8,10 @@ import * as tar from "tar";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { runCommandWithRuntime } from "../cli/cli-utils.js";
+import {
+  BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+  BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+} from "../infra/backup-recovery-profile.js";
 import { requireNodeSqlite } from "../infra/node-sqlite.js";
 import { buildBackupArchivePath, buildBackupArchiveRoot } from "./backup-shared.js";
 import type { BackupManifest } from "./backup-verify-manifest.js";
@@ -123,7 +127,7 @@ async function withBrokenArchiveFixture(
   options: {
     tempPrefix: string;
     manifestAssetArchivePath: string;
-    manifest?: ReturnType<typeof createBackupManifest>;
+    manifest?: Record<string, unknown>;
     payloads: Array<{ fileName: string; contents: string | Uint8Array; archivePath?: string }>;
     buildTarEntries?: (paths: { manifestPath: string; payloadPaths: string[] }) => string[];
   },
@@ -244,6 +248,266 @@ describe("backupVerifyCommand", () => {
     } finally {
       await fs.rm(archiveDir, { recursive: true, force: true });
     }
+  });
+
+  it.each([
+    {
+      name: "declared config below the excluded root",
+      paths: { configPath: "/tmp/.openclaw/internal-agent-runs/config/openclaw.json" },
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /cannot declare excluded state path/iu,
+    },
+    {
+      name: "declared oauth directory below the excluded root",
+      paths: { oauthDir: "/tmp/.openclaw/internal-agent-runs/oauth" },
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /cannot declare excluded state path/iu,
+    },
+    {
+      name: "covered workspace below the excluded root",
+      paths: { workspaceDirs: ["/tmp/.openclaw/internal-agent-runs/workspace"] },
+      skipped: [
+        {
+          kind: "workspace",
+          sourcePath: "/tmp/.openclaw/internal-agent-runs/workspace",
+          reason: "covered",
+          coveredBy: "forged",
+        },
+      ],
+      payloadSuffix: "internal-agent-runs/workspace/KEEP.md",
+      error: /cannot declare excluded state path/iu,
+    },
+    {
+      name: "payload under a case variant of the excluded root",
+      paths: {},
+      skipped: [],
+      payloadSuffix: "Internal-Agent-Runs/run.json",
+      error: /contains excluded state payload/iu,
+    },
+    {
+      name: "declared config exception without payload proof",
+      paths: { configPath: "/tmp/.openclaw/internal-agent-runs/openclaw.json" },
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /cannot declare excluded state path/iu,
+    },
+    {
+      name: "declared workspace exception without a covered relation",
+      paths: { workspaceDirs: ["/tmp/.openclaw/internal-agent-runs/workspace"] },
+      skipped: [],
+      payloadSuffix: "internal-agent-runs/workspace/KEEP.md",
+      error: /cannot declare excluded state path/iu,
+    },
+  ])("rejects forged recovery-profile preserved exceptions: $name", async (fixture) => {
+    const stateAssetRoot = buildBackupArchivePath(TEST_ARCHIVE_ROOT, "/tmp/.openclaw");
+    const manifest = {
+      ...createBackupManifest(stateAssetRoot),
+      schemaVersion: 2,
+      paths: { stateDir: "/tmp/.openclaw", ...fixture.paths },
+      options: { recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] } },
+      skipped: [
+        {
+          kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+          sourcePath: "/tmp/.openclaw/internal-agent-runs",
+          reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+        },
+        ...fixture.skipped,
+      ],
+    };
+    await withBrokenArchiveFixture(
+      {
+        tempPrefix: "openclaw-backup-forged-recovery-profile-",
+        manifestAssetArchivePath: stateAssetRoot,
+        manifest,
+        payloads: [
+          {
+            fileName: "payload.txt",
+            contents: "payload\n",
+            archivePath: `${stateAssetRoot}/${fixture.payloadSuffix}`,
+          },
+        ],
+      },
+      async (archivePath) => {
+        await expect(
+          backupVerifyCommand(createBackupVerifyRuntime(), { archive: archivePath }),
+        ).rejects.toThrow(fixture.error);
+      },
+    );
+  });
+
+  it.each([
+    {
+      name: "archivePath does not encode the state sourcePath",
+      stateSourcePath: "/tmp/.openclaw",
+      stateArchiveSourcePath: "/tmp/decoy-state",
+      error: /state asset archivePath does not match its sourcePath/iu,
+    },
+    {
+      name: "state sourcePath does not match paths.stateDir",
+      stateSourcePath: "/tmp/decoy-state",
+      stateArchiveSourcePath: "/tmp/decoy-state",
+      error: /state asset sourcePath does not match paths\.stateDir/iu,
+    },
+  ])("rejects a recovery-profile state-root decoy: $name", async (fixture) => {
+    const declaredStateDir = "/tmp/.openclaw";
+    const realStateAssetRoot = buildBackupArchivePath(TEST_ARCHIVE_ROOT, declaredStateDir);
+    const decoyStateAssetRoot = buildBackupArchivePath(
+      TEST_ARCHIVE_ROOT,
+      fixture.stateArchiveSourcePath,
+    );
+    const manifest = {
+      ...createBackupManifest(decoyStateAssetRoot, TEST_ARCHIVE_ROOT, fixture.stateSourcePath),
+      schemaVersion: 2,
+      paths: { stateDir: declaredStateDir },
+      options: { recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] } },
+      assets: [
+        {
+          kind: "state",
+          sourcePath: fixture.stateSourcePath,
+          archivePath: decoyStateAssetRoot,
+        },
+        {
+          kind: "workspace",
+          sourcePath: declaredStateDir,
+          archivePath: realStateAssetRoot,
+        },
+      ],
+      skipped: [
+        {
+          kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+          sourcePath: `${fixture.stateArchiveSourcePath}/internal-agent-runs`,
+          reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+        },
+      ],
+    };
+
+    await withBrokenArchiveFixture(
+      {
+        tempPrefix: "openclaw-backup-recovery-state-decoy-",
+        manifestAssetArchivePath: decoyStateAssetRoot,
+        manifest,
+        payloads: [
+          {
+            fileName: "decoy.txt",
+            contents: "decoy\n",
+            archivePath: `${decoyStateAssetRoot}/operator.json`,
+          },
+          {
+            fileName: "secret.txt",
+            contents: "secret\n",
+            archivePath: `${realStateAssetRoot}/internal-agent-runs/secret.txt`,
+          },
+        ],
+      },
+      async (archivePath) => {
+        await expect(
+          backupVerifyCommand(createBackupVerifyRuntime(), { archive: archivePath }),
+        ).rejects.toThrow(fixture.error);
+      },
+    );
+  });
+
+  it.each([
+    {
+      name: "v1 recovery profile",
+      schemaVersion: 1,
+      recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] },
+      error: /schemaVersion 1 cannot declare a recoveryProfile/iu,
+    },
+    {
+      name: "v2 without a recovery profile",
+      schemaVersion: 2,
+      recoveryProfile: undefined,
+      error: /schemaVersion 2 must declare a recoveryProfile/iu,
+    },
+  ])("rejects incompatible manifest schema/profile pairs: $name", async (fixture) => {
+    const stateAssetRoot = buildBackupArchivePath(TEST_ARCHIVE_ROOT, "/tmp/.openclaw");
+    await withBrokenArchiveFixture(
+      {
+        tempPrefix: "openclaw-backup-schema-profile-",
+        manifestAssetArchivePath: stateAssetRoot,
+        manifest: {
+          ...createBackupManifest(stateAssetRoot),
+          schemaVersion: fixture.schemaVersion,
+          options:
+            fixture.recoveryProfile === undefined
+              ? {}
+              : { recoveryProfile: fixture.recoveryProfile },
+        },
+        payloads: [{ fileName: "payload.txt", contents: "payload\n" }],
+      },
+      async (archivePath) => {
+        await expect(
+          backupVerifyCommand(createBackupVerifyRuntime(), { archive: archivePath }),
+        ).rejects.toThrow(fixture.error);
+      },
+    );
+  });
+
+  it.each([
+    {
+      name: "legacy boolean marker",
+      recoveryProfile: true,
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /recoveryProfile must declare excludedStateRoots/iu,
+    },
+    {
+      name: "unsupported exclusion",
+      recoveryProfile: { excludedStateRoots: ["backups"] },
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /declares unsupported state exclusions/iu,
+    },
+    {
+      name: "missing exclusion metadata",
+      recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] },
+      skipped: [],
+      payloadSuffix: "operator.json",
+      error: /missing verified exclusion metadata/iu,
+    },
+    {
+      name: "excluded payload present",
+      recoveryProfile: { excludedStateRoots: ["internal-agent-runs"] },
+      skipped: [
+        {
+          kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+          sourcePath: "/tmp/.openclaw/internal-agent-runs",
+          reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+        },
+      ],
+      payloadSuffix: "internal-agent-runs/run.json",
+      error: /contains excluded state payload/iu,
+    },
+  ])("rejects inconsistent recovery profile manifests: $name", async (fixture) => {
+    const stateAssetRoot = buildBackupArchivePath(TEST_ARCHIVE_ROOT, "/tmp/.openclaw");
+    const manifest = {
+      ...createBackupManifest(stateAssetRoot),
+      schemaVersion: 2,
+      options: { recoveryProfile: fixture.recoveryProfile },
+      skipped: fixture.skipped,
+    };
+    await withBrokenArchiveFixture(
+      {
+        tempPrefix: "openclaw-backup-invalid-recovery-profile-",
+        manifestAssetArchivePath: stateAssetRoot,
+        manifest,
+        payloads: [
+          {
+            fileName: "payload.txt",
+            contents: "payload\n",
+            archivePath: `${stateAssetRoot}/${fixture.payloadSuffix}`,
+          },
+        ],
+      },
+      async (archivePath) => {
+        await expect(
+          backupVerifyCommand(createBackupVerifyRuntime(), { archive: archivePath }),
+        ).rejects.toThrow(fixture.error);
+      },
+    );
   });
 
   it.each([
