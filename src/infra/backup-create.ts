@@ -3,7 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { resolveDateTimestampMs } from "@openclaw/normalization-core/number-coercion";
-import type { BackupAgentRoot } from "../commands/backup-resource-inventory.js";
+import type {
+  BackupAgentRoot,
+  BackupResourceInventory,
+} from "../commands/backup-resource-inventory.js";
 import {
   buildBackupArchiveBasename,
   buildBackupArchivePath,
@@ -16,7 +19,7 @@ import type { BackupManifest } from "../commands/backup-verify-manifest.js";
 import { isPathWithin } from "../commands/cleanup-utils.js";
 import { resolveGatewayLockDir } from "../config/paths.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
-import { resolveHomeDir, resolveUserPath } from "../utils.js";
+import { resolveHomeDir, resolveUserPath, shortenHomePath } from "../utils.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
 import { assertArchiveSymbolicLinkTarget } from "./backup-archive-path-policy.js";
 import {
@@ -30,6 +33,12 @@ import {
   removePreparedBackupArchive,
   writeArchiveStreamToFile,
 } from "./backup-create-stream.js";
+import {
+  BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+  BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+  BACKUP_RECOVERY_PROFILE_STATE_ROOTS,
+  buildBackupRecoveryProfileManifest,
+} from "./backup-recovery-profile.js";
 import {
   classifyBackupSqliteSource,
   createBackupSqliteSnapshotPlan,
@@ -56,6 +65,8 @@ export type BackupCreateOptions = {
   dryRun?: boolean;
   includeWorkspace?: boolean;
   onlyConfig?: boolean;
+  /** Exclude non-authoritative legacy internal-run traces from durable recovery state. */
+  recoveryProfile?: boolean;
   verify?: boolean;
   json?: boolean;
   nowMs?: number;
@@ -76,6 +87,7 @@ export type BackupCreateResult = {
   dryRun: boolean;
   includeWorkspace: boolean;
   onlyConfig: boolean;
+  recoveryProfile?: true;
   verified: boolean;
   assets: BackupAsset[];
   agentRoots?: readonly BackupManifestAgentRoot[];
@@ -243,6 +255,7 @@ function buildManifest(params: {
   archiveRoot: string;
   includeWorkspace: boolean;
   onlyConfig: boolean;
+  recoveryProfile: boolean;
   assets: BackupAsset[];
   skipped: BackupCreateResult["skipped"];
   stateDir: string;
@@ -252,7 +265,7 @@ function buildManifest(params: {
   agentRoots: readonly BackupAgentRoot[];
 }): BackupManifest {
   return {
-    schemaVersion: 1,
+    schemaVersion: params.recoveryProfile ? 2 : 1,
     createdAt: params.createdAt,
     archiveRoot: params.archiveRoot,
     runtimeVersion: resolveRuntimeServiceVersion(),
@@ -261,6 +274,7 @@ function buildManifest(params: {
     options: {
       includeWorkspace: params.includeWorkspace,
       onlyConfig: params.onlyConfig,
+      recoveryProfile: params.recoveryProfile ? buildBackupRecoveryProfileManifest() : undefined,
     },
     paths: {
       stateDir: params.stateDir,
@@ -292,6 +306,9 @@ function buildManifest(params: {
 
 export function formatBackupCreateSummary(result: BackupCreateResult): string[] {
   const lines = [`Backup archive: ${result.archivePath}`];
+  if (result.recoveryProfile) {
+    lines.push("Recovery profile: excluded non-authoritative legacy internal-run traces.");
+  }
   lines.push(`Included ${result.assets.length} path${result.assets.length === 1 ? "" : "s"}:`);
   for (const asset of result.assets) {
     lines.push(`- ${asset.kind}: ${asset.displayPath}`);
@@ -341,6 +358,50 @@ function remapArchiveEntryPath(params: {
   return buildBackupArchivePath(params.archiveRoot, normalizedEntry);
 }
 
+function resolveRecoveryProfileStateAsset(assets: readonly BackupAsset[]): BackupAsset {
+  const stateAssets = assets.filter((asset) => asset.kind === "state");
+  if (stateAssets.length !== 1 || !stateAssets[0]) {
+    throw new Error("Recovery-profile backup requires exactly one state asset.");
+  }
+  return stateAssets[0];
+}
+
+function isRecoveryProfileExcludedSourcePath(stateDir: string, sourcePath: string): boolean {
+  const relativePath = path.relative(path.resolve(stateDir), path.resolve(sourcePath));
+  if (!relativePath || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    return false;
+  }
+  const root = relativePath.split(path.sep)[0]?.normalize("NFC").toLocaleLowerCase("en-US");
+  return BACKUP_RECOVERY_PROFILE_STATE_ROOTS.some((excludedRoot) => excludedRoot === root);
+}
+
+async function assertRecoveryProfilePreservedPaths(params: {
+  stateDir: string;
+  preservedPaths: readonly string[];
+}): Promise<void> {
+  for (const preservedPath of params.preservedPaths) {
+    const canonicalPreservedPath = await canonicalizePathForContainment(preservedPath);
+    if (isRecoveryProfileExcludedSourcePath(params.stateDir, canonicalPreservedPath)) {
+      throw new Error(
+        `Recovery-profile backup cannot preserve excluded state path: ${preservedPath}`,
+      );
+    }
+  }
+}
+
+function buildRecoveryProfileInventory(
+  inventory: BackupResourceInventory,
+): BackupResourceInventory {
+  const isExcluded = (sourcePath: string) =>
+    isRecoveryProfileExcludedSourcePath(inventory.stateDir, sourcePath);
+  return Object.freeze({
+    ...inventory,
+    isIncluded: (sourcePath: string) => !isExcluded(sourcePath) && inventory.isIncluded(sourcePath),
+    isTraversable: (sourcePath: string) =>
+      !isExcluded(sourcePath) && inventory.isTraversable(sourcePath),
+  });
+}
+
 function isBackupTarFilterFile(entry: import("node:fs").Stats | import("tar").ReadEntry): boolean {
   return "isFile" in entry ? entry.isFile() : entry.type === "File";
 }
@@ -351,8 +412,34 @@ export async function createBackupArchive(
   const nowMs = resolveDateTimestampMs(opts.nowMs);
   const archiveRoot = buildBackupArchiveRoot(nowMs);
   const onlyConfig = Boolean(opts.onlyConfig);
+  if (onlyConfig && opts.recoveryProfile) {
+    throw new Error(
+      "--only-config cannot be combined with --recovery-profile. Choose one backup scope and try again.",
+    );
+  }
+  const recoveryProfile = Boolean(opts.recoveryProfile);
   const includeWorkspace = onlyConfig ? false : (opts.includeWorkspace ?? true);
   const plan = await resolveBackupPlanFromDisk({ includeWorkspace, onlyConfig, nowMs });
+  const stateAsset = recoveryProfile
+    ? resolveRecoveryProfileStateAsset(plan.included)
+    : plan.included.find((asset) => asset.kind === "state");
+  const backupInventory = recoveryProfile
+    ? buildRecoveryProfileInventory(plan.inventory)
+    : plan.inventory;
+  if (recoveryProfile) {
+    if (!stateAsset) {
+      throw new Error("Recovery-profile backup state asset could not be resolved.");
+    }
+    await assertRecoveryProfilePreservedPaths({
+      stateDir: stateAsset.sourcePath,
+      preservedPaths: [
+        plan.configPath,
+        plan.oauthDir,
+        ...plan.workspaceDirs,
+        ...plan.inventory.agentRoots.flatMap((root) => [root.sourcePath, root.databasePath]),
+      ],
+    });
+  }
   const outputPath = await resolveOutputPath({
     output: opts.output,
     nowMs,
@@ -383,7 +470,18 @@ export async function createBackupArchive(
   }
 
   const createdAt = new Date(nowMs).toISOString();
-  const stateAsset = plan.included.find((asset) => asset.kind === "state");
+  const recoveryProfileSkipped =
+    recoveryProfile && stateAsset
+      ? BACKUP_RECOVERY_PROFILE_STATE_ROOTS.map((name) => {
+          const sourcePath = path.join(stateAsset.sourcePath, name);
+          return {
+            kind: BACKUP_RECOVERY_PROFILE_SKIP_KIND,
+            sourcePath,
+            displayPath: shortenHomePath(sourcePath),
+            reason: BACKUP_RECOVERY_PROFILE_SKIP_REASON,
+          };
+        })
+      : [];
   const result: BackupCreateResult = {
     createdAt,
     archiveRoot,
@@ -391,6 +489,7 @@ export async function createBackupArchive(
     dryRun: Boolean(opts.dryRun),
     includeWorkspace,
     onlyConfig,
+    ...(recoveryProfile ? { recoveryProfile: true as const } : {}),
     verified: false,
     assets: plan.included,
     ...(onlyConfig
@@ -401,7 +500,7 @@ export async function createBackupArchive(
             sourcePath,
           })),
         }),
-    skipped: plan.skipped,
+    skipped: [...plan.skipped, ...recoveryProfileSkipped],
     skippedVolatileCount: 0,
   };
 
@@ -439,7 +538,7 @@ export async function createBackupArchive(
           : [];
       const stateSqliteBackup = !onlyConfig
         ? await createBackupSqliteSnapshotPlan({
-            inventory: plan.inventory,
+            inventory: backupInventory,
             tempDir,
             legacyAuditSnapshots,
           })
@@ -470,9 +569,10 @@ export async function createBackupArchive(
       archiveRoot,
       includeWorkspace,
       onlyConfig,
+      recoveryProfile,
       assets: result.assets,
       skipped: result.skipped,
-      stateDir: plan.stateDir,
+      stateDir: recoveryProfile && stateAsset ? stateAsset.sourcePath : plan.stateDir,
       configPath: plan.configPath,
       oauthDir: plan.oauthDir,
       workspaceDirs: plan.workspaceDirs,
@@ -503,8 +603,8 @@ export async function createBackupArchive(
       if (
         !onlyConfig &&
         !(isDirectory
-          ? plan.inventory.isTraversable(resolvedEntryPath)
-          : plan.inventory.isIncluded(resolvedEntryPath))
+          ? backupInventory.isTraversable(resolvedEntryPath)
+          : backupInventory.isIncluded(resolvedEntryPath))
       ) {
         return false;
       }
@@ -519,7 +619,7 @@ export async function createBackupArchive(
       }
       const sqliteSourceKind = onlyConfig
         ? undefined
-        : classifyBackupSqliteSource(resolvedEntryPath, plan.inventory);
+        : classifyBackupSqliteSource(resolvedEntryPath, backupInventory);
       if (sqliteSourceKind === "excluded") {
         return false;
       }
@@ -624,6 +724,19 @@ export async function createBackupArchive(
     }).catch((error: unknown) => {
       throw formatBackupOutputFailure(error, outputPath, "write", publication.stagingDir);
     });
+    if (recoveryProfile) {
+      try {
+        // The omission is a restore contract, so prove it before publication.
+        const { verifyBackupArchive } = await import("../commands/backup-verify.js");
+        await verifyBackupArchive(completedArchive.archivePath);
+        result.verified = true;
+      } catch (error) {
+        if (!removePreparedBackupArchive(completedArchive)) {
+          publication.pendingCleanupArchives.push(completedArchive);
+        }
+        throw error;
+      }
+    }
     result.skippedVolatileCount = skippedVolatileCount;
     if (skippedVolatileCount > 0) {
       opts.log?.(
