@@ -13,8 +13,6 @@ import { getCodexAppServerTurnRouter } from "./turn-router.js";
 
 /** Timeout for best-effort app-server turn interruption during cleanup. */
 export const CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS = 5_000;
-/** Timeout for best-effort cleanup of background terminals owned by a thread. */
-const CODEX_APP_SERVER_BACKGROUND_TERMINAL_CLEAN_TIMEOUT_MS = 5_000;
 /** Timeout for best-effort thread unsubscribe during cleanup. */
 export const CODEX_APP_SERVER_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
 const CODEX_NO_ACTIVE_TURN_ERROR_CODE = -32_600;
@@ -144,25 +142,64 @@ export async function interruptCodexTurnAndWaitBestEffort(
   }
 }
 
-/** Cleans background terminal processes after an explicit stop or timeout. */
-async function cleanCodexBackgroundTerminalsBestEffort(
+/** Stops native terminals on the cancelled thread without retiring peer threads. */
+export async function terminateCodexBackgroundTerminals(
+  client: CodexAppServerClient,
+  threadId: string,
+  timeoutMsInput?: number,
+): Promise<void> {
+  const timeoutMs = resolvePositiveTimerTimeoutMs(
+    timeoutMsInput,
+    CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
+  );
+  const options = {
+    timeoutMs,
+    signal: AbortSignal.timeout(timeoutMs),
+  };
+  try {
+    // Codex returns the complete inventory when limit is omitted. Its process
+    // IDs are thread-owned handles, not host PIDs or process-group authority.
+    const { data } = await client.request("thread/backgroundTerminals/list", { threadId }, options);
+    for (const { processId } of data) {
+      // False also means it exited between listing and termination. The final
+      // inventory distinguishes that benign race from a failed termination.
+      await client.request(
+        "thread/backgroundTerminals/terminate",
+        { threadId, processId },
+        options,
+      );
+    }
+    if (data.length > 0) {
+      const remaining = await client.request(
+        "thread/backgroundTerminals/list",
+        { threadId, limit: 1 },
+        options,
+      );
+      if (remaining.data.length > 0) {
+        throw new Error("native background terminals remain running");
+      }
+    }
+  } catch (cause) {
+    throw new Error(
+      "Codex background-terminal cleanup failed; inspect the thread's running terminals before starting more work.",
+      { cause },
+    );
+  }
+}
+
+/** Stops one turn and then removes terminal processes that can outlive it. */
+async function stopCodexTurnAndBackgroundTerminalsBestEffort(
   client: CodexAppServerClient,
   params: {
     threadId: string;
+    turnId: string;
     timeoutMs?: number;
   },
 ): Promise<boolean> {
-  const timeoutMs = resolvePositiveTimerTimeoutMs(
-    params.timeoutMs,
-    CODEX_APP_SERVER_BACKGROUND_TERMINAL_CLEAN_TIMEOUT_MS,
-  );
+  const interrupted = await interruptCodexTurnAndWaitBestEffort(client, params);
   try {
-    await client.request(
-      "thread/backgroundTerminals/clean",
-      { threadId: params.threadId },
-      { timeoutMs },
-    );
-    return true;
+    await terminateCodexBackgroundTerminals(client, params.threadId, params.timeoutMs);
+    return interrupted;
   } catch (error) {
     embeddedAgentLog.debug("codex app-server background terminal cleanup failed", {
       threadId: params.threadId,
@@ -172,35 +209,25 @@ async function cleanCodexBackgroundTerminalsBestEffort(
   }
 }
 
-/** Stops one turn and then removes terminal processes that can outlive it. */
-export async function stopCodexTurnAndBackgroundTerminalsBestEffort(
-  client: CodexAppServerClient,
-  params: {
-    threadId: string;
-    turnId: string;
-    timeoutMs?: number;
-  },
-): Promise<boolean> {
-  const interrupted = await interruptCodexTurnAndWaitBestEffort(client, params);
-  const cleaned = await cleanCodexBackgroundTerminalsBestEffort(client, {
-    threadId: params.threadId,
-    timeoutMs: params.timeoutMs,
-  });
-  return interrupted && cleaned;
-}
-
 /** Unsubscribes from a thread while swallowing cleanup-only failures. */
 export async function unsubscribeCodexThreadBestEffort(
   client: CodexAppServerClient,
   params: {
     threadId: string;
     timeoutMs: number;
+    assertCurrent?: () => void;
   },
 ): Promise<boolean> {
   try {
-    await unsubscribeCodexAppServerLiveThread(client, params.threadId, params.timeoutMs);
+    await unsubscribeCodexAppServerLiveThread(
+      client,
+      params.threadId,
+      params.timeoutMs,
+      params.assertCurrent,
+    );
     return true;
   } catch (error) {
+    params.assertCurrent?.();
     embeddedAgentLog.debug("codex app-server thread unsubscribe cleanup failed", {
       threadId: params.threadId,
       error,

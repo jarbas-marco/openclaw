@@ -427,6 +427,7 @@ describe("createConfiguredOllamaCompatStreamWrapper", () => {
           api: "ollama",
           provider,
           id,
+          input: ["text"],
           contextWindow,
           ...(reasoning === undefined ? {} : { reasoning }),
           ...(params ? { params } : {}),
@@ -538,6 +539,7 @@ describe("createConfiguredOllamaCompatStreamWrapper", () => {
           api: "ollama",
           provider: "ollama-spark",
           id: "ollama-spark/qwen3:32b",
+          input: ["text"],
           contextWindow: 131072,
         };
 
@@ -575,6 +577,7 @@ describe("createConfiguredOllamaCompatStreamWrapper", () => {
           api: "ollama",
           provider: "ollama",
           id: "qwen3:32b",
+          input: ["text"],
           contextWindow: 131072,
         };
 
@@ -1671,6 +1674,7 @@ async function createOllamaTestStream(params: {
       id: "qwen3:32b",
       api: "ollama",
       provider: "custom-ollama",
+      input: ["text"],
       contextWindow: 131072,
       ...params.model,
     } as unknown as Parameters<typeof streamFn>[0],
@@ -1710,6 +1714,7 @@ async function createManagedOllamaTestStream(params: {
       id: "qwen3:32b",
       api: "ollama",
       provider: params.providerId ?? "custom-ollama",
+      input: ["text"],
       contextWindow: 131072,
       ...params.model,
     } as unknown as Parameters<typeof streamFn>[0],
@@ -2175,7 +2180,7 @@ describe("createOllamaStreamFn streaming events", () => {
       ],
       {
         baseUrl: "http://ollama-host:11434",
-        model: { id: "llava" },
+        model: { id: "llava", input: ["text", "image"] },
         context: {
           messages: [{ role: "user", content: [{ type: "image", data: "a".repeat(400) }] }],
         },
@@ -2859,6 +2864,67 @@ describe("createOllamaStreamFn streaming events", () => {
 });
 
 describe("createOllamaStreamFn", () => {
+  it.each([
+    {
+      input: ["text"],
+      expectedUserImages: undefined,
+      expectedToolImages: undefined,
+      expectsOmissionMarkers: true,
+    },
+    {
+      input: ["text", "image"],
+      expectedUserImages: ["dXNlci1pbWFnZQ=="],
+      expectedToolImages: ["dG9vbC1pbWFnZQ=="],
+      expectsOmissionMarkers: false,
+    },
+  ])("projects historical images for model input $input", async (testCase) => {
+    const context = {
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "user caption" },
+            { type: "image", mimeType: "image/png", data: "dXNlci1pbWFnZQ==" },
+          ],
+        },
+        {
+          role: "toolResult",
+          toolCallId: "call_inspect",
+          toolName: "view_image",
+          content: [
+            { type: "text", text: "tool caption" },
+            { type: "image", mimeType: "image/png", data: "dG9vbC1pbWFnZQ==" },
+          ],
+        },
+      ],
+    };
+    await expectSuccessfulOllamaRequest(
+      {
+        baseUrl: "http://ollama-host:11434",
+        model: { input: testCase.input },
+        context,
+      },
+      ({ body }) => {
+        const messages = body.messages as Array<Record<string, unknown>>;
+        expect(messages[0]?.images).toEqual(testCase.expectedUserImages);
+        expect(messages[1]?.images).toEqual(testCase.expectedToolImages);
+        expect(messages[0]?.content).toContain("user caption");
+        expect(messages[1]?.content).toContain("tool caption");
+        expect(
+          String(messages[0]?.content).includes("(image omitted: model does not support images)"),
+        ).toBe(testCase.expectsOmissionMarkers);
+        expect(
+          String(messages[1]?.content).includes(
+            "(tool image omitted: model does not support images)",
+          ),
+        ).toBe(testCase.expectsOmissionMarkers);
+        expect(messages[1]?.tool_call_id).toBe("call_inspect");
+      },
+    );
+    expect(JSON.stringify(context)).toContain("dXNlci1pbWFnZQ==");
+    expect(JSON.stringify(context)).toContain("dG9vbC1pbWFnZQ==");
+  });
+
   it("normalizes /v1 baseUrl and maps maxTokens + signal", async () => {
     const signal = new AbortController().signal;
     await expectSuccessfulOllamaRequest(
@@ -3486,6 +3552,7 @@ describe("createConfiguredOllamaStreamFn", () => {
               id: "qwen3:32b",
               api: "ollama",
               provider: "ollama-gpu",
+              input: ["text"],
               contextWindow: 131072,
             } as never,
             { messages: [{ role: "user", content: "hello" }] } as never,
@@ -3522,6 +3589,7 @@ describe("createConfiguredOllamaStreamFn", () => {
               id: "qwen3:32b",
               api: "ollama",
               provider: "ollama-gpu",
+              input: ["text"],
               contextWindow: 131072,
             } as never,
             { messages: [{ role: "user", content: "hello" }] } as never,
@@ -3557,6 +3625,7 @@ describe("createConfiguredOllamaStreamFn", () => {
               id: "qwen3:32b",
               api: "ollama",
               provider: "custom-ollama",
+              input: ["text"],
               contextWindow: 131072,
             } as never,
             {

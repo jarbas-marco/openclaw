@@ -4,7 +4,6 @@ import {
   CODEX_APP_SERVER_INTERRUPT_TIMEOUT_MS,
   closeCodexStartupClientBestEffort,
   interruptCodexTurnAndWaitBestEffort,
-  stopCodexTurnAndBackgroundTerminalsBestEffort,
 } from "./attempt-client-cleanup.js";
 import { createCodexSteeringQueue } from "./attempt-steering.js";
 import {
@@ -47,6 +46,9 @@ export function createCodexAttemptTurnState(resources: CodexAttemptResources) {
     latestStartupErrorNotification: undefined as CodexServerNotification | undefined,
     rateLimitsRevisionBeforeLastTurnStart: undefined as number | undefined,
     completed: false,
+    abortCleanup: Promise.resolve(),
+    // SAFETY: Unset is valid; only completed native cleanup can advance this closed state to confirmed.
+    permissionChangeRestart: undefined as "requested" | "confirmed" | undefined,
     localCompletionRequested: false,
     terminalTurnNotificationQueued: false,
     // App-server collapses user interrupts and replacements to "interrupted";
@@ -123,19 +125,12 @@ export function createCodexAttemptTurnState(resources: CodexAttemptResources) {
   };
   const interruptTurn = async (
     turnId: string,
-    completionOptions?: {
-      cleanBackgroundTerminals?: boolean;
-      locallyCompleted?: boolean;
-      timeoutMs?: number;
-    },
+    completionOptions?: { locallyCompleted?: boolean; timeoutMs?: number },
   ) => {
     if (completionOptions?.locallyCompleted) {
       state.localCompletionRequested = true;
     }
-    const interrupt = completionOptions?.cleanBackgroundTerminals
-      ? stopCodexTurnAndBackgroundTerminalsBestEffort
-      : interruptCodexTurnAndWaitBestEffort;
-    const completed = await interrupt(resourceState.client, {
+    const completed = await interruptCodexTurnAndWaitBestEffort(resourceState.client, {
       threadId: resourceState.thread.threadId,
       turnId,
       timeoutMs: completionOptions?.timeoutMs,

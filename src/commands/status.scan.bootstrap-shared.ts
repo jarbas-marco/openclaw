@@ -69,6 +69,8 @@ type StatusScanExecRunner = (
 type StatusScanCoreBootstrapParams<TAgentStatus> = {
   coldStart: boolean;
   cfg: OpenClawConfig;
+  configPath: string;
+  env: NodeJS.ProcessEnv;
   hasConfiguredChannels: boolean;
   opts: { timeoutMs?: number; all?: boolean };
   skipUpdateCheck?: boolean;
@@ -122,6 +124,8 @@ export async function createStatusScanCoreBootstrap<TAgentStatus>(
     : params.getAgentLocalStatuses(params.cfg);
   const gatewayProbePromise = resolveGatewayProbeSnapshot({
     cfg: params.cfg,
+    configPath: params.configPath,
+    env: params.env,
     opts: {
       ...params.opts,
       ...(params.gatewayProbeTimeoutMs !== undefined
