@@ -1874,5 +1874,101 @@
   {
     "source": "Node and tsx startup errors",
     "target": "Node 和 tsx 启动错误"
+  },
+  {
+    "source": "IMAP email trigger",
+    "target": "IMAP 电子邮件触发器"
+  },
+  {
+    "source": "Gmail PubSub integration",
+    "target": "Gmail PubSub 集成"
+  },
+  {
+    "source": "A2A",
+    "target": "A2A"
+  },
+  {
+    "source": "Channels overview",
+    "target": "渠道概览"
+  },
+  {
+    "source": "Channel plugin SDK",
+    "target": "渠道插件 SDK"
+  },
+  {
+    "source": "Cloud Sessions",
+    "target": "云会话"
+  },
+  {
+    "source": "Cloud Workers",
+    "target": "云端工作节点"
+  },
+  {
+    "source": "Connect",
+    "target": "连接"
+  },
+  {
+    "source": "Managed worktrees",
+    "target": "托管工作树"
+  },
+  {
+    "source": "Control UI URLs",
+    "target": "控制界面 URL"
+  },
+  {
+    "source": "A2a plugin",
+    "target": "A2a 插件"
+  },
+  {
+    "source": "a2a",
+    "target": "a2a"
+  },
+  {
+    "source": "Imap plugin",
+    "target": "Imap 插件"
+  },
+  {
+    "source": "imap",
+    "target": "imap"
+  },
+  {
+    "source": "Visitor Access plugin",
+    "target": "访客访问插件"
+  },
+  {
+    "source": "Bun workflow",
+    "target": "Bun 工作流"
+  },
+  {
+    "source": "Team setup",
+    "target": "团队设置"
+  },
+  {
+    "source": "Why OpenClaw: working together",
+    "target": "为什么选择 OpenClaw：协同工作"
+  },
+  {
+    "source": "Groups",
+    "target": "群组"
+  },
+  {
+    "source": "Security",
+    "target": "安全"
+  },
+  {
+    "source": "Why OpenClaw",
+    "target": "为什么选择 OpenClaw"
+  },
+  {
+    "source": "Secrets",
+    "target": "密钥"
+  },
+  {
+    "source": "Beam plugin",
+    "target": "Beam 插件"
+  },
+  {
+    "source": "v2026.8.2",
+    "target": "v2026.8.2"
   }
 ]
