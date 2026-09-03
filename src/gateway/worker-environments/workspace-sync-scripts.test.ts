@@ -87,7 +87,11 @@ async function quiesce(
   const match = /^quiesced ([a-f0-9]{32})\n$/u.exec(result.stdout);
   expect(match).not.toBeNull();
   if (sharedHost) {
-    expect(result.stderr).toContain("shared host declared; skipping process freeze sweep");
+    expect(result.stderr).toContain(
+      process.platform === "win32"
+        ? "Windows shared host declared; using manifest fences without process freezing"
+        : "shared host declared; skipping process freeze sweep",
+    );
   }
   return match![1]!;
 }
@@ -661,7 +665,10 @@ esac
       expect(() => process.kill(lease.watchdog.pid, 0)).not.toThrow();
 
       await replaceFixturePs(input, healthyPs);
-      expect(await waitForProcessState(child.pid!, /^[^T]/u)).not.toMatch(/^T/u);
+      // SIGCONT precedes lease removal. Wait for the watchdog's terminal state,
+      // including an unreaped zombie, before asserting its completed cleanup.
+      expect(await waitForProcessState(lease.watchdog.pid, /^(?:Z|$)/u)).toMatch(/^(?:Z|$)/u);
+      expect(await processState(child.pid!)).toMatch(/^[^T]/u);
       await expect(fs.stat(leasePath(input.home, input.workspace, nonce))).rejects.toThrow();
     } finally {
       await stopIdleWorker(child);

@@ -47,6 +47,13 @@ function makeOllamaResponse(params: {
 }
 
 const MODEL_INFO = { api: "ollama", provider: "ollama", id: "qwen3.5" };
+const STREAM_MODEL = {
+  api: "ollama",
+  provider: "ollama",
+  id: "qwen3.5",
+  input: ["text"],
+  contextWindow: 65536,
+} as const;
 
 describe("isOllamaCompatProvider", () => {
   it.each([
@@ -170,11 +177,7 @@ describe("createOllamaStreamFn thinking events", () => {
     });
 
     const streamFn = createOllamaStreamFn("http://localhost:11434");
-    const stream = streamFn(
-      { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
-      context,
-      options,
-    );
+    const stream = streamFn(STREAM_MODEL as never, context, options);
 
     const events: Array<{ type: string; [key: string]: unknown }> = [];
     for await (const event of stream as AsyncIterable<{
@@ -484,7 +487,7 @@ describe("createOllamaStreamFn thinking events", () => {
 
     const streamFn = createOllamaStreamFn("http://localhost:11434");
     const stream = streamFn(
-      { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+      STREAM_MODEL as never,
       { messages: [{ role: "user", content: "test" }] } as never,
       {},
     );
@@ -532,7 +535,7 @@ describe("createOllamaStreamFn thinking events", () => {
 
     const streamFn = createOllamaStreamFn("http://localhost:11434");
     const stream = streamFn(
-      { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+      STREAM_MODEL as never,
       { messages: [{ role: "user", content: "test" }] } as never,
       {},
     );
@@ -588,7 +591,7 @@ describe("createOllamaStreamFn thinking events", () => {
         "X-Proxy-Auth": configuredSecret,
       });
       const stream = streamFn(
-        { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+        STREAM_MODEL as never,
         { messages: [{ role: "user", content: "test" }] } as never,
         { apiKey: bearerCredential },
       );
@@ -612,7 +615,7 @@ describe("createOllamaStreamFn thinking events", () => {
       returnSuccess = true;
       const successEvents: Array<{ type: string }> = [];
       for await (const event of streamFn(
-        { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+        STREAM_MODEL as never,
         { messages: [{ role: "user", content: "test" }] } as never,
         { apiKey: bearerCredential },
       ) as AsyncIterable<{ type: string }>) {
@@ -653,7 +656,7 @@ describe("createOllamaStreamFn thinking events", () => {
       const readEventTypes = async () => {
         const events: string[] = [];
         for await (const event of streamFn(
-          { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+          STREAM_MODEL as never,
           { messages: [{ role: "user", content: "test" }] } as never,
           {},
         ) as AsyncIterable<{ type: string }>) {
@@ -720,7 +723,7 @@ describe("createOllamaStreamFn thinking events", () => {
       const address = server.address() as AddressInfo;
       const streamFn = createOllamaStreamFn(`http://127.0.0.1:${address.port}`);
       const stream = streamFn(
-        { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+        STREAM_MODEL as never,
         { messages: [{ role: "user", content: "test" }] } as never,
         { requestTimeoutMs } as never,
       );
@@ -766,7 +769,7 @@ describe("createOllamaStreamFn thinking events", () => {
       const address = server.address() as AddressInfo;
       const streamFn = createOllamaStreamFn(`http://127.0.0.1:${address.port}`);
       const stream = streamFn(
-        { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+        STREAM_MODEL as never,
         { messages: [{ role: "user", content: "test" }] } as never,
         { requestTimeoutMs: 120 } as never,
       );
@@ -804,7 +807,7 @@ describe("createOllamaStreamFn thinking events", () => {
     const controller = new AbortController();
     const streamFn = createOllamaStreamFn("http://localhost:11434");
     const stream = streamFn(
-      { api: "ollama", provider: "ollama", id: "qwen3.5", contextWindow: 65536 } as never,
+      STREAM_MODEL as never,
       { messages: [{ role: "user", content: "test" }] } as never,
       { signal: controller.signal },
     );

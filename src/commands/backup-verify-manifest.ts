@@ -1,5 +1,5 @@
 import path from "node:path";
-import { readStringValue } from "@openclaw/normalization-core/string-coerce";
+import { normalizeAgentId } from "@openclaw/normalization-core/agent-id";
 import {
   isArchivePathWithin,
   normalizeArchivePath,
@@ -11,6 +11,7 @@ import {
   BACKUP_RECOVERY_PROFILE_STATE_ROOTS,
   type BackupRecoveryProfileManifest,
 } from "../infra/backup-recovery-profile.js";
+import { normalizeWindowsPathForComparison } from "../infra/path-guards.js";
 import { isRecord } from "../utils.js";
 import { buildBackupArchivePath } from "./backup-shared.js";
 
@@ -31,6 +32,7 @@ export type BackupManifest = {
     configPath?: string;
     oauthDir?: string;
     workspaceDirs?: string[];
+    agentRoots?: Array<{ agentId: string; sourcePath: string }>;
   };
   assets: Array<{
     kind: string;
@@ -55,6 +57,69 @@ function parseOptionalBoolean(value: unknown, label: string): boolean | undefine
   return value;
 }
 
+function parseBackupManifestSourcePath(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) {
+    throw new Error(`Backup manifest ${label} has an invalid sourcePath.`);
+  }
+  const windowsPath = /^[A-Za-z]:[\\/]/u.test(value);
+  const normalized = windowsPath ? path.win32.normalize(value) : path.posix.normalize(value);
+  if ((!windowsPath && !value.startsWith("/")) || normalized !== value) {
+    throw new Error(`Backup manifest ${label} sourcePath must be absolute and normalized.`);
+  }
+  return value;
+}
+
+function parseBackupManifestAgentRoots(
+  value: unknown,
+): Array<{ agentId: string; sourcePath: string }> | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error("Backup manifest agentRoots must be an array.");
+  }
+
+  const agentRoots: Array<{ agentId: string; sourcePath: string }> = [];
+  const seenAgentIds = new Set<string>();
+  const seenSourcePaths = new Set<string>();
+  for (const agentRoot of value) {
+    if (
+      !isRecord(agentRoot) ||
+      Object.keys(agentRoot).length !== 2 ||
+      !Object.hasOwn(agentRoot, "agentId") ||
+      !Object.hasOwn(agentRoot, "sourcePath")
+    ) {
+      throw new Error("Backup manifest agent root must contain only agentId and sourcePath.");
+    }
+    const { agentId, sourcePath } = agentRoot;
+    if (typeof agentId !== "string" || !agentId || normalizeAgentId(agentId) !== agentId) {
+      throw new Error("Backup manifest agent root has an invalid or noncanonical agentId.");
+    }
+    const normalizedSourcePath = parseBackupManifestSourcePath(sourcePath, "agent root");
+    const windowsPath = /^[A-Za-z]:[\\/]/u.test(normalizedSourcePath);
+    const sourcePathKey = windowsPath
+      ? normalizeWindowsPathForComparison(normalizedSourcePath)
+      : normalizedSourcePath;
+    if (seenAgentIds.has(agentId) || seenSourcePaths.has(sourcePathKey)) {
+      throw new Error("Backup manifest contains duplicate agent root ownership.");
+    }
+    seenAgentIds.add(agentId);
+    seenSourcePaths.add(sourcePathKey);
+    agentRoots.push({ agentId, sourcePath: normalizedSourcePath });
+  }
+  return agentRoots;
+}
+
+function parseBackupManifestSourcePaths(value: unknown, label: string): string[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value)) {
+    throw new Error(`Backup manifest ${label} must be an array.`);
+  }
+  return value.map((entry) => parseBackupManifestSourcePath(entry, label));
+}
+
 function parseBackupRecoveryProfile(value: unknown): BackupRecoveryProfileManifest | undefined {
   if (value === undefined) {
     return undefined;
@@ -73,23 +138,6 @@ function parseBackupRecoveryProfile(value: unknown): BackupRecoveryProfileManife
     throw new Error("Backup manifest recoveryProfile declares unsupported state exclusions.");
   }
   return { excludedStateRoots: [...BACKUP_RECOVERY_PROFILE_STATE_ROOTS] };
-}
-
-function portableCasefoldArchivePath(value: string, label: string): string {
-  return normalizeArchivePath(value, label).normalize("NFC").toLocaleLowerCase("en-US");
-}
-
-function isPortableCasefoldWithin(child: string, parent: string): boolean {
-  const normalizedChild = portableCasefoldArchivePath(child, "Backup archive entry path");
-  const normalizedParent = portableCasefoldArchivePath(parent, "Backup archive path");
-  return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
-}
-
-function isPortableCasefoldArchivePathEqual(left: string, right: string): boolean {
-  return (
-    portableCasefoldArchivePath(left, "Backup archive path") ===
-    portableCasefoldArchivePath(right, "Backup archive path")
-  );
 }
 
 function parseSkippedEntries(value: unknown): BackupManifest["skipped"] {
@@ -171,6 +219,9 @@ export function parseBackupManifest(raw: string): BackupManifest {
   if (parsed.schemaVersion === 2 && !recoveryProfile) {
     throw new Error("Backup manifest schemaVersion 2 must declare a recoveryProfile.");
   }
+  if (recoveryProfile && isRecord(parsed.options) && parsed.options.onlyConfig === true) {
+    throw new Error("Backup manifest recoveryProfile cannot be combined with onlyConfig.");
+  }
 
   return {
     schemaVersion: parsed.schemaVersion,
@@ -194,14 +245,24 @@ export function parseBackupManifest(raw: string): BackupManifest {
       : undefined,
     paths: isRecord(parsed.paths)
       ? {
-          stateDir: readStringValue(parsed.paths.stateDir),
-          configPath: readStringValue(parsed.paths.configPath),
-          oauthDir: readStringValue(parsed.paths.oauthDir),
-          workspaceDirs: Array.isArray(parsed.paths.workspaceDirs)
-            ? parsed.paths.workspaceDirs.filter(
-                (entry): entry is string => typeof entry === "string",
-              )
-            : undefined,
+          ...(parsed.paths.stateDir === undefined
+            ? {}
+            : {
+                stateDir: parseBackupManifestSourcePath(parsed.paths.stateDir, "state directory"),
+              }),
+          ...(parsed.paths.configPath === undefined
+            ? {}
+            : { configPath: parseBackupManifestSourcePath(parsed.paths.configPath, "config") }),
+          ...(parsed.paths.oauthDir === undefined
+            ? {}
+            : {
+                oauthDir: parseBackupManifestSourcePath(parsed.paths.oauthDir, "oauth directory"),
+              }),
+          workspaceDirs: parseBackupManifestSourcePaths(
+            parsed.paths.workspaceDirs,
+            "workspace directory",
+          ),
+          agentRoots: parseBackupManifestAgentRoots(parsed.paths.agentRoots),
         }
       : undefined,
     assets,
@@ -214,6 +275,23 @@ export function isRootBackupManifestEntry(entryPath: string): boolean {
   return parts.length === 2 && parts[0] !== "" && parts[1] === "manifest.json";
 }
 
+function portableCasefoldArchivePath(value: string, label: string): string {
+  return normalizeArchivePath(value, label).normalize("NFC").toLowerCase();
+}
+
+function isPortableCasefoldWithin(child: string, parent: string): boolean {
+  const normalizedChild = portableCasefoldArchivePath(child, "Backup archive entry path");
+  const normalizedParent = portableCasefoldArchivePath(parent, "Backup archive path");
+  return normalizedChild === normalizedParent || normalizedChild.startsWith(`${normalizedParent}/`);
+}
+
+function isPortableCasefoldArchivePathEqual(left: string, right: string): boolean {
+  return (
+    portableCasefoldArchivePath(left, "Backup archive path") ===
+    portableCasefoldArchivePath(right, "Backup archive path")
+  );
+}
+
 function verifyBackupRecoveryProfileEntries(
   manifest: BackupManifest,
   entries: readonly string[],
@@ -223,19 +301,17 @@ function verifyBackupRecoveryProfileEntries(
     return;
   }
   const stateAssets = manifest.assets.filter((asset) => asset.kind === "state");
-  if (stateAssets.length !== 1) {
+  if (stateAssets.length !== 1 || !stateAssets[0]) {
     throw new Error("Recovery-profile backup manifest must contain exactly one state asset.");
   }
   const stateAsset = stateAssets[0];
-  if (!stateAsset) {
-    throw new Error("Recovery-profile backup state asset could not be resolved.");
-  }
+  const archiveRoot = normalizeArchiveRoot(manifest.archiveRoot);
   const stateAssetRoot = normalizeArchivePath(
     stateAsset.archivePath,
     "Backup manifest state asset path",
   );
   const expectedStateAssetRoot = normalizeArchivePath(
-    buildBackupArchivePath(normalizeArchiveRoot(manifest.archiveRoot), stateAsset.sourcePath),
+    buildBackupArchivePath(archiveRoot, stateAsset.sourcePath),
     "Backup manifest expected state asset path",
   );
   if (stateAssetRoot !== expectedStateAssetRoot) {
@@ -248,7 +324,7 @@ function verifyBackupRecoveryProfileEntries(
     throw new Error("Recovery-profile backup manifest must declare paths.stateDir.");
   }
   const declaredStateAssetRoot = normalizeArchivePath(
-    buildBackupArchivePath(normalizeArchiveRoot(manifest.archiveRoot), declaredStateDir),
+    buildBackupArchivePath(archiveRoot, declaredStateDir),
     "Backup manifest declared state directory path",
   );
   if (stateAssetRoot !== declaredStateAssetRoot) {
@@ -256,29 +332,25 @@ function verifyBackupRecoveryProfileEntries(
       "Recovery-profile backup manifest state asset sourcePath does not match paths.stateDir.",
     );
   }
-  const declaredArchivePaths = [
-    { kind: "config", sourcePath: manifest.paths?.configPath },
-    { kind: "oauth", sourcePath: manifest.paths?.oauthDir },
-    ...(manifest.paths?.workspaceDirs ?? []).map((sourcePath) => ({
-      kind: "workspace" as const,
-      sourcePath,
-    })),
-  ]
-    .filter((entry): entry is { kind: "config" | "oauth" | "workspace"; sourcePath: string } =>
-      Boolean(entry.sourcePath),
-    )
-    .map((entry) => ({
-      kind: entry.kind,
-      sourcePath: entry.sourcePath,
-      archivePath: buildBackupArchivePath(manifest.archiveRoot, entry.sourcePath),
-    }));
+
+  const declaredSourcePaths = [
+    manifest.paths?.configPath,
+    manifest.paths?.oauthDir,
+    ...(manifest.paths?.workspaceDirs ?? []),
+    ...(manifest.paths?.agentRoots ?? []).map((root) => root.sourcePath),
+  ].filter((sourcePath): sourcePath is string => Boolean(sourcePath));
 
   for (const root of recoveryProfile.excludedStateRoots) {
     const excludedArchiveRoot = path.posix.join(stateAssetRoot, root);
-    for (const declaredPath of declaredArchivePaths) {
-      if (isPortableCasefoldWithin(declaredPath.archivePath, excludedArchiveRoot)) {
+    for (const sourcePath of declaredSourcePaths) {
+      if (
+        isPortableCasefoldWithin(
+          buildBackupArchivePath(archiveRoot, sourcePath),
+          excludedArchiveRoot,
+        )
+      ) {
         throw new Error(
-          `Recovery-profile backup manifest cannot declare excluded state path: ${declaredPath.sourcePath}`,
+          `Recovery-profile backup manifest cannot declare excluded state path: ${sourcePath}`,
         );
       }
     }
@@ -291,15 +363,14 @@ function verifyBackupRecoveryProfileEntries(
       );
     }
 
-    const skippedMatches = (manifest.skipped ?? []).filter((entry) => {
-      if (!entry.sourcePath) {
-        return false;
-      }
-      return isPortableCasefoldArchivePathEqual(
-        buildBackupArchivePath(manifest.archiveRoot, entry.sourcePath),
-        excludedArchiveRoot,
-      );
-    });
+    const skippedMatches = (manifest.skipped ?? []).filter((entry) =>
+      entry.sourcePath
+        ? isPortableCasefoldArchivePathEqual(
+            buildBackupArchivePath(archiveRoot, entry.sourcePath),
+            excludedArchiveRoot,
+          )
+        : false,
+    );
     if (
       skippedMatches.length !== 1 ||
       skippedMatches[0]?.kind !== BACKUP_RECOVERY_PROFILE_SKIP_KIND ||

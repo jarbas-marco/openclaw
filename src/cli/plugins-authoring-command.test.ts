@@ -5,6 +5,7 @@ import path from "node:path";
 import { expectDefined } from "@openclaw/normalization-core";
 import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { publicPluginSdkSubpaths } from "../../scripts/lib/plugin-sdk-entries.mjs";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import { defineToolPlugin, getToolPluginMetadata } from "../plugin-sdk/tool-plugin.js";
 import { defaultRuntime } from "../runtime.js";
@@ -722,6 +723,12 @@ describe("plugin authoring commands", () => {
       },
       openclaw: {
         extensions: ["./dist/index.js"],
+        compat: {
+          pluginApi: ">=2026.5.17",
+        },
+        build: {
+          openclawVersion: VERSION,
+        },
       },
     });
     expect(
@@ -820,6 +827,9 @@ describe("plugin authoring commands", () => {
     const indexSource = fs.readFileSync(path.join(projectDir, "src/index.ts"), "utf8");
     expect(indexSource).toContain("definePluginEntry");
     expect(indexSource).toContain("api.registerProvider");
+    for (const [, subpath] of indexSource.matchAll(/from "openclaw\/plugin-sdk\/([^"]+)"/g)) {
+      expect(publicPluginSdkSubpaths).toContain(subpath);
+    }
     expect(indexSource).toContain('from "openclaw/plugin-sdk/provider-auth"');
     expect(indexSource).toContain("ctx.resolveProviderApiKey");
     expect(indexSource).not.toContain("provider-auth-api-key");

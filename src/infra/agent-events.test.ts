@@ -7,6 +7,7 @@ import {
   emitAgentEvent,
   emitAgentEventForOwner,
   emitAgentEventIfCurrent,
+  emitAgentRunOutputTokens,
   getAgentEventLifecycleGeneration,
   onAgentAuditEvent,
   onAgentEvent,
@@ -28,7 +29,6 @@ import {
   sweepStaleRunContexts,
 } from "./agent-run-registry.js";
 import { emitAgentRunStatusEvent } from "./agent-run-status-events.js";
-import { recordAgentRunOutputTokens } from "./agent-run-usage.js";
 
 type AgentEventsModule = {
   events: typeof import("./agent-events.js");
@@ -133,30 +133,29 @@ describe("agent-events sequencing", () => {
         seen.push(event.data.outputTokens as number);
       }
     });
-    const emitUsage = (outputTokens: number) => {
-      recordAgentRunOutputTokens({
+    const emitUsage = (outputTokens: number, generation = lifecycleGeneration) =>
+      emitAgentRunOutputTokens({
         runId: "usage-run",
-        lifecycleGeneration,
+        lifecycleGeneration: generation,
         outputTokens,
-        emit: (data) =>
-          emitAgentEventIfCurrent({
-            runId: "usage-run",
-            lifecycleGeneration,
-            stream: "usage",
-            data,
-          }),
       });
-    };
 
-    emitUsage(12);
+    expect(emitUsage(12)).toEqual({ outputTokens: 12 });
     registerAgentRunContext("usage-run", { sessionKey: "main", lifecycleGeneration });
     emitUsage(8);
     clearAgentRunContext("usage-run", lifecycleGeneration);
     registerAgentRunContext("usage-run", { sessionKey: "main", lifecycleGeneration });
     emitUsage(3);
+    const nextGeneration = rotateAgentEventLifecycleGeneration();
+    claimAgentRunContext("usage-run", {
+      sessionKey: "main",
+      lifecycleGeneration: nextGeneration,
+    });
+    expect(emitUsage(100)).toBeUndefined();
+    emitUsage(4, nextGeneration);
     stop();
 
-    expect(seen).toEqual([12, 20, 3]);
+    expect(seen).toEqual([12, 20, 3, 4]);
   });
 
   test("clears sequence state when guarded cleanup finds no run context", () => {
@@ -220,22 +219,16 @@ describe("agent-events sequencing", () => {
     const audit: AgentEventPayload[] = [];
     const stopShared = onAgentEvent((event) => shared.push(event));
     const stopAudit = onAgentAuditEvent((event) => audit.push(event));
-    registerAgentRunContext("model-run", {
-      sessionKey: "agent:main:direct:source",
-      eventAudience: "audit",
-    });
+    registerAgentRunContext("model-run", { eventAudience: "audit" });
 
     for (const data of [{ phase: "start", startedAt: 1_000 }, { phase: "end" }]) {
       emitAgentEvent({ runId: "model-run", stream: "lifecycle", data });
     }
 
-    stopShared();
-    stopAudit();
+    [stopShared, stopAudit].forEach((stop) => stop());
     expect(shared).toEqual([]);
-    expect(audit.map((event) => [event.data.phase, event.seq])).toEqual([
-      ["start", 1],
-      ["end", 2],
-    ]);
+    expect(audit.map((event) => event.data.phase)).toEqual(["start", "end"]);
+    expect(audit.map((event) => event.seq)).toEqual([1, 2]);
   });
 
   test("preserves sequence state when same-generation ownership is reclaimed", () => {
@@ -691,20 +684,26 @@ describe("agent-events sequencing", () => {
     expect(seen.get("new-run")?.keys).not.toContain("lifecycleGeneration");
   });
 
-  test("stamps session lifecycle projection policy without serializing it", () => {
+  test("stamps private session lifecycle facts without serializing them", () => {
     registerAgentRunContext("maintenance-run", {
+      mainSessionRestartRecovery: true,
       projectSessionLifecycle: false,
+      projectSessionMessages: false,
       sessionKey: "main",
     });
     let received:
       | {
           projectSessionLifecycle?: boolean;
+          projectSessionMessages?: boolean;
+          mainSessionRestartRecovery?: true;
           keys: string[];
         }
       | undefined;
     const stop = onAgentRuntimeEvent((evt) => {
       received = {
         projectSessionLifecycle: evt.projectSessionLifecycle,
+        projectSessionMessages: evt.projectSessionMessages,
+        mainSessionRestartRecovery: evt.mainSessionRestartRecovery,
         keys: Object.keys(evt),
       };
     });
@@ -717,7 +716,11 @@ describe("agent-events sequencing", () => {
     stop();
 
     expect(received?.projectSessionLifecycle).toBe(false);
+    expect(received?.projectSessionMessages).toBe(false);
+    expect(received?.mainSessionRestartRecovery).toBe(true);
     expect(received?.keys).not.toContain("projectSessionLifecycle");
+    expect(received?.keys).not.toContain("projectSessionMessages");
+    expect(received?.keys).not.toContain("mainSessionRestartRecovery");
   });
 
   test("lets a newly admitted retry claim an explicit lifecycle generation", () => {

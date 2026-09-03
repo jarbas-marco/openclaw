@@ -11,10 +11,7 @@ import {
   resolvePackageExtensionEntries,
 } from "../plugins/manifest.js";
 import { unwrapDefaultModuleExport } from "../plugins/module-export.js";
-import {
-  createPluginModuleLoaderCache,
-  getCachedPluginModuleLoader,
-} from "../plugins/plugin-module-loader-cache.js";
+import { getCachedPluginModuleLoader } from "../plugins/plugin-module-loader-cache.js";
 import { buildPluginLoaderAliasMap } from "../plugins/sdk-alias.js";
 import { defaultRuntime } from "../runtime.js";
 import { toSafeImportPath } from "../shared/import-specifier.js";
@@ -58,8 +55,7 @@ const SUPPORTED_PLUGIN_SCAFFOLD_TYPES = [
   "provider",
 ] as const satisfies readonly PluginScaffoldType[];
 const CLAWHUB_PACKAGE_PUBLISH_WORKFLOW_REF = "9d49df109d4ad3dc8a6ecf05d26b39f46d294721";
-
-const toolPluginEntryModuleLoaders = createPluginModuleLoaderCache();
+const TOOL_PLUGIN_API_RANGE = ">=2026.5.17";
 
 function readJsonFile(filePath: string): JsonObject {
   const raw = fs.readFileSync(filePath, "utf8");
@@ -114,10 +110,10 @@ function readPackageManifest(rootDir: string): JsonObject {
   return readJsonFile(packagePath);
 }
 
-async function importToolPluginEntry(entryPath: string): Promise<unknown> {
+async function importToolPluginEntry(entryPath: string, rootDir: string): Promise<unknown> {
   const loader = getCachedPluginModuleLoader({
-    cache: toolPluginEntryModuleLoaders,
     modulePath: entryPath,
+    rootDir,
     importerUrl: import.meta.url,
     loaderFilename: entryPath,
     aliasMap: buildPluginLoaderAliasMap(entryPath, process.argv[1], import.meta.url),
@@ -143,7 +139,7 @@ export async function loadToolPlugin(params: {
       `plugin entry not found: ${normalizeRelativePath(params.rootDir, params.entryPath)}`,
     );
   }
-  const entry = await importToolPluginEntry(params.entryPath);
+  const entry = await importToolPluginEntry(params.entryPath, params.rootDir);
   const metadata = getToolPluginMetadata(entry);
   if (!metadata) {
     throw new Error(
@@ -449,6 +445,12 @@ function createConfigSchema() {
   };
 }
 
+const createPluginPackageMetadata = (pluginApi: string) => ({
+  extensions: ["./dist/index.js"],
+  compat: { pluginApi },
+  build: { openclawVersion: VERSION },
+});
+
 function buildScaffoldTsconfig(type: PluginScaffoldType): JsonObject {
   return {
     compilerOptions: {
@@ -493,7 +495,7 @@ function writeToolPluginScaffold(params: { rootDir: string; id: string; name: st
     },
     files: ["dist", "openclaw.plugin.json", "README.md"],
     peerDependencies: {
-      openclaw: ">=2026.5.17",
+      openclaw: TOOL_PLUGIN_API_RANGE,
     },
     dependencies: {
       typebox: "^1.1.38",
@@ -503,9 +505,7 @@ function writeToolPluginScaffold(params: { rootDir: string; id: string; name: st
       typescript: "^5.9.0",
       vitest: "^3.2.0",
     },
-    openclaw: {
-      extensions: ["./dist/index.js"],
-    },
+    openclaw: createPluginPackageMetadata(TOOL_PLUGIN_API_RANGE),
   };
   const idLiteral = jsStringLiteral(params.id);
   const nameLiteral = jsStringLiteral(params.name);
@@ -603,17 +603,11 @@ function writeProviderPluginScaffold(params: { rootDir: string; id: string; name
       vitest: "^3.2.0",
     },
     openclaw: {
-      extensions: ["./dist/index.js"],
+      ...createPluginPackageMetadata(`>=${VERSION}`),
       install: {
         clawhubSpec: `clawhub:${packageName}`,
         defaultChoice: "clawhub",
         minHostVersion: `>=${VERSION}`,
-      },
-      compat: {
-        pluginApi: `>=${VERSION}`,
-      },
-      build: {
-        openclawVersion: VERSION,
       },
       release: {
         publishToClawHub: true,
@@ -686,11 +680,13 @@ export default definePluginEntry({
           if (!apiKey) {
             return null;
           }
-          const explicitBaseUrl = ctx.config.models?.providers?.[PROVIDER_ID]?.baseUrl?.trim();
+          const configuredProvider = Object.entries(ctx.config.models?.providers ?? {}).find(
+            ([providerId]) => providerId.trim().toLowerCase() === PROVIDER_ID.toLowerCase(),
+          )?.[1];
           return {
             provider: {
               api: "openai-completions",
-              baseUrl: explicitBaseUrl || "https://api.example.com/v1",
+              baseUrl: configuredProvider?.baseUrl?.trim() || "https://api.example.com/v1",
               apiKey,
               models: [
                 {
@@ -721,7 +717,7 @@ import type { OpenClawPluginApi, ProviderPlugin } from "openclaw/plugin-sdk/plug
 import entry from "./index.js";
 
 describe(${idLiteral}, () => {
-  it("registers the provider", () => {
+  it("registers the provider and resolves its authenticated catalog", async () => {
     const providers: ProviderPlugin[] = [];
     const api = {
       registerProvider(provider: ProviderPlugin) {
@@ -734,6 +730,47 @@ describe(${idLiteral}, () => {
     expect(providers.map((provider) => provider.id)).toEqual([${idLiteral}]);
     expect(providers[0]?.label).toBe(${nameLiteral});
     expect(providers[0]?.envVars).toEqual([${envVarLiteral}]);
+
+    const provider = providers[0];
+    if (!provider?.catalog) {
+      throw new Error("Generated provider did not register its catalog");
+    }
+    expect(provider.auth).toMatchObject([
+      { id: "api-key", kind: "api_key", starterModel: ${defaultModelRefLiteral} },
+    ]);
+    for (const [apiKey, configuredId, baseUrl, expectedBaseUrl] of [
+      [undefined, ${idLiteral}, "https://configured.example/v1", null],
+      ["fixture-api-key", ${jsStringLiteral(`${params.id}-unrelated`)}, "https://unrelated.example/v1", "https://api.example.com/v1"],
+      ["fixture-api-key", ${jsStringLiteral(` ${params.id.toUpperCase()} `)}, " https://configured.example/v1 ", "https://configured.example/v1"],
+      ["fixture-api-key", ${idLiteral}, " ", "https://api.example.com/v1"],
+    ] as const) {
+      const result = await provider.catalog.run({
+        config: { models: { providers: { [configuredId]: { baseUrl, models: [] } } } },
+        env: {},
+        resolveProviderApiKey: () => ({ apiKey }),
+        resolveProviderAuth: () => ({ apiKey, mode: "api_key", source: "env" }),
+      });
+      expect(result).toEqual(
+        expectedBaseUrl === null
+          ? null
+          : {
+              provider: {
+                api: "openai-completions",
+                apiKey,
+                baseUrl: expectedBaseUrl,
+                models: [{
+                  id: ${defaultModelIdLiteral},
+                  name: "Example Chat",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: 128000,
+                  maxTokens: 8192,
+                }],
+              },
+            },
+      );
+    }
   });
 
   it("builds the configured model catalog only with an API key", async () => {

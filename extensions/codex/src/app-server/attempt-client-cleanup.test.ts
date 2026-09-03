@@ -6,6 +6,7 @@ import {
   retireUnsafeCodexTurnClientBestEffort,
   retireCodexAppServerClientAfterTimedOutTurn,
   unsubscribeCodexThreadBestEffort,
+  terminateCodexBackgroundTerminals,
 } from "./attempt-client-cleanup.js";
 import { createClientHarness } from "./test-support.js";
 
@@ -24,6 +25,57 @@ describe("Codex app-server attempt client cleanup", () => {
     sharedClientMocks.retainSharedCodexAppServerClientIfCurrent.mockReset();
     sharedClientMocks.retireSharedCodexAppServerClientIfCurrent.mockReset();
     vi.restoreAllMocks();
+  });
+
+  it.each([true, false])(
+    "drains the full terminal inventory and accepts a concurrent exit (%s)",
+    async (terminated) => {
+      const request = vi
+        .fn()
+        .mockResolvedValueOnce({
+          data: [{ processId: "10" }, { processId: "20" }],
+          nextCursor: null,
+        })
+        .mockResolvedValueOnce({ terminated })
+        .mockResolvedValueOnce({ terminated: true })
+        .mockResolvedValueOnce({ data: [], nextCursor: null });
+      await expect(
+        terminateCodexBackgroundTerminals({ request } as never, "thread-1"),
+      ).resolves.toBeUndefined();
+      expect(request.mock.calls.map(([method, params]) => [method, params])).toEqual([
+        ["thread/backgroundTerminals/list", { threadId: "thread-1" }],
+        ["thread/backgroundTerminals/terminate", { threadId: "thread-1", processId: "10" }],
+        ["thread/backgroundTerminals/terminate", { threadId: "thread-1", processId: "20" }],
+        ["thread/backgroundTerminals/list", { threadId: "thread-1", limit: 1 }],
+      ]);
+    },
+  );
+
+  it("reports a terminal that remains running after termination", async () => {
+    const request = vi
+      .fn()
+      .mockResolvedValueOnce({ data: [{ processId: "10" }], nextCursor: null })
+      .mockResolvedValueOnce({ terminated: false })
+      .mockResolvedValueOnce({ data: [{ processId: "10" }], nextCursor: null });
+    await expect(
+      terminateCodexBackgroundTerminals({ request } as never, "thread-1"),
+    ).rejects.toThrow("Codex background-terminal cleanup failed");
+  });
+
+  it("bounds the entire terminal inventory request without closing the shared client", async () => {
+    vi.useFakeTimers();
+    const harness = createClientHarness();
+    const close = vi.spyOn(harness.client, "close");
+    try {
+      const cleanup = terminateCodexBackgroundTerminals(harness.client, "thread-1");
+      const rejected = expect(cleanup).rejects.toThrow("Codex background-terminal cleanup failed");
+      await vi.advanceTimersByTimeAsync(5_000);
+      await rejected;
+      expect(close).not.toHaveBeenCalled();
+    } finally {
+      harness.client.close();
+      vi.useRealTimers();
+    }
   });
 
   it("keeps strict startup retirement failures visible to lifecycle owners", async () => {
@@ -190,6 +242,9 @@ describe("Codex app-server attempt client cleanup", () => {
           }
         });
       }
+      if (method === "thread/backgroundTerminals/list") {
+        return { data: [], nextCursor: null };
+      }
       return {};
     });
     const close = vi.fn();
@@ -219,9 +274,9 @@ describe("Codex app-server attempt client cleanup", () => {
       { timeoutMs: 5_000 },
     );
     expect(request).toHaveBeenCalledWith(
-      "thread/backgroundTerminals/clean",
+      "thread/backgroundTerminals/list",
       { threadId: "thread-1" },
-      { timeoutMs: 5_000 },
+      expect.objectContaining({ timeoutMs: 5_000 }),
     );
     expect(request).toHaveBeenCalledWith(
       "thread/unsubscribe",
@@ -234,6 +289,7 @@ describe("Codex app-server attempt client cleanup", () => {
   it("cleans a suspect shared remote client before forcing its transport closed", async () => {
     const events: string[] = [];
     const notificationHandlers = new Set<(notification: unknown) => void>();
+    let terminalRunning = true;
     const releaseCleanupLease = vi.fn(() => events.push("release-cleanup-lease"));
     sharedClientMocks.retainSharedCodexAppServerClientIfCurrent.mockImplementation(() => {
       events.push("retain-cleanup-lease");
@@ -265,6 +321,16 @@ describe("Codex app-server attempt client cleanup", () => {
           }
         });
       }
+      if (method === "thread/backgroundTerminals/list") {
+        return {
+          data: terminalRunning ? [{ processId: "42" }] : [],
+          nextCursor: null,
+        };
+      }
+      if (method === "thread/backgroundTerminals/terminate") {
+        terminalRunning = false;
+        return { terminated: true };
+      }
       return {};
     });
     const close = vi.fn(() => events.push("direct-close"));
@@ -292,7 +358,9 @@ describe("Codex app-server attempt client cleanup", () => {
       "retain-cleanup-lease",
       "detach-shared-client",
       "turn/interrupt",
-      "thread/backgroundTerminals/clean",
+      "thread/backgroundTerminals/list",
+      "thread/backgroundTerminals/terminate",
+      "thread/backgroundTerminals/list",
       "thread/unsubscribe",
       "force-close-shared-client",
       "release-cleanup-lease",
