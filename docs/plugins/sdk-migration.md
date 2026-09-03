@@ -269,14 +269,20 @@ artifact reader count is zero.
 
 Audit the current migration queue with `pnpm plugins:boundary-report`:
 
-| Flag                                                    | Effect                                                                     |
-| ------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `--summary` (or `pnpm plugins:boundary-report:summary`) | Compact counts instead of full detail.                                     |
-| `--json`                                                | Machine-readable report.                                                   |
-| `--owner <id>`                                          | Filter to one compatibility owner.                                         |
-| `--fail-on-eligible-compat`                             | Exit non-zero on or after a deprecated compat record's `removeAfter` date. |
+| Flag                                                    | Effect                                                                                             |
+| ------------------------------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `--summary` (or `pnpm plugins:boundary-report:summary`) | Compact counts instead of full detail.                                                             |
+| `--json`                                                | Machine-readable report.                                                                           |
+| `--owner <id>`                                          | Filter to one compatibility owner.                                                                 |
+| `--fail-on-eligible-compat`                             | Exit non-zero for dated `deprecated` records starting at 00:00 UTC on the day after `removeAfter`. |
 
 `pnpm plugins:boundary-report:ci` runs with the compatibility fail flag.
+For dated `deprecated` records, `removeAfter` is the final compatibility day:
+`2026-09-01` becomes eligible at `2026-09-02T00:00:00Z`, not at the start of
+September 1. `removal-pending` records are separate: they become due for review
+at 00:00 UTC on their `removeAfter` date and are reported with blockers, but do
+not trigger this fail flag. Neither state authorizes automatic removal.
+
 Deprecated records normally have an explicit `removeAfter` date. A contract
 tied to a version boundary instead declares a `removalGate`;
 `next-plugin-sdk-major` is an approved major-version gate, not a pending owner
@@ -1123,12 +1129,13 @@ apps own device capture/playback UX.
 
 ## Removal timeline
 
-| When                                        | What happens                                                                                                                              |
-| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **Now**                                     | Warning-capable deprecated surfaces emit runtime warnings; repository guards reject deprecated SDK imports from core and bundled plugins. |
-| **Pending owner decision**                  | Records without `removeAfter` or `removalGate` remain deprecated and ineligible until their owner publishes a gate.                       |
-| **Each compat record's `removeAfter` date** | That dated surface becomes eligible for removal; `pnpm plugins:boundary-report --fail-on-eligible-compat` fails CI on or after that date. |
-| **Next Plugin SDK major**                   | `inbound-reply-dispatch` reaches its explicit `next-plugin-sdk-major` gate; it is not date-eligible before that version boundary.         |
+| When                                                     | What happens                                                                                                                                                                 |
+| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Now**                                                  | Warning-capable deprecated surfaces emit runtime warnings; repository guards reject deprecated SDK imports from core and bundled plugins.                                    |
+| **Pending owner decision**                               | Records without `removeAfter` or `removalGate` remain deprecated and ineligible until their owner publishes a gate.                                                          |
+| **Day after a `deprecated` record's `removeAfter` date** | At 00:00 UTC, that record becomes date-eligible and `pnpm plugins:boundary-report --fail-on-eligible-compat` exits non-zero. The date itself is the final compatibility day. |
+| **A `removal-pending` record's `removeAfter` date**      | At 00:00 UTC, the report marks the record due for review and lists its blockers. It does not trigger the compatibility fail flag.                                            |
+| **Next Plugin SDK major**                                | `inbound-reply-dispatch` reaches its explicit `next-plugin-sdk-major` gate; it is not date-eligible before that version boundary.                                            |
 
 The remaining public SDK subpaths below have registry-backed removal windows.
 The July 30 rows were removed after their early maintainer-authorized sweep:
@@ -1145,13 +1152,23 @@ until the next Plugin SDK major.
 
 | Removal gate            | Tier                               | SDK subpaths                                                                                                                                                                        |
 | ----------------------- | ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `2026-09-01`            | Earlier compatibility deprecations | `channel-lifecycle`, `channel-message`, `channel-reply-pipeline`, `config-runtime`, `infra-runtime`                                                                                 |
+| `2026-10-01`            | Earlier compatibility deprecations | `channel-lifecycle`, `channel-message`, `channel-reply-pipeline`, `config-runtime`, `infra-runtime`                                                                                 |
 | `next-plugin-sdk-major` | Major-version compatibility gate   | `inbound-reply-dispatch`                                                                                                                                                            |
 | `2026-10-01`            | Media legacy projection            | `agent-media-payload`, plus the non-subpath `MsgContext Media*` fields, channel inbound media payload builders, `buildMediaPayload`, hook media aliases, and `{{Media*}}` templates |
 
-All core plugins have already migrated. External plugins should migrate
-before the next major release. Run `pnpm plugins:boundary-report` to see which
-compat records are due soonest for the surfaces your plugin uses.
+The five September 1 subpaths remain available in 2026.8.2 under an approved
+retention exception; that release's registry still labels them `deprecated`.
+For 2026.9.1, the release maintainer approved renewing their `removeAfter` date
+from `2026-09-01` to `2026-10-01` on September 2, 2026. The registry keeps them
+`removal-pending` with the same replacement mappings. Removal awaits verification
+that supported external plugins have migrated. `infra-runtime` additionally retains
+system-event snapshot inspection and consumption until a modern public replacement
+exists. This changes compatibility tracking only, not the exported SDK or runtime
+behavior.
+
+All core plugins have already migrated. External plugins should migrate before
+the next major release. Run `pnpm plugins:boundary-report` to see which compat
+records are due soonest for the surfaces your plugin uses.
 
 ## Related
 

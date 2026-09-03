@@ -227,7 +227,8 @@ describe("agent-events sequencing", () => {
 
     [stopShared, stopAudit].forEach((stop) => stop());
     expect(shared).toEqual([]);
-    expect(audit.map(({ data, seq }) => `${data.phase}:${seq}`).join(",")).toBe("start:1,end:2");
+    expect(audit.map((event) => event.data.phase)).toEqual(["start", "end"]);
+    expect(audit.map((event) => event.seq)).toEqual([1, 2]);
   });
 
   test("preserves sequence state when same-generation ownership is reclaimed", () => {

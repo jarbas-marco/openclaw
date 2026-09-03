@@ -21,6 +21,7 @@ import {
 } from "./changed-lanes.mts";
 import type { ChangedLaneResult } from "./changed-lanes.mts";
 import { detectChangedScope, isMacosToolingPath } from "./ci-changed-scope.mjs";
+import { chunkFilesForCommand } from "./format-docs.mts";
 import {
   booleanFlag,
   isOpenEndedTruthyValue,
@@ -610,12 +611,10 @@ export function createChangedCheckPlan(
   broadAudits.add(add("coercion helper declaration guard", ["check:coercion-helpers"]));
   add("dependency pin guard", ["deps:pins:check"]);
   if (result.paths.length > 0) {
-    add("format changed files", [
-      "format:check",
-      "--no-error-on-unmatched-pattern",
-      "--",
-      ...result.paths,
-    ]);
+    const formatPrefixArgs = ["format:check", "--no-error-on-unmatched-pattern", "--"];
+    for (const paths of chunkFilesForCommand(result.paths, formatPrefixArgs)) {
+      add("format changed files", [...formatPrefixArgs, ...paths]);
+    }
   }
   const npmLockGuardCommand = createNpmLockGuardCommand(result.paths);
   if (npmLockGuardCommand) {

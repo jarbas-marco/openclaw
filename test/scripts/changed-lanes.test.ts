@@ -656,6 +656,22 @@ describe("scripts/changed-lanes", () => {
     });
   });
 
+  it("batches large changed-path sets below the formatter command-line budget", () => {
+    const paths = Array.from(
+      { length: 2_000 },
+      (_, index) => `docs/generated/upgrade-artifact-${index.toString().padStart(4, "0")}.md`,
+    );
+    const commands = createChangedCheckPlan(detectChangedLanes(paths)).commands.filter(
+      (command) => command.name === "format changed files",
+    );
+
+    expect(commands.length).toBeGreaterThan(1);
+    expect(commands.flatMap((command) => command.args.slice(3))).toEqual(paths);
+    expect(
+      commands.every((command) => Buffer.byteLength(command.args.join("\0"), "utf8") <= 24 * 1024),
+    ).toBe(true);
+  });
+
   it("fails the changed format check on a misformatted added file and passes once formatted", () => {
     const dir = makeTempRepoRoot(tempDirs, "openclaw-changed-format-added-");
     writeRepoFile(dir, "src/added.test.ts", "export const added={value:1};\n");
