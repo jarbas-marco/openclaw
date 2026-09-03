@@ -1724,6 +1724,26 @@ NODE
     expect(guard).not.toContain("openclaw-barnacle[bot]");
   });
 
+  it("keeps upstream GitHub App automation disabled in forks without its credentials", () => {
+    for (const workflowPath of [
+      ".github/workflows/auto-response.yml",
+      ".github/workflows/labeler.yml",
+    ]) {
+      const workflow = readWorkflow(workflowPath);
+      for (const [jobName, job] of Object.entries(workflow.jobs) as Array<
+        [string, { if?: unknown; steps?: WorkflowStep[] }]
+      >) {
+        const usesUpstreamApp = JSON.stringify(job.steps ?? []).includes("GH_APP_PRIVATE_KEY");
+        if (!usesUpstreamApp) {
+          continue;
+        }
+        expect(String(job.if), `${workflowPath}:${jobName}`).toContain(
+          "github.repository == 'openclaw/openclaw'",
+        );
+      }
+    }
+  });
+
   it("routes stale bug issues through ClawSweeper instead of Barnacle closure", () => {
     const staleWorkflow = readWorkflow(".github/workflows/stale.yml");
     const staleSteps = staleWorkflow.jobs.stale.steps as WorkflowStep[];
