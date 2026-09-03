@@ -276,9 +276,73 @@ enter_worktree() {
   mkdir -p .local
 }
 
+clear_pr_file_metadata_refs() {
+  local root="$1"
+  local base_ref="$2"
+  local head_ref="$3"
+  git -C "$root" update-ref -d "$base_ref" || return 1
+  git -C "$root" update-ref -d "$head_ref" || return 1
+}
+
+large_pr_file_metadata_from_git() {
+  local pr="$1"
+  local base_ref_name="$2"
+  local expected_head="$3"
+  local expected_file_count="$4"
+  local root helper_dir ref_root local_base_ref local_head_ref fetched_head merge_base files
+
+  if [[ ! "$pr" =~ ^[0-9]+$ ]] ||
+    [[ ! "$expected_head" =~ ^[0-9a-fA-F]{40}([0-9a-fA-F]{24})?$ ]] ||
+    ! git check-ref-format "refs/heads/$base_ref_name" >/dev/null 2>&1; then
+    echo "Refusing local Git metadata fallback for PR #$pr: invalid PR, base branch, or head SHA metadata." >&2
+    return 1
+  fi
+
+  root=$(repo_root) || return 1
+  helper_dir="${script_parent_dir:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+  ref_root="refs/openclaw-pr-metadata/$pr"
+  local_base_ref="$ref_root/base"
+  local_head_ref="$ref_root/head"
+  clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || return 1
+
+  if ! git -C "$root" fetch --no-tags --force origin \
+    "refs/heads/$base_ref_name:$local_base_ref" \
+    "refs/pull/$pr/head:$local_head_ref"; then
+    clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || true
+    echo "Failed to fetch pinned Git refs for large PR #$pr metadata." >&2
+    return 1
+  fi
+
+  fetched_head=$(git -C "$root" rev-parse --verify "$local_head_ref^{commit}") || {
+    clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || true
+    return 1
+  }
+  if [ "$fetched_head" != "$expected_head" ]; then
+    clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || true
+    echo "PR head changed while fetching large PR metadata for #$pr (expected $expected_head, fetched $fetched_head). Retry review initialization." >&2
+    return 1
+  fi
+
+  merge_base=$(git -C "$root" merge-base "$local_base_ref" "$local_head_ref") || {
+    clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || true
+    return 1
+  }
+  if ! files=$(node "$helper_dir/lib/pr-file-metadata-from-git.mjs" "$merge_base" "$local_head_ref" "$expected_file_count"); then
+    clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref" || true
+    echo "Failed to derive large PR #$pr file metadata from its pinned Git diff." >&2
+    return 1
+  fi
+  if ! clear_pr_file_metadata_refs "$root" "$local_base_ref" "$local_head_ref"; then
+    echo "Failed to clear temporary large PR #$pr metadata refs." >&2
+    return 1
+  fi
+  printf '%s\n' "$files"
+}
+
 pr_meta_json() {
   local pr="$1"
   local metadata files expected_file_count actual_file_count head_before head_after head_after_json
+  local base_ref_name files_source="paginated REST"
   metadata=$(read_pr_view_json "$pr" "number,title,state,isDraft,author,baseRefName,headRefName,headRefOid,headRepository,headRepositoryOwner,url,body,labels,assignees,changedFiles,additions,deletions,statusCheckRollup,files") || return 1
   head_before=$(pr_view_string_field "$metadata" "headRefOid" "$pr" "Retry review initialization.") || return 1
   if ! expected_file_count=$(printf '%s\n' "$metadata" | jq -er '.changedFiles | if type == "number" and . >= 0 and . == floor then . else error("invalid changed file count") end' 2>/dev/null); then
@@ -340,6 +404,30 @@ pr_meta_json() {
     fi
   fi
 
+  if ! actual_file_count=$(
+    printf '%s\n' "$files" |
+      jq -er 'if type == "array" then length else error("expected an array") end'
+  ); then
+    echo "Invalid paginated PR file metadata for #$pr: expected a JSON array." >&2
+    return 1
+  fi
+  if [ "$actual_file_count" -eq 3000 ] && [ "$expected_file_count" -gt 3000 ]; then
+    if ! base_ref_name=$(printf '%s\n' "$metadata" | jq -er '.baseRefName | select(type == "string" and length > 0)'); then
+      echo "Invalid PR metadata for #$pr: baseRefName must be a non-empty string." >&2
+      return 1
+    fi
+    files=$(large_pr_file_metadata_from_git "$pr" "$base_ref_name" "$head_before" "$expected_file_count") || return 1
+    files_source="pinned local Git diff"
+    if ! actual_file_count=$(printf '%s\n' "$files" | jq -er 'if type == "array" then length else error("expected an array") end'); then
+      echo "Invalid pinned local Git file metadata for #$pr: expected a JSON array." >&2
+      return 1
+    fi
+    if [ "$actual_file_count" -ne "$expected_file_count" ]; then
+      echo "Incomplete PR file metadata for #$pr: expected $expected_file_count changed files, received $actual_file_count from $files_source." >&2
+      return 1
+    fi
+  fi
+
   head_after_json=$(read_pr_view_json "$pr" "headRefOid") || return 1
   head_after=$(pr_view_string_field "$head_after_json" "headRefOid" "$pr" "Retry review initialization.") || return 1
   if [ "$head_after" != "$head_before" ]; then
@@ -355,7 +443,7 @@ pr_meta_json() {
     return 1
   fi
   if [ "$actual_file_count" -ne "$expected_file_count" ]; then
-    echo "Incomplete PR file metadata for #$pr: expected $expected_file_count changed files, received $actual_file_count from paginated REST." >&2
+    echo "Incomplete PR file metadata for #$pr: expected $expected_file_count changed files, received $actual_file_count from $files_source." >&2
     return 1
   fi
 
