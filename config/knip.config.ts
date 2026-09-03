@@ -85,6 +85,8 @@ const repositoryScriptEntries = [
   // Generates the checked-in native protocol models from core descriptor metadata.
   "scripts/protocol-gen.ts!",
   "scripts/pr-gates-lock.mts!",
+  // scripts/pr invokes this helper directly when GitHub truncates PR file metadata.
+  "scripts/lib/pr-file-metadata-from-git.mjs!",
   "scripts/pr-lib/ci-dispatch.mjs!",
   "scripts/pr-lib/review-artifacts.mjs!",
   "scripts/pr-lib/process-group-runner.mjs!",

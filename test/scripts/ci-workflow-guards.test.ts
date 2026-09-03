@@ -1708,12 +1708,21 @@ NODE
     expect(workflow.concurrency["cancel-in-progress"]).toBe(
       "${{ github.event_name == 'pull_request_target' && github.event.action == 'synchronize' }}",
     );
+    expect(guard).toContain("github.repository == 'openclaw/openclaw'");
     expect(guard).toContain("github.event_name != 'pull_request_target'");
     expect(guard).toContain("github.event.action != 'labeled'");
     expect(guard).toContain("github.event.action != 'unlabeled'");
     expect(guard).toContain("github.actor != 'clawsweeper[bot]'");
     expect(guard).toContain("github.actor != 'openclaw-clawsweeper[bot]'");
     expect(guard).not.toContain("openclaw-barnacle[bot]");
+  });
+
+  it("runs secret-backed labeling automation only in the upstream repository", () => {
+    const workflow = readWorkflow(".github/workflows/labeler.yml");
+
+    for (const jobName of ["label", "backfill-pr-labels", "label-issues"]) {
+      expect(workflow.jobs[jobName].if).toContain("github.repository == 'openclaw/openclaw'");
+    }
   });
 
   it("routes stale bug issues through ClawSweeper instead of Barnacle closure", () => {

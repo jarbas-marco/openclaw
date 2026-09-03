@@ -646,37 +646,12 @@ function writeProviderPluginScaffold(params: { rootDir: string; id: string; name
     `Replace https://api.example.com/v1 with your ${params.name} API base URL.`,
   );
   const indexSource = `import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
-import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth-api-key";
-import { buildSingleProviderApiKeyCatalog } from "openclaw/plugin-sdk/provider-catalog-shared";
-import type { ModelProviderConfig } from "openclaw/plugin-sdk/provider-model-shared";
+import { createProviderApiKeyAuthMethod } from "openclaw/plugin-sdk/provider-auth";
 
 const PLUGIN_ID = ${idLiteral};
 const PROVIDER_ID = PLUGIN_ID;
 const DEFAULT_MODEL_ID = ${defaultModelIdLiteral};
 const DEFAULT_MODEL_REF = ${defaultModelRefLiteral};
-
-function buildProvider(): ModelProviderConfig {
-  return {
-    api: "openai-completions",
-    baseUrl: "https://api.example.com/v1",
-    models: [
-      {
-        id: DEFAULT_MODEL_ID,
-        name: "Example Chat",
-        reasoning: false,
-        input: ["text"],
-        cost: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-        },
-        contextWindow: 128000,
-        maxTokens: 8192,
-      },
-    ],
-  };
-}
 
 export default definePluginEntry({
   id: PLUGIN_ID,
@@ -706,13 +681,36 @@ export default definePluginEntry({
       ],
       catalog: {
         order: "simple",
-        run: (ctx) =>
-          buildSingleProviderApiKeyCatalog({
-            ctx,
-            providerId: PROVIDER_ID,
-            buildProvider,
-            allowExplicitBaseUrl: true,
-          }),
+        run: async (ctx) => {
+          const apiKey = ctx.resolveProviderApiKey(PROVIDER_ID).apiKey;
+          if (!apiKey) {
+            return null;
+          }
+          const explicitBaseUrl = ctx.config.models?.providers?.[PROVIDER_ID]?.baseUrl?.trim();
+          return {
+            provider: {
+              api: "openai-completions",
+              baseUrl: explicitBaseUrl || "https://api.example.com/v1",
+              apiKey,
+              models: [
+                {
+                  id: DEFAULT_MODEL_ID,
+                  name: "Example Chat",
+                  reasoning: false,
+                  input: ["text"],
+                  cost: {
+                    input: 0,
+                    output: 0,
+                    cacheRead: 0,
+                    cacheWrite: 0,
+                  },
+                  contextWindow: 128000,
+                  maxTokens: 8192,
+                },
+              ],
+            },
+          };
+        },
       },
     });
   },
@@ -736,6 +734,52 @@ describe(${idLiteral}, () => {
     expect(providers.map((provider) => provider.id)).toEqual([${idLiteral}]);
     expect(providers[0]?.label).toBe(${nameLiteral});
     expect(providers[0]?.envVars).toEqual([${envVarLiteral}]);
+  });
+
+  it("builds the configured model catalog only with an API key", async () => {
+    const providers: ProviderPlugin[] = [];
+    const api = {
+      registerProvider(provider: ProviderPlugin) {
+        providers.push(provider);
+      },
+    } as Partial<OpenClawPluginApi>;
+    entry.register(api as OpenClawPluginApi);
+
+    const provider = providers[0];
+    expect(provider).toBeDefined();
+    if (!provider) {
+      return;
+    }
+    const withoutKey = await provider.catalog.run({
+      config: {},
+      env: {},
+      resolveProviderApiKey: () => ({ apiKey: undefined }),
+      resolveProviderAuth: () => ({ apiKey: undefined, mode: "none", source: "none" }),
+    });
+    expect(withoutKey).toBeNull();
+
+    const withKey = await provider.catalog.run({
+      config: {
+        models: {
+          providers: {
+            [${idLiteral}]: {
+              baseUrl: "https://override.example/v1",
+              models: [],
+            },
+          },
+        },
+      },
+      env: {},
+      resolveProviderApiKey: () => ({ apiKey: "test-key" }),
+      resolveProviderAuth: () => ({ apiKey: "test-key", mode: "api_key", source: "profile" }),
+    });
+    expect(withKey).toMatchObject({
+      provider: {
+        apiKey: "test-key",
+        baseUrl: "https://override.example/v1",
+        models: [{ id: ${defaultModelIdLiteral} }],
+      },
+    });
   });
 });
 `;

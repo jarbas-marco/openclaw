@@ -86,6 +86,10 @@ function makeMismatchedWrapperRepo() {
   );
   cpSync("scripts/lib/plain-gh.mjs", join(canonical, "scripts", "lib", "plain-gh.mjs"));
   cpSync("scripts/lib/direct-run.mjs", join(canonical, "scripts", "lib", "direct-run.mjs"));
+  cpSync(
+    "scripts/lib/pr-file-metadata-from-git.mjs",
+    join(canonical, "scripts", "lib", "pr-file-metadata-from-git.mjs"),
+  );
   cpSync("scripts/lib/tsx-cli-shim.mjs", join(canonical, "scripts", "lib", "tsx-cli-shim.mjs"));
   writeFileSync(
     join(canonical, "scripts", "lib", "plain-gh.sh"),
@@ -203,6 +207,7 @@ describe("scripts/pr wrappers", () => {
     expect(script).toContain("scripts/lib/tsx-cli-shim.mjs");
     expect(script).toContain("scripts/lib/plain-gh.mjs");
     expect(script).toContain("scripts/lib/direct-run.mjs");
+    expect(script).toContain("scripts/lib/pr-file-metadata-from-git.mjs");
     expect(script).toContain("scripts/pr review-init <PR>");
     expect(script).toContain("scripts/pr prepare-run <PR>");
     expect(script).toContain("scripts/pr ci-dispatch <PR>");
@@ -437,6 +442,7 @@ describe("scripts/pr wrappers", () => {
     writeFileSync(join(repo, "scripts", "lib", "plain-gh.sh"), "# canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "plain-gh.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "direct-run.mjs"), "// canonical\n");
+    writeFileSync(join(repo, "scripts", "lib", "pr-file-metadata-from-git.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "tsx-cli-shim.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "watch-pr-ci.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "watch-pr-ci.mts"), "// canonical\n");
@@ -525,6 +531,7 @@ describe("scripts/pr wrappers", () => {
     writeFileSync(join(repo, "scripts", "lib", "plain-gh.sh"), "# canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "plain-gh.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "direct-run.mjs"), "// canonical\n");
+    writeFileSync(join(repo, "scripts", "lib", "pr-file-metadata-from-git.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "lib", "tsx-cli-shim.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "watch-pr-ci.mjs"), "// canonical\n");
     writeFileSync(join(repo, "scripts", "watch-pr-ci.mts"), "// canonical\n");
