@@ -204,6 +204,9 @@ describe("scripts/pr wrappers", () => {
     expect(script).toContain('source "$script_parent_dir/lib/plain-gh.sh"');
     expect(script).toContain("for cmd in git gh jq rg pnpm node");
     expect(script).not.toContain("gh() {");
+    expect(readScript("scripts/pr-lib/wrapper-components.txt")).toContain(
+      "scripts/lib/pr-file-metadata-from-git.mjs",
+    );
     expect(script).toContain("scripts/pr review-init <PR>");
     expect(script).toContain("scripts/pr prepare-run <PR>");
     expect(script).toContain("scripts/pr ci-dispatch <PR>");

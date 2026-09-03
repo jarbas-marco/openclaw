@@ -686,6 +686,8 @@ export default definePluginEntry({
           return {
             provider: {
               api: "openai-completions",
+              baseUrl: configuredProvider?.baseUrl?.trim() || "https://api.example.com/v1",
+              apiKey,
               models: [
                 {
                   id: DEFAULT_MODEL_ID,
@@ -702,8 +704,6 @@ export default definePluginEntry({
                   maxTokens: 8192,
                 },
               ],
-              apiKey,
-              baseUrl: configuredProvider?.baseUrl?.trim() || "https://api.example.com/v1",
             },
           };
         },
@@ -771,6 +771,52 @@ describe(${idLiteral}, () => {
             },
       );
     }
+  });
+
+  it("builds the configured model catalog only with an API key", async () => {
+    const providers: ProviderPlugin[] = [];
+    const api = {
+      registerProvider(provider: ProviderPlugin) {
+        providers.push(provider);
+      },
+    } as Partial<OpenClawPluginApi>;
+    entry.register(api as OpenClawPluginApi);
+
+    const provider = providers[0];
+    expect(provider).toBeDefined();
+    if (!provider) {
+      return;
+    }
+    const withoutKey = await provider.catalog.run({
+      config: {},
+      env: {},
+      resolveProviderApiKey: () => ({ apiKey: undefined }),
+      resolveProviderAuth: () => ({ apiKey: undefined, mode: "none", source: "none" }),
+    });
+    expect(withoutKey).toBeNull();
+
+    const withKey = await provider.catalog.run({
+      config: {
+        models: {
+          providers: {
+            [${idLiteral}]: {
+              baseUrl: "https://override.example/v1",
+              models: [],
+            },
+          },
+        },
+      },
+      env: {},
+      resolveProviderApiKey: () => ({ apiKey: "test-key" }),
+      resolveProviderAuth: () => ({ apiKey: "test-key", mode: "api_key", source: "profile" }),
+    });
+    expect(withKey).toMatchObject({
+      provider: {
+        apiKey: "test-key",
+        baseUrl: "https://override.example/v1",
+        models: [{ id: ${defaultModelIdLiteral} }],
+      },
+    });
   });
 });
 `;

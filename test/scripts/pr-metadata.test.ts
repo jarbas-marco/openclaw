@@ -59,6 +59,7 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
       {
         number: 42,
         url: "https://example.test/pr/42",
+        baseRefName: "main",
         headRefOid: $headRefOid,
         headRepository: {nameWithOwner: "fork-owner/fork-repo"},
         changedFiles: $changedFiles,
@@ -88,12 +89,18 @@ if [ "$1" = "api" ] && [ "$2" = "--paginate" ]; then
     jq -nc '[range(0; 2) | {filename: ("src/file-" + (tostring) + ".ts"), status: (if . == 1 then "removed" else "modified" end), additions: 1, deletions: 0}]'
     exit 0
   fi
-  jq -nc '[range(0; 100) | {filename: ("src/file-" + (tostring) + ".ts"), status: "modified", additions: 1, deletions: 0}]'
+  jq -nc --argjson count "\${FAKE_REST_FILE_COUNT:-101}" '
+    [range(0; $count) | {
+      filename: ("src/file-" + (tostring) + ".ts"),
+      status: (if . == ($count - 1) then "removed" else "modified" end),
+      additions: (if . == ($count - 1) then 0 else 1 end),
+      deletions: (if . == ($count - 1) then 1 else 0 end)
+    }]
+  '
   if [ "\${FAKE_FILES_API_FAILURE:-0}" = "1" ]; then
     echo "files API failed" >&2
     exit 5
   fi
-  jq -nc '[{filename: "src/file-100.ts", status: "removed", additions: 0, deletions: 1}]'
   exit 0
 fi
 
@@ -103,6 +110,52 @@ exit 2
   );
   chmodSync(gh, 0o755);
   return dir;
+}
+
+function createFakeGit(dir: string): void {
+  const git = join(dir, "git");
+  writeFileSync(
+    git,
+    `#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == *"check-ref-format"* ]] || [[ "$*" == *" fetch "* ]] || [[ "$*" == *"update-ref -d"* ]]; then
+  exit 0
+fi
+if [[ "$*" == *"rev-parse --show-toplevel"* ]]; then
+  printf '%s\n' "$FAKE_REPO_ROOT"
+  exit 0
+fi
+if [[ "$*" == *"rev-parse --path-format=absolute --git-common-dir"* ]]; then
+  printf '%s/.git\n' "$FAKE_REPO_ROOT"
+  exit 0
+fi
+if [[ "$*" == *"rev-parse --verify refs/openclaw-pr-metadata/42/head^{commit}"* ]]; then
+  printf '%s\n' "$FAKE_HEAD_BEFORE"
+  exit 0
+fi
+if [[ "$*" == *"merge-base refs/openclaw-pr-metadata/42/base refs/openclaw-pr-metadata/42/head"* ]]; then
+  printf '%040d\n' 0
+  exit 0
+fi
+if [ "$1" = "diff" ] && [[ "$*" == *"--name-status"* ]]; then
+  for ((index = 0; index < FAKE_LOCAL_FILE_COUNT; index += 1)); do
+    printf 'M\\0src/local-file-%s.ts\\0' "$index"
+  done
+  exit 0
+fi
+if [ "$1" = "diff" ] && [[ "$*" == *"--numstat"* ]]; then
+  for ((index = 0; index < FAKE_LOCAL_FILE_COUNT; index += 1)); do
+    printf '1\t0\tsrc/local-file-%s.ts\\0' "$index"
+  done
+  exit 0
+fi
+
+echo "unexpected git command: $*" >&2
+exit 2
+`,
+  );
+  chmodSync(git, 0o755);
 }
 
 function readPrMetadata(
@@ -137,6 +190,8 @@ function readPrMetadata(
         FAKE_GRAPHQL_FILE_COUNT: options.graphqlFileCount ?? "100",
         FAKE_HEAD_AFTER: options.headAfter ?? "head-a",
         FAKE_HEAD_BEFORE: options.headBefore ?? "head-a",
+        FAKE_LOCAL_FILE_COUNT: options.changedFiles ?? "101",
+        FAKE_REPO_ROOT: process.cwd(),
         FAKE_PR_VIEW_COUNT_FILE: join(fakeGhDir, "pr-view-count"),
         FAKE_PR_VIEW_FAILURE_COUNT: options.prViewFailureCount ?? "-1",
         FAKE_PR_VIEW_FAILURE_MODE: options.prViewFailureMode ?? "",
@@ -165,7 +220,7 @@ describe("PR metadata", () => {
       rejectReviewRequests: true,
     });
 
-    expect(result.status).toBe(0);
+    expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toBe("");
   });
 
@@ -242,6 +297,32 @@ describe("PR metadata", () => {
     expect(result.stderr).toContain(
       "Incomplete PR file metadata for #42: expected 102 changed files, received 101 from paginated REST.",
     );
+  });
+
+  it("derives complete metadata from the pinned Git diff past GitHub's 3000-file cap", () => {
+    const fakeDir = createFakeGh();
+    createFakeGit(fakeDir);
+    const head = "a".repeat(40);
+    const result = readPrMetadata(fakeDir, {
+      changedFiles: "3001",
+      graphqlFileCount: "100",
+      headBefore: head,
+      headAfter: head,
+      restFileCount: "3000",
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    const metadata = JSON.parse(result.stdout) as {
+      files: Array<{ path: string; additions: number; deletions: number; changeType: string }>;
+    };
+    expect(metadata.files).toHaveLength(3001);
+    expect(metadata.files[3000]).toEqual({
+      path: "src/local-file-3000.ts",
+      additions: 1,
+      deletions: 0,
+      changeType: "MODIFIED",
+    });
   });
 
   it("fails closed when the paginated files API fails after emitting a page", () => {

@@ -830,6 +830,11 @@ describe("plugin authoring commands", () => {
     for (const [, subpath] of indexSource.matchAll(/from "openclaw\/plugin-sdk\/([^"]+)"/g)) {
       expect(publicPluginSdkSubpaths).toContain(subpath);
     }
+    expect(indexSource).toContain('from "openclaw/plugin-sdk/provider-auth"');
+    expect(indexSource).toContain("ctx.resolveProviderApiKey");
+    expect(indexSource).not.toContain("provider-auth-api-key");
+    expect(indexSource).not.toContain("provider-catalog-shared");
+    expect(indexSource).not.toContain("provider-model-shared");
 
     expect(fs.readFileSync(path.join(projectDir, "src/index.test.ts"), "utf8")).toContain(
       "OpenClawPluginApi",
