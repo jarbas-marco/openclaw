@@ -562,6 +562,8 @@ describe("Crabbox authorization before final effects", () => {
         "workflow",
         "run",
         "pr-crabbox-gate-publisher.yml",
+        "--repo",
+        "openclaw/openclaw",
         "--ref",
         "main",
         "-f",

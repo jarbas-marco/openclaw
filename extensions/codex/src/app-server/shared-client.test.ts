@@ -2170,7 +2170,7 @@ describe("shared Codex app-server client", () => {
 
   it("rejects an in-flight acquire after its shared client is detached for cleanup", async () => {
     const harness = createClientHarness();
-    vi.spyOn(CodexAppServerClient, "start").mockReturnValueOnce(harness.client);
+    vi.spyOn(CodexAppServerClient, "start").mockResolvedValueOnce(harness.client);
     let startedClient: CodexAppServerClient | undefined;
     const pendingAcquire = getLeasedSharedCodexAppServerClient({
       timeoutMs: 1_000,
@@ -2191,7 +2191,7 @@ describe("shared Codex app-server client", () => {
     const rejectedAcquire = expect(pendingAcquire).rejects.toThrow(
       "codex app-server client is closed",
     );
-    await sendInitializeResult(harness, "openclaw/0.147.0 (Linux; test)");
+    await sendInitializeResult(harness, "openclaw/0.149.0 (Linux; test)");
     await rejectedAcquire;
     expect(harness.process.stdin.destroyed).toBe(false);
 
