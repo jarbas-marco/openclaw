@@ -215,6 +215,8 @@ export async function resolveSkillWorkshopToolApproval(params: {
   return {
     requireApproval: {
       ...text,
+      // This core policy owns its approval even when invoked under another plugin's scope.
+      pluginId: "skill-workshop",
       description: approvalDescription.description,
       timeoutMs: SKILL_WORKSHOP_APPROVAL_TIMEOUT_MS,
       timeoutReason: lifecycleApprovalTimeoutReason({
