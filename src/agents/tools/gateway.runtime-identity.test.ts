@@ -21,6 +21,7 @@ import {
 } from "../../infra/agent-run-registry.js";
 import { withPluginRuntimeGatewayRequestScope } from "../../plugins/runtime/gateway-request-scope.js";
 import { createOperationalRunInstanceRef } from "../admitted-run-context.js";
+import { resolveSkillWorkshopApprovalForFinalParams } from "../agent-tools.before-tool-call.approval.js";
 import {
   withGatewayToolApprovalOwner,
   withGatewayToolCallerIdentity,
@@ -596,6 +597,51 @@ describe("gateway tool runtime identity", () => {
       if (!executionIdentityToken) {
         expect(verified).not.toHaveProperty("executionIdentity");
       }
+    },
+  );
+
+  it.each(
+    ["apply", "reject", "quarantine", "restore_collection"].flatMap((action) =>
+      [undefined, "outer-policy"].map((approvalOwnerPluginId) => ({
+        action,
+        approvalOwnerPluginId,
+      })),
+    ),
+  )(
+    "binds Workshop $action approval to its owner (ambient: $approvalOwnerPluginId) and honors denial",
+    async ({ action, approvalOwnerPluginId }) => {
+      mocks.callGateway.mockResolvedValueOnce({ id: "workshop-approval", decision: "deny" });
+      const operationalRunInstance = createOperationalRunInstanceRef("workshop-policy-run");
+      const result = await withActiveGatewayToolCallerIdentity(
+        {
+          agentId: "ops",
+          sessionKey: "agent:ops:main",
+          operationalRunInstance,
+          approvalOwnerPluginId,
+        },
+        async () => {
+          const outcome = await resolveSkillWorkshopApprovalForFinalParams({
+            toolName: "skill_workshop",
+            params: { action, proposal_id: "synthetic-proposal" },
+            ctx: {
+              agentId: "ops",
+              sessionKey: "agent:ops:main",
+              config: { skills: { workshop: { approvalPolicy: "pending" } } },
+            },
+          });
+          const call = capturedGatewayCall();
+          expect(call.method).toBe("plugin.approval.request");
+          await expect(
+            verifyAgentRuntimeIdentityToken(call.agentRuntimeIdentityToken),
+          ).resolves.toMatchObject({ approvalOwnerPluginId: "skill-workshop" });
+          return outcome;
+        },
+      );
+      expect(result).toMatchObject({
+        blocked: true,
+        deniedReason: "plugin-approval",
+        reason: expect.stringContaining("Denied by user"),
+      });
     },
   );
 
