@@ -23,6 +23,10 @@ import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const NOW = Date.parse("2026-08-28T12:00:00Z");
 const EXPIRES_AT = "2026-09-04T12:00:00Z";
+// CLI subprocesses need the fixture's epoch while discovery deadlines keep advancing.
+const FIXTURE_CLOCK_PRELOAD = `const clockStartedAt = performance.now();
+Date.now = () => ${NOW} + Math.floor(performance.now() - clockStartedAt);
+`;
 const REPOSITORY = "openclaw/openclaw";
 const CONTRACT_SCRIPT = resolve("scripts/full-release-candidate-contract.mjs");
 const SCRIPT = resolve("scripts/full-release-candidate-reuse.mjs");
@@ -528,6 +532,8 @@ cat "$FAKE_GH_PAYLOAD"
     const inputPath = join(root, "request-input.json");
     const outputPath = join(root, "github-output");
     const artifactListingPath = join(root, "artifacts.json");
+    const clockPreloadPath = join(root, "clock-preload.mjs");
+    writeFileSync(clockPreloadPath, FIXTURE_CLOCK_PRELOAD);
     mkdirSync(bin);
     mkdirSync(responses);
     const ghPath = join(bin, "gh");
@@ -582,6 +588,7 @@ esac
         FAKE_GH_RESPONSES: responses,
         GH_TOKEN: "test-token",
         GITHUB_OUTPUT: outputPath,
+        NODE_OPTIONS: `--import=${pathToFileURL(clockPreloadPath).href}`,
         PATH: `${bin}:${process.env.PATH}`,
       },
       timeout: 10_000,
@@ -647,7 +654,8 @@ esac
     writeFileSync(artifactMetadataPath, JSON.stringify(metadata));
     writeFileSync(
       fetchPreloadPath,
-      `import { readFileSync } from "node:fs";
+      `${FIXTURE_CLOCK_PRELOAD}
+import { readFileSync } from "node:fs";
 const archive = readFileSync(process.env.FAKE_ARTIFACT_ARCHIVE);
 const metadata = JSON.parse(readFileSync(process.env.FAKE_ARTIFACT_METADATA, "utf8"));
 globalThis.fetch = async (url) => {
