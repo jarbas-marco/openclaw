@@ -45,9 +45,8 @@ import {
   type CodexAppServerThreadBinding,
 } from "./session-binding.js";
 import {
-  getLeasedSharedCodexAppServerClient,
+  createIsolatedCodexAppServerClient,
   retainSharedCodexAppServerClientByInstanceId,
-  releaseLeasedSharedCodexAppServerClient,
   type CodexAppServerClientFactory,
 } from "./shared-client.js";
 import { isSameCodexAppServerThreadOwner } from "./thread-ownership.js";
@@ -517,7 +516,7 @@ async function compactCodexNativeThread(
     return { ok: false, compacted: false, reason: "auth profile mismatch for session binding" };
   }
   const shouldReleaseDefaultLease = !options.clientFactory;
-  const clientFactory = options.clientFactory ?? getLeasedSharedCodexAppServerClient;
+  const clientFactory = options.clientFactory ?? createIsolatedCodexAppServerClient;
   const runtimeAuthPlan = params.runtimeAuthPlan ?? params.runtimePlan?.auth;
   // A user-home app-server keeps its native Codex account; injecting a prepared key
   // would rewrite the CODEX_HOME auth that Codex CLI and Desktop share.
@@ -553,6 +552,7 @@ async function compactCodexNativeThread(
         let releaseThreadSubscription: (() => Promise<void>) | undefined;
         let retainedThreadOwnership: CodexAppServerLiveThreadOwnership | undefined;
         let compactionSucceeded = false;
+        let temporaryClientExited = true;
         let compactionRequestDefinitelyRejected = false;
         let tokensAfter: number | undefined;
         const releaseCompactionThread = async (threadId: string) => {
@@ -832,10 +832,17 @@ async function compactCodexNativeThread(
             }
           } finally {
             boundClientLease?.release();
+            // Unsubscribe keeps the native thread loaded. A cold compaction owns
+            // its process and must release the writer before a later turn resumes.
             if (!boundClientLease && shouldReleaseDefaultLease) {
-              releaseLeasedSharedCodexAppServerClient(client);
+              temporaryClientExited = await client.closeAndWait();
             }
           }
+        }
+        if (!temporaryClientExited) {
+          throw new CodexAppServerUnsafeSubscriptionError(
+            `Codex compaction client did not exit: ${binding.threadId}`,
+          );
         }
         const details: JsonObject = {
           backend: "codex-app-server",

@@ -131,6 +131,8 @@ export function createClientHarness(
     stdin: Writable;
     stdout: PassThrough;
     stderr: PassThrough;
+    exitCode: number | null;
+    signalCode: NodeJS.Signals | null;
     killed: boolean;
     kill: (signal?: NodeJS.Signals) => unknown;
   };
@@ -159,6 +161,8 @@ export function createClientHarness(
     stdin,
     stdout,
     stderr: new PassThrough(),
+    exitCode: null,
+    signalCode: null,
     killed: false,
     kill: vi.fn((_signal?: NodeJS.Signals) => {
       process.killed = true;
@@ -167,6 +171,11 @@ export function createClientHarness(
   emitProcessExit = () => {
     process.emit("exit", 0, null);
   };
+  // Preserve terminal state so repeated closeAndWait calls observe the prior exit.
+  process.once("exit", (code: number | null, signal: NodeJS.Signals | null) => {
+    process.exitCode = code;
+    process.signalCode = signal;
+  });
   const client = CodexAppServerClient.fromTransportForTests(process);
   return {
     client,
