@@ -7,6 +7,7 @@ import { parse } from "yaml";
 import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 
 const workflow = parse(readFileSync(".github/workflows/codeql-critical-quality.yml", "utf8")) as {
+  on: { pull_request: { paths?: string[]; "paths-ignore"?: string[] } };
   jobs: Record<string, { steps: { id?: string; name: string; run?: string }[] }>;
 };
 const steps = [
@@ -31,16 +32,18 @@ function runStep(name: string, root: string, env: Record<string, string>) {
 }
 
 function scan(
-  files: { filename: string; patch?: string | null }[],
+  files: { filename: string; previous_filename?: string; patch?: string | null }[],
   failCall = 0,
   response?: string,
   step = "network-diff-scan",
+  declaredFileCount: number | null = files.length,
 ) {
   const root = tempDirs.make("codeql-network-scan-");
   const bin = path.join(root, "bin");
   mkdirSync(bin);
   writeFileSync(path.join(root, "files.json"), response ?? JSON.stringify(files));
   writeFileSync(path.join(root, "calls"), "0");
+  writeFileSync(path.join(root, "pr.json"), JSON.stringify({ changed_files: declaredFileCount }));
   const output = path.join(root, "output");
   writeFileSync(output, "");
   // Execute the workflow's own jq filters, replacing only the GitHub API boundary.
@@ -48,13 +51,18 @@ function scan(
     path.join(bin, "gh"),
     `#!/usr/bin/env bash
 set -euo pipefail
-[[ "$1" == api && "$2" == --paginate && "$3" == repos/openclaw/openclaw/pulls/123/files ]]
+[[ "$1" == api ]]
 call=$(( $(cat calls) + 1 ))
 echo "$call" > calls
 if [[ "$call" == "$FAIL_CALL" ]]; then
   echo "synthetic GitHub fetch failure" >&2
   exit 7
 fi
+if [[ "$2" == repos/openclaw/openclaw/pulls/123 ]]; then
+  [[ "$#" == 4 && "$3" == --jq ]]
+  exec jq -er "$4" pr.json
+fi
+[[ "$2" == --paginate && "$3" == repos/openclaw/openclaw/pulls/123/files ]]
 if [[ "$#" == 3 ]]; then
   cat files.json
 else
@@ -80,6 +88,62 @@ fi
 }
 
 describe("network CodeQL PR routing", () => {
+  it("admits PRs before applying complete security path selection", () => {
+    expect(workflow.on.pull_request.paths).toBeUndefined();
+    expect(workflow.on.pull_request["paths-ignore"]).toBeUndefined();
+  });
+
+  it.each(["network-diff-scan", "detect"])(
+    "requires full coverage when the PR file list is truncated in %s",
+    (step) => {
+      const files = Array.from({ length: 3000 }, (_, index) => ({ filename: `docs/${index}.md` }));
+      const { result, output } = scan(files, 0, undefined, step, 18360);
+      expect(result.status, result.stderr).toBe(0);
+      const selections = output.trim().split("\n");
+      expect(selections.length).toBeGreaterThan(0);
+      expect(selections.every((selection) => selection.endsWith("=true"))).toBe(true);
+    },
+  );
+
+  it.each(["network-diff-scan", "detect"])(
+    "requires full coverage for an incomplete list below the API cap in %s",
+    (step) => {
+      const { result, output } = scan([{ filename: "docs/example.md" }], 0, undefined, step, 2);
+      expect(result.status, result.stderr).toBe(0);
+      expect(
+        output
+          .trim()
+          .split("\n")
+          .every((selection) => selection.endsWith("=true")),
+      ).toBe(true);
+    },
+  );
+
+  it.each(["network-diff-scan", "detect"])(
+    "keeps the original security boundary when a file is renamed away in %s",
+    (step) => {
+      const { result, output } = scan(
+        [{ filename: "docs/removed.txt", previous_filename: "src/infra/net/client.ts", patch: "" }],
+        0,
+        undefined,
+        step,
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(output.split("\n")).toContain(
+        step === "detect" ? "network_runtime=true" : "full_codeql=true",
+      );
+    },
+  );
+
+  it.each(["network-diff-scan", "detect"])(
+    "fails closed when the declared file count is unavailable in %s",
+    (step) => {
+      const { result, output } = scan([], 0, undefined, step, null);
+      expect(result.status).not.toBe(0);
+      expect(output).toBe("");
+    },
+  );
+
   it.each([
     ["tests/network-runtime/packages/net-policy/src/client.ts", true],
     ["tests/unrelated/example.qlref", false],
@@ -152,9 +216,9 @@ describe("network CodeQL PR routing", () => {
 
   it.each(["network-diff-scan", "detect"])("consumes one paginated snapshot in %s", (step) => {
     const response = `${JSON.stringify([{ filename: "src/example.ts", patch: "+const ok = true;" }])}\n${JSON.stringify([{ filename: qaOwner, patch: null }])}`;
-    const { result, output, calls } = scan([], 0, response, step);
+    const { result, output, calls } = scan([], 0, response, step, 2);
     expect(result.status, result.stderr).toBe(0);
-    expect(calls).toBe(1);
+    expect(calls).toBe(2);
     expect(output.split("\n")).toContain(
       step === "detect" ? "network_runtime=true" : "full_codeql=true",
     );
