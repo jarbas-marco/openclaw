@@ -575,6 +575,9 @@ async function compactCodexNativeThread(
         assertCurrent();
         const client = await clientFactory({
           startOptions: appServer.start,
+          authRequirement: usesSupervisionConnection
+            ? undefined
+            : runtimeAuthPlan?.modelRoute?.authRequirement,
           ...(preparedApiKey
             ? { preparedAuth: { kind: "api-key" as const, apiKey: preparedApiKey } }
             : { authProfileId: connection.clientAuthProfileId }),

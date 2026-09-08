@@ -557,6 +557,49 @@ describe("maybeCompactCodexAppServerSession", () => {
     expect(factory.mock.calls[0]?.[0]).not.toHaveProperty("authProfileId");
   });
 
+  it.each([false, true])(
+    "preserves subscription compaction auth without overriding native supervision (supervised=%s)",
+    async (supervised) => {
+      const fake = createFakeCodexClient({ retainedThreadId: null });
+      const factory = vi.fn<CodexAppServerClientFactory>(async () => fake.client);
+      const sessionFile = await (supervised ? writeSupervisedTestBinding : writeTestBinding)({
+        authProfileId: "openai:work",
+      });
+      const result = requireCompactResult(
+        await maybeCompactCodexAppServerSession(
+          {
+            sessionId: "session-1",
+            sessionKey: "agent:main:session-1",
+            sessionFile,
+            workspaceDir: tempDir,
+            trigger: "manual",
+            authProfileId: "openai:work",
+            runtimeAuthPlan: {
+              providerForAuth: "openai",
+              authProfileProviderForAuth: "openai",
+              harnessAuthProvider: "openai",
+              selectedAuthMode: "subscription",
+              modelRoute: {
+                provider: "openai",
+                modelId: "gpt-5.4-codex",
+                api: "openai-chatgpt-responses",
+                baseUrl: "https://chatgpt.com/backend-api/codex",
+                authRequirement: "subscription",
+                requestTransportOverrides: "none",
+              },
+            },
+          },
+          { clientFactory: factory, pluginConfig: { supervision: { enabled: supervised } } },
+        ),
+      );
+      expect(result.ok).toBe(true);
+      const options = factory.mock.calls[0]?.[0];
+      expect(options?.authRequirement).toBe(supervised ? undefined : "subscription");
+      expect(options?.authProfileId).toBe(supervised ? null : "openai:work");
+      expect(options).not.toHaveProperty("preparedAuth");
+    },
+  );
+
   it("fails closed when prepared Platform compaction has no key", async () => {
     const fake = createFakeCodexClient();
     const factory = vi.fn(async () => fake.client);
