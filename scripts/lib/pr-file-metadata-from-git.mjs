@@ -10,6 +10,7 @@ const expectedCount =
 const GIT_DIFF_TIMEOUT_MS = 60_000;
 const GIT_DIFF_MAX_BUFFER_BYTES = 256 * 1024 * 1024;
 const GIT_RENAME_CANDIDATE_LIMIT = 5_000;
+const GIT_RENAME_THRESHOLD_SCALE = 10;
 const deadline = Date.now() + GIT_DIFF_TIMEOUT_MS;
 
 if (
@@ -150,6 +151,12 @@ function parseNumstat(buffer) {
   return stats;
 }
 
+function formatRenameThreshold(threshold) {
+  const whole = Math.floor(threshold / GIT_RENAME_THRESHOLD_SCALE);
+  const fraction = threshold % GIT_RENAME_THRESHOLD_SCALE;
+  return fraction === 0 ? String(whole) : `${String(whole)}.${String(fraction)}`;
+}
+
 try {
   const renameLimitArg = `-l${String(GIT_RENAME_CANDIDATE_LIMIT)}`;
   let renameArg = "--find-renames";
@@ -164,10 +171,10 @@ try {
       runGit(["diff", renameLimitArg, renameArg, "-z", "--name-status", base, head, "--"]),
     );
     let minimumThreshold = 1;
-    let maximumThreshold = 100;
+    let maximumThreshold = 100 * GIT_RENAME_THRESHOLD_SCALE;
     while (statuses.length !== expectedCount && minimumThreshold <= maximumThreshold) {
       const threshold = Math.floor((minimumThreshold + maximumThreshold) / 2);
-      renameArg = `--find-renames=${String(threshold)}%`;
+      renameArg = `--find-renames=${formatRenameThreshold(threshold)}%`;
       statuses = parseNameStatus(
         runGit(["diff", renameLimitArg, renameArg, "-z", "--name-status", base, head, "--"]),
       );
