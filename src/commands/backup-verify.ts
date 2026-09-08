@@ -1,4 +1,3 @@
-// Verifies backup archives, including payload paths and hardlink/symbolic-link targets.
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -84,8 +83,9 @@ async function listArchiveEntries(archivePath: string) {
     gzip: true,
     maxDecompressionRatio: BACKUP_MAX_DECOMPRESSION_RATIO,
     onwarn: (code, message) => {
-      if (code === "TAR_BAD_ARCHIVE" && invalidReason === undefined) {
-        invalidReason = formatErrorMessage(message);
+      // tar skips invalid headers; a readable remainder is not a complete backup.
+      if (code === "TAR_BAD_ARCHIVE" || code === "TAR_ENTRY_INVALID") {
+        invalidReason ??= formatErrorMessage(message);
       }
     },
     onReadEntry: (entry) => {
@@ -142,19 +142,6 @@ function formatResult(result: BackupVerifyResult): string {
       ? ["Recovery profile: legacy internal-run traces were verified as omitted."]
       : []),
   ].join("\n");
-}
-
-function findDuplicateNormalizedEntryPath(
-  entries: Array<{ normalized: string }>,
-): string | undefined {
-  const seen = new Set<string>();
-  for (const entry of entries) {
-    if (seen.has(entry.normalized)) {
-      return entry.normalized;
-    }
-    seen.add(entry.normalized);
-  }
-  return undefined;
 }
 
 function resolvePortableArchivePathKey(value: string): string {
@@ -387,7 +374,6 @@ function resolveSqliteExtractionBytes(entries: SqliteSnapshotEntry[]): number {
 function assertSqliteExtractionBudget(params: {
   entries: SqliteSnapshotEntry[];
   tempRoot: string;
-  readDiskSpace?: typeof tryReadDiskSpace;
 }): void {
   const totalBytes = resolveSqliteExtractionBytes(params.entries);
   if (totalBytes > MAX_SQLITE_SNAPSHOT_EXTRACT_BYTES) {
@@ -396,7 +382,7 @@ function assertSqliteExtractionBudget(params: {
     );
   }
 
-  const diskSpace = (params.readDiskSpace ?? tryReadDiskSpace)(params.tempRoot);
+  const diskSpace = tryReadDiskSpace(params.tempRoot);
   if (
     diskSpace &&
     totalBytes + SQLITE_SNAPSHOT_FREE_SPACE_RESERVE_BYTES > diskSpace.availableBytes
@@ -599,14 +585,21 @@ async function verifyResolvedBackupArchive(archivePath: string): Promise<Prepare
   const symbolicLinks = rawEntries
     .filter((entry) => entry.type === "SymbolicLink")
     .map((entry) => ({ entryPath: entry.path, linkpath: entry.linkpath }));
-  const rawEntryPaths = new Map(entries.map((entry) => [entry.normalized, entry.raw]));
+  const rawEntryPaths = new Map<string, string>();
+  let duplicateEntryPath: string | undefined;
+  // Keep the first duplicate for validation below; manifest-count errors still win.
+  for (const entry of entries) {
+    if (rawEntryPaths.has(entry.normalized)) {
+      duplicateEntryPath ??= entry.normalized;
+    }
+    rawEntryPaths.set(entry.normalized, entry.raw);
+  }
   const normalizedEntrySet = new Set(rawEntryPaths.keys());
 
   const manifestMatches = entries.filter((entry) => isRootBackupManifestEntry(entry.normalized));
   if (manifestMatches.length !== 1) {
     throw new Error(`Expected exactly one backup manifest entry, found ${manifestMatches.length}.`);
   }
-  const duplicateEntryPath = findDuplicateNormalizedEntryPath(entries);
   if (duplicateEntryPath) {
     throw new Error(`Archive contains duplicate entry path: ${duplicateEntryPath}`);
   }
@@ -650,7 +643,7 @@ async function verifyResolvedBackupArchive(archivePath: string): Promise<Prepare
     assertArchiveSymbolicLinkTarget({
       ...link,
       archiveRoot: manifest.archiveRoot,
-      assetArchivePaths: manifest.assets.map((asset) => asset.archivePath),
+      assets: manifest.assets,
     });
   }
   await verifySqliteSnapshots({ archivePath, entries, manifest });
@@ -698,7 +691,3 @@ export async function backupVerifyCommand(
   }
   return result;
 }
-
-export const testApi = {
-  assertSqliteExtractionBudget,
-};
