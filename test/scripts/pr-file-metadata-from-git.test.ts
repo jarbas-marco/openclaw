@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 const tempDirs: string[] = [];
@@ -78,6 +78,41 @@ describe("PR file metadata from Git", () => {
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("expected 4");
     expect(result.stdout).toBe("");
+  });
+
+  it("uses a fractional rename threshold when whole percentages miss the expected count", () => {
+    const binDir = mkdtempSync(join(tmpdir(), "openclaw-pr-file-metadata-fake-git-"));
+    tempDirs.push(binDir);
+    const fakeGit = join(binDir, "git");
+    writeFileSync(
+      fakeGit,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const renameArg = args.find((arg) => arg.startsWith("--find-renames="));
+const threshold = renameArg ? Number(renameArg.slice("--find-renames=".length, -1)) : 100;
+const count = threshold < 87.4 ? 18359 : threshold === 87.4 ? 18360 : 18362;
+const nameStatus = args.includes("--name-status");
+const chunks = [];
+for (let index = 0; index < count; index += 1) {
+  const path = \`file-\${String(index).padStart(5, "0")}\`;
+  chunks.push(nameStatus ? \`M\\0\${path}\\0\` : \`0\\t0\\t\${path}\\0\`);
+}
+process.stdout.write(chunks.join(""));
+`,
+    );
+    chmodSync(fakeGit, 0o755);
+
+    const result = spawnSync("node", [helper, "base", "head", "18360"], {
+      cwd: binDir,
+      encoding: "utf8",
+      env: { ...process.env, PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}` },
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toHaveLength(18360);
   });
 
   it("overrides a restrictive rename limit for modified rename candidates", () => {
