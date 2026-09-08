@@ -45,6 +45,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
+      privileged: ${{ steps.authority.outputs.privileged }}
+      cache_mode: ${{ steps.authority.outputs.cache_mode }}
       docs_only: ${{ steps.manifest.outputs.docs_only }}
       run_install_smoke: ${{ steps.manifest.outputs.run_install_smoke }}
       run_fast_install_smoke: ${{ steps.manifest.outputs.run_fast_install_smoke }}
@@ -56,7 +58,8 @@ jobs:
     steps:
       # The caller workflow SHA can differ during workflow_call. The job context identifies
       # this reusable workflow, so trusted harness checkouts cannot drift to candidate code.
-      - name: Assert trusted workflow identity
+      - &workflow_identity_step
+        name: Assert trusted workflow identity
         id: workflow
         env:
           EXPECTED_WORKFLOW_REPOSITORY: ${{ github.repository }}
@@ -87,10 +90,44 @@ jobs:
           );
           NODE
 
+      # Fetch metadata and trusted policy only; no candidate checkout or execution yet.
+      - name: Materialize execution authority helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .trust-harness
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: scripts/github/classify-candidate-execution.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Classify candidate execution authority
+        id: authority
+        env:
+          TARGET_REF: ${{ inputs.ref || github.ref }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git -C .trust-harness merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH" || {
+            echo "::error::Called workflow revision must belong to the repository default-branch history."
+            exit 1
+          }
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          git -C .trust-harness fetch --no-tags --no-recurse-submodules -- origin "$TARGET_REF"
+          CANDIDATE_SHA="$(git -C .trust-harness rev-parse --verify 'FETCH_HEAD^{commit}')"
+          export CANDIDATE_SHA
+          node .trust-harness/scripts/github/classify-candidate-execution.mjs
+          echo "target_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ steps.authority.outputs.target_sha }}
           fetch-depth: 1
           fetch-tags: false
           persist-credentials: false
@@ -156,7 +193,14 @@ jobs:
           ref: ${{ needs.preflight.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: Dockerfile
@@ -371,7 +415,14 @@ jobs:
           );
           NODE
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: Dockerfile
@@ -690,7 +741,14 @@ jobs:
             "https://codeload.github.com/${TARGET_REPOSITORY}/tar.gz/${TARGET_SHA}"
           test -s "${RUNNER_TEMP}/candidate.tar.gz"
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-smoke/Dockerfile
@@ -839,7 +897,14 @@ jobs:
       - *trusted_workflow_subdir_checkout_step
       - *trusted_workflow_subdir_identity_step
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-smoke/Dockerfile
@@ -912,7 +977,14 @@ jobs:
       - *trusted_workflow_subdir_checkout_step
       - *trusted_workflow_subdir_identity_step
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-nonroot/Dockerfile
@@ -1516,14 +1588,32 @@ jobs:
           ref: ${{ needs.preflight.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/e2e/Dockerfile
 
-      - name: Setup Node environment for package smoke
-        uses: ./.github/actions/setup-node-env
+      - *workflow_identity_step
+
+      - name: Materialize package-smoke setup
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .release-harness
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment for package smoke
+        uses: ./.release-harness/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.preflight.outputs.cache_mode }}
           install-bun: "false"
           install-deps: "true"

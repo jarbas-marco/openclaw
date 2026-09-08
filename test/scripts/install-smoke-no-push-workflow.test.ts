@@ -1,5 +1,7 @@
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 
@@ -61,6 +63,140 @@ function step(workflowJob: WorkflowJob, name: string): WorkflowStep {
   expect(found, name).toBeDefined();
   return found!;
 }
+
+describe("candidate execution trust boundary", () => {
+  it.each([INSTALL_SMOKE_REUSABLE, ".github/workflows/openclaw-repo-e2e-reusable.yml"])(
+    "rejects default-branch candidates and untrusted workflow history before execution in %s",
+    (path) => {
+      const guard = step(
+        job(readWorkflow(path), "preflight"),
+        "Classify candidate execution authority",
+      );
+      const root = mkdtempSync(join(tmpdir(), "candidate-workflow-authority-"));
+      const source = join(root, "source");
+      const harness = join(root, ".trust-harness");
+      const output = join(root, "output");
+      const marker = join(root, "untrusted-executed");
+      const git = (cwd: string, ...args: string[]) => {
+        const result = spawnSync(
+          "git",
+          [
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            ...args,
+          ],
+          { cwd, encoding: "utf8" },
+        );
+        expect(result.status, result.stderr).toBe(0);
+        return result.stdout.trim();
+      };
+      try {
+        mkdirSync(join(source, "scripts/github"), { recursive: true });
+        copyFileSync(
+          resolve("scripts/github/classify-candidate-execution.mjs"),
+          join(source, "scripts/github/classify-candidate-execution.mjs"),
+        );
+        git(source, "init", "--initial-branch=main");
+        git(source, "add", ".");
+        git(source, "commit", "-m", "historical candidate");
+        const candidate = git(source, "rev-parse", "HEAD");
+        writeFileSync(join(source, "workflow-revision"), "trusted");
+        git(source, "add", ".");
+        git(source, "commit", "-m", "trusted workflow");
+        const workflowSha = git(source, "rev-parse", "HEAD");
+        git(source, "checkout", "-b", "untrusted");
+        writeFileSync(
+          join(source, "scripts/github/classify-candidate-execution.mjs"),
+          `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(marker)}, "executed");`,
+        );
+        git(source, "add", ".");
+        git(source, "commit", "-m", "untrusted workflow policy");
+        const untrustedSha = git(source, "rev-parse", "HEAD");
+        git(source, "checkout", "main");
+        git(root, "clone", source, harness);
+        const runGuard = (workflowRef: string, selectedWorkflowSha: string) => {
+          git(harness, "checkout", "--detach", selectedWorkflowSha);
+          writeFileSync(output, "");
+          return spawnSync("bash", ["--noprofile", "--norc", "-c", guard.run!], {
+            cwd: root,
+            encoding: "utf8",
+            env: {
+              ...process.env,
+              TARGET_REF: candidate,
+              WORKFLOW_SHA: selectedWorkflowSha,
+              WORKFLOW_REF: workflowRef,
+              DEFAULT_BRANCH: "main",
+              GITHUB_OUTPUT: output,
+            },
+          });
+        };
+        const rejected = runGuard("refs/heads/main", workflowSha);
+        expect(rejected.status).not.toBe(0);
+        expect(readFileSync(output, "utf8")).not.toContain("target_sha=");
+        const isolated = runGuard("refs/heads/validate-historical", workflowSha);
+        expect(isolated.status, isolated.stderr).toBe(0);
+        expect(readFileSync(output, "utf8")).toContain("privileged=false\ncache_mode=off");
+        expect(readFileSync(output, "utf8")).toContain(`target_sha=${candidate}`);
+        const untrusted = runGuard("refs/heads/validate-historical", untrustedSha);
+        expect(untrusted.status).not.toBe(0);
+        expect(untrusted.stdout).toContain("default-branch history");
+        expect(() => readFileSync(marker)).toThrow();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each([INSTALL_SMOKE_REUSABLE, ".github/workflows/openclaw-repo-e2e-reusable.yml"])(
+    "classifies the immutable candidate before checkout in %s",
+    (path) => {
+      const workflow = readWorkflow(path);
+      const preflight = job(workflow, "preflight");
+      const identity = step(preflight, "Assert trusted workflow identity");
+      expect(identity.env?.JOB_CONTEXT).toBe("${{ toJSON(job) }}");
+      expect(identity.run).toContain("job.workflow_sha");
+      const guard = step(preflight, "Classify candidate execution authority");
+      expect(guard.env).toMatchObject({
+        WORKFLOW_SHA: "${{ steps.workflow.outputs.workflow_sha }}",
+        WORKFLOW_REF: "${{ github.ref }}",
+        DEFAULT_BRANCH: "${{ github.event.repository.default_branch }}",
+      });
+      expect(guard.run).toContain('merge-base --is-ancestor "$WORKFLOW_SHA"');
+      expect(guard.run).toContain("classify-candidate-execution.mjs");
+      expect(preflight.outputs?.cache_mode).toBe("${{ steps.authority.outputs.cache_mode }}");
+      expect(preflight.outputs?.privileged).toBe("${{ steps.authority.outputs.privileged }}");
+      for (const [name, workflowJob] of Object.entries(workflow.jobs)) {
+        for (const candidateStep of workflowJob.steps ?? []) {
+          if (candidateStep.uses?.startsWith("actions/checkout@")) {
+            expect(candidateStep.with?.["persist-credentials"], name).toBe(false);
+            if (candidateStep.with?.ref === "${{ steps.authority.outputs.target_sha }}") {
+              expect(preflight.steps!.indexOf(guard)).toBeLessThan(
+                preflight.steps!.indexOf(candidateStep),
+              );
+            }
+          }
+          if (candidateStep.uses?.includes("setup-node-env")) {
+            expect(candidateStep.uses).toBe("./.release-harness/.github/actions/setup-node-env");
+            expect(candidateStep.with?.["cache-mode"]).toBe(
+              "${{ needs.preflight.outputs.cache_mode }}",
+            );
+          }
+          if (candidateStep.uses?.startsWith("docker/setup-buildx-action@")) {
+            expect(candidateStep.with?.["cache-binary"]).toBe(false);
+          }
+          if (candidateStep.uses?.startsWith("useblacksmith/setup-docker-builder@")) {
+            expect(candidateStep.if).toBe("needs.preflight.outputs.privileged == 'true'");
+          }
+        }
+      }
+      expect(JSON.stringify(workflow)).not.toContain("${{ secrets.");
+    },
+  );
+});
 
 describe("install smoke no-push root image transport", () => {
   it("keeps schedule/manual orchestration read-only and delegates to the reusable core", () => {

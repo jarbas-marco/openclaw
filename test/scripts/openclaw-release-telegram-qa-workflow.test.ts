@@ -358,7 +358,7 @@ describe("release Telegram QA workflow", () => {
     const release = workflow(RELEASE_CHECKS_PATH);
     const caller = release.jobs?.qa_live_telegram_release_checks;
     expect(caller).toMatchObject({
-      needs: ["resolve_target"],
+      needs: ["candidate_execution", "resolve_target"],
       permissions: { actions: "write", contents: "read" },
       "runs-on": "ubuntu-24.04",
       "timeout-minutes": 210,

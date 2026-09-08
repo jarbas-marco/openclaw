@@ -4470,12 +4470,17 @@ NODE
       packageManager?: string;
     };
     const setupPnpmAction = readFileSync(SETUP_PNPM_STORE_CACHE_ACTION, "utf8");
+    const setupPnpmScript = readFileSync(
+      ".github/actions/setup-pnpm-store-cache/setup-pnpm.sh",
+      "utf8",
+    );
+    expect(setupPnpmAction).toContain('bash "$GITHUB_ACTION_PATH/setup-pnpm.sh"');
 
     expect(packageJson.packageManager).toMatch(/^pnpm@\d+\.\d+\.\d+\+sha512\.[a-f0-9]+$/u);
     expect(setupPnpmAction).toContain("Setup pnpm from packageManager");
     expect(setupPnpmAction).toContain("PACKAGE_MANAGER_FILE: ${{ inputs.package-manager-file }}");
-    expect(setupPnpmAction).toContain('case "$package_manager" in');
-    expect(setupPnpmAction).toContain('corepack prepare "$package_manager" --activate');
+    expect(setupPnpmScript).toContain('case "$package_manager" in');
+    expect(setupPnpmScript).toContain('corepack prepare "$package_manager" --activate');
     expect(setupPnpmAction).toContain(
       "if: ${{ inputs.cache-mode != 'off' && runner.os != 'Windows' }}",
     );
@@ -4486,8 +4491,8 @@ NODE
     expect(setupPnpmAction).not.toContain("shasum");
     expect(setupPnpmAction).not.toContain("PNPM_VERSION_INPUT");
     expect(setupPnpmAction).not.toContain("version: ${{ inputs.pnpm-version }}");
-    expect(setupPnpmAction).toContain('corepack enable --install-directory "$PNPM_HOME"');
-    expect(setupPnpmAction).toContain('echo "PNPM_HOME=$PNPM_HOME" >> "$GITHUB_ENV"');
+    expect(setupPnpmScript).toContain('corepack enable --install-directory "$PNPM_HOME"');
+    expect(setupPnpmScript).toContain('echo "PNPM_HOME=$PNPM_HOME" >> "$GITHUB_ENV"');
 
     const setupReleaseHarnessAction = readFileSync(SETUP_RELEASE_HARNESS_ACTION, "utf8");
     const setupHarnessPackageManagerIndex = setupReleaseHarnessAction.indexOf(
@@ -4526,7 +4531,7 @@ NODE
       runs: { steps: WorkflowStep[] };
     };
     const step = action.runs.steps.find(
-      (candidate) => candidate.name === "Resolve pnpm store path",
+      (candidate) => candidate.name === "Setup pnpm from packageManager",
     );
     expect(step?.run).toBeDefined();
 
@@ -4537,9 +4542,12 @@ NODE
     const outputPath = join(root, "output");
     const storePath = join(root, "store");
     mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(root, "package.json"), JSON.stringify({ packageManager: "pnpm@12.3.4" }));
+    writeFileSync(join(binDir, "corepack"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     writeFileSync(
       join(binDir, "pnpm"),
       `#!/bin/sh
+if [ "$1" = "-v" ]; then printf '12.3.4\\n'; exit 0; fi
 attempts=$(cat "$MOCK_ATTEMPTS" 2>/dev/null || printf 0)
 attempts=$((attempts + 1))
 printf '%s' "$attempts" > "$MOCK_ATTEMPTS"
@@ -4564,6 +4572,13 @@ printf '%s\\n' "$1" >> "$MOCK_SLEEPS"
       env: {
         ...process.env,
         GITHUB_OUTPUT: outputPath,
+        GITHUB_ACTION_PATH: resolve(dirname(SETUP_PNPM_STORE_CACHE_ACTION)),
+        PACKAGE_MANAGER_FILE: join(root, "package.json"),
+        CACHE_MODE: "restore",
+        RUNNER_OS: "Linux",
+        REQUESTED_NODE_VERSION: "",
+        NODE_VERSION: "",
+        PNPM_HOME: "",
         MOCK_ATTEMPTS: attemptsPath,
         MOCK_SLEEPS: sleepPath,
         MOCK_STORE_PATH: storePath,
@@ -4950,10 +4965,14 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(workflow).toContain("name: Package integrity");
     expect(workflow).toContain('node scripts/check-openclaw-package-tarball.mjs "$package"');
     expect(workflow).toContain('[[ "$actual_sha256" == "$EXPECTED_PACKAGE_SHA256" ]]');
-    expect(workflow).toContain("needs: [resolve_package, package_integrity]");
+    expect(workflow).toContain("needs: [candidate_execution, resolve_package, package_integrity]");
     expect(workflow).toContain("package_integrity=${PACKAGE_INTEGRITY_RESULT}");
     const npm12Job = workflowJob(PACKAGE_ACCEPTANCE_WORKFLOW, "npm_12_install_sh");
-    expect(jobNeeds(npm12Job)).toEqual(["resolve_package", "package_integrity"]);
+    expect(jobNeeds(npm12Job)).toEqual([
+      "candidate_execution",
+      "resolve_package",
+      "package_integrity",
+    ]);
     expect(npm12Job.permissions).toEqual({ actions: "read", contents: "read" });
     const npm12Step = workflowStep(npm12Job, "Run install.sh with npm 12");
     expect(npm12Step.run).toContain("npm@12.0.2");
@@ -5167,9 +5186,12 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(npmTelegramWorkflow).toContain("Download prerelease plugin registry artifact");
     expect(npmTelegramWorkflow).toContain("--required-packages-json '[\"@openclaw/codex\"]'");
     expect(packageTelegram.secrets).toEqual({
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}",
-      OPENCLAW_QA_CONVEX_SECRET_CI: "${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}",
-      OPENCLAW_QA_CONVEX_SITE_URL: "${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}",
+      OPENAI_API_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      OPENCLAW_QA_CONVEX_SECRET_CI:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}",
+      OPENCLAW_QA_CONVEX_SITE_URL:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}",
     });
     expect(dockerAcceptance.with?.ref).toBe(
       "${{ needs.resolve_package.outputs.package_source_sha || inputs.workflow_ref }}",
@@ -5185,12 +5207,14 @@ test "$package_manager" = "pnpm@12.1.0"
     expect(packageTelegram.with?.prepublish_plugin_registry_artifact_name).not.toContain(
       "startsWith(",
     );
-    expect(npm12Install.if).toBe("inputs.suite_profile != 'telegram'");
+    expect(npm12Install.if).toBe(
+      "needs.candidate_execution.result == 'success' && (inputs.suite_profile != 'telegram')",
+    );
     expect(dockerAcceptance.if).toBe(
-      "inputs.suite_profile != 'telegram' && inputs.shared_image_policy == 'no-push-artifact'",
+      "needs.candidate_execution.result == 'success' && (inputs.suite_profile != 'telegram' && inputs.shared_image_policy == 'no-push-artifact')",
     );
     expect(dockerAcceptanceRegistry.if).toBe(
-      "inputs.suite_profile != 'telegram' && inputs.shared_image_policy == 'existing-only'",
+      "needs.candidate_execution.result == 'success' && (inputs.suite_profile != 'telegram' && inputs.shared_image_policy == 'existing-only')",
     );
     expect(parsedWorkflow.permissions).toEqual({
       actions: "read",
@@ -6130,7 +6154,7 @@ describe("package artifact reuse", () => {
     );
     expect(workflowStep(prepareDockerImage, setupCandidateStepName)).toMatchObject({
       if: "(steps.plan.outputs.needs_package == '1' && steps.package_source.outputs.required == 'true') || (inputs.enable_prepublish_plugin_registry && steps.plan.outputs.needs_prepublish_plugin_registry == '1' && inputs.prepublish_plugin_registry_artifact_id == '')",
-      uses: "./.github/actions/setup-node-env",
+      uses: "./.candidate-setup/.github/actions/setup-node-env",
     });
     expect(workflowStep(prepareDockerImage, planStepName).env).toEqual({
       INCLUDE_OPENWEBUI: "${{ inputs.include_openwebui }}",
@@ -6524,8 +6548,8 @@ describe("package artifact reuse", () => {
     });
     expect(producer.outputs).not.toHaveProperty("candidate_evidence_json");
     expect(binder).toMatchObject({
-      if: "inputs.emit_candidate_evidence && needs.prepare_docker_e2e_image.result == 'success'",
-      needs: ["validate_selected_ref", "prepare_docker_e2e_image"],
+      if: "needs.candidate_execution.result == 'success' && (inputs.emit_candidate_evidence && needs.prepare_docker_e2e_image.result == 'success')",
+      needs: ["candidate_execution", "validate_selected_ref", "prepare_docker_e2e_image"],
       outputs: {
         candidate_evidence_json: "${{ steps.candidate_binding.outputs.json }}",
       },
@@ -6576,7 +6600,7 @@ describe("package artifact reuse", () => {
     expect(producerCheckouts.map(({ uses, with: inputs }) => ({ inputs, uses }))).toEqual([
       {
         inputs: {
-          ref: "${{ needs.validate_selected_ref.outputs.selected_sha }}",
+          ref: "${{ needs.candidate_execution.outputs.candidate_sha }}",
           "fetch-depth": 1,
           "persist-credentials": false,
         },
@@ -6589,6 +6613,16 @@ describe("package artifact reuse", () => {
           "fetch-depth": 1,
           path: ".release-harness",
           "persist-credentials": false,
+        },
+        uses: checkoutAction,
+      },
+      {
+        inputs: {
+          repository: "${{ needs.candidate_execution.outputs.workflow_repository }}",
+          ref: "${{ needs.candidate_execution.outputs.workflow_sha }}",
+          path: ".candidate-setup",
+          "persist-credentials": false,
+          "sparse-checkout": ".github/actions",
         },
         uses: checkoutAction,
       },
@@ -7491,13 +7525,12 @@ describe("package artifact reuse", () => {
     expect(providerVerifier).toContain('model: "claude-haiku-4-5"');
     expect(providerVerifier).toContain("validateResponse:");
     expect(providerVerifier).not.toContain("ANTHROPIC_OAUTH_TOKEN");
-    for (const workflow of [
-      reusableWorkflow,
-      releaseChecksWorkflow,
-      scheduledWorkflow,
-      packageAcceptanceWorkflow,
-      testboxWorkflow,
-    ]) {
+    for (const workflow of [reusableWorkflow, releaseChecksWorkflow, packageAcceptanceWorkflow]) {
+      expect(workflow).toContain(
+        "FACTORY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FACTORY_API_KEY || '' }}",
+      );
+    }
+    for (const workflow of [scheduledWorkflow, testboxWorkflow]) {
       expect(workflow).toContain("FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}");
     }
     for (const step of githubBackedTestboxProviderSteps) {
@@ -7512,7 +7545,9 @@ describe("package artifact reuse", () => {
     }
     for (const [jobName, job] of Object.entries(readWorkflow(LIVE_E2E_WORKFLOW).jobs ?? {})) {
       if (job.steps?.some((step) => step.run === `bash ${CI_HYDRATE_LIVE_AUTH_SCRIPT}`)) {
-        expect(job.env?.DEEPSEEK_API_KEY, jobName).toBe("${{ secrets.DEEPSEEK_API_KEY }}");
+        expect(job.env?.DEEPSEEK_API_KEY, jobName).toBe(
+          "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}",
+        );
       }
     }
     for (const workflowPath of [RELEASE_CHECKS_WORKFLOW, PACKAGE_ACCEPTANCE_WORKFLOW]) {
@@ -7522,7 +7557,8 @@ describe("package artifact reuse", () => {
           job.uses === `./${PACKAGE_ACCEPTANCE_WORKFLOW}`
         ) {
           expect(job.secrets, `${workflowPath}:${jobName}`).toMatchObject({
-            DEEPSEEK_API_KEY: "${{ secrets.DEEPSEEK_API_KEY }}",
+            DEEPSEEK_API_KEY:
+              "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}",
           });
         }
       }
@@ -8602,10 +8638,10 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
       "candidate_artifact_json cannot be combined with release_package_spec.",
     );
     expect(workflow).toContain(
-      "live_repo_e2e_release_checks:\n    name: Run repo/live E2E validation\n    needs: [resolve_target]",
+      "live_repo_e2e_release_checks:\n    name: Run repo/live E2E validation\n    needs: [candidate_execution, resolve_target]",
     );
     expect(workflow).toContain(
-      "docker_e2e_release_checks:\n    name: Run Docker release-path validation\n    needs: [resolve_target, prepare_release_package]",
+      "docker_e2e_release_checks:\n    name: Run Docker release-path validation\n    needs: [candidate_execution, resolve_target, prepare_release_package]",
     );
     expect(workflow).toContain("include_release_path_suites: false");
     expect(workflow).toContain("include_release_path_suites: true");
@@ -8662,13 +8698,17 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
       telegram_advisory: true,
     });
     expect(workflow).not.toContain("telegram_scenarios:");
-    expect(workflow).toContain("ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}");
-    expect(workflow).toContain("ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}");
     expect(workflow).toContain(
-      "OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}",
+      "ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}",
     );
     expect(workflow).toContain(
-      "OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}",
+      "ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}",
+    );
+    expect(workflow).toContain(
+      "OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}",
+    );
+    expect(workflow).toContain(
+      "OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}",
     );
     expect(workflow).toContain("rerun_group:");
     expect(workflow).toContain("live_suite_filter:");
@@ -8689,8 +8729,12 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
     expect(workflow).toContain(
       "live_suite_filter: ${{ needs.resolve_target.outputs.repo_live_suite_filter }}",
     );
-    expect(workflow).toContain("if: needs.resolve_target.outputs.package_required == 'true'");
-    expect(workflow).toContain("if: needs.resolve_target.outputs.docker_required == 'true'");
+    expect(workflow).toContain(
+      "if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.package_required == 'true')",
+    );
+    expect(workflow).toContain(
+      "if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.docker_required == 'true')",
+    );
     expect(workflow).toContain(
       'if [[ "$release_profile" == "stable" || "$release_profile" == "full" ]]; then\n            run_release_soak=true',
     );
@@ -8728,7 +8772,7 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
       "validate_live_provider_suites",
     ]) {
       expect(workflowJob(LIVE_E2E_WORKFLOW, jobName).env?.ANTHROPIC_OAUTH_TOKEN).toBe(
-        "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}",
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}",
       );
     }
   });
@@ -8741,13 +8785,16 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
 
     expect(releaseJob.uses).toBe("./.github/workflows/qa-live-transports-convex.yml");
     expect(releaseJob.secrets).toEqual({
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}",
-      OPENCLAW_QA_CONVEX_SECRET_CI: "${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}",
-      OPENCLAW_QA_CONVEX_SITE_URL: "${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}",
+      OPENAI_API_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      OPENCLAW_QA_CONVEX_SECRET_CI:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}",
+      OPENCLAW_QA_CONVEX_SITE_URL:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}",
     });
     expect(releaseJob.permissions).toEqual({ contents: "read", "pull-requests": "read" });
     expect(releaseJob.if).toBe(
-      "needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_matrix_enabled == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_matrix_enabled == 'true')",
     );
     expect(releaseJob.with).toMatchObject({
       expected_sha: "${{ needs.resolve_target.outputs.revision }}",
@@ -8760,17 +8807,17 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
     const manualScenarioGuard =
       "(github.event_name != 'workflow_dispatch' || inputs.scenario == '')";
     expect(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "run_mock_parity").if).toBe(
-      `(inputs.expected_sha == '' || inputs.run_mock_parity) && ${manualScenarioGuard}`,
+      `needs.candidate_execution.result == 'success' && ((inputs.expected_sha == '' || inputs.run_mock_parity) && ${manualScenarioGuard})`,
     );
     expect(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "run_live_matrix").if).toBe(
-      `(inputs.expected_sha == '' || inputs.run_matrix) && ${manualScenarioGuard}`,
+      `needs.candidate_execution.result == 'success' && ((inputs.expected_sha == '' || inputs.run_matrix) && ${manualScenarioGuard})`,
     );
     expect(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "run_live_telegram").if).toBe(
-      "inputs.expected_sha == '' || inputs.run_telegram",
+      "needs.candidate_execution.result == 'success' && (inputs.expected_sha == '' || inputs.run_telegram)",
     );
     for (const channel of ["discord", "whatsapp", "slack"]) {
       expect(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, `run_live_${channel}`).if).toBe(
-        `(inputs.expected_sha == '' || inputs.run_${channel}) && ${manualScenarioGuard}`,
+        `needs.candidate_execution.result == 'success' && ((inputs.expected_sha == '' || inputs.run_${channel}) && ${manualScenarioGuard})`,
       );
     }
     expect(releaseWorkflow).not.toContain("qa_live_matrix_release_checks");
@@ -8806,8 +8853,10 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
     expect(matrixJob.strategy).toBeUndefined();
     expect(workflowStep(matrixJob, "Run Matrix live lane").env).toEqual({
       FAIL_FAST: "${{ inputs.fail_fast }}",
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}",
-      OPENCLAW_LIVE_OPENAI_KEY: "${{ secrets.OPENAI_API_KEY }}",
+      OPENAI_API_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      OPENCLAW_LIVE_OPENAI_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
       OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1",
     });
     expect(releaseTelegramWorkflow).toContain(
@@ -8820,13 +8869,16 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
 
     expect(releaseJob.uses).toBe("./.github/workflows/qa-live-transports-convex.yml");
     expect(releaseJob.secrets).toEqual({
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}",
-      OPENCLAW_QA_CONVEX_SECRET_CI: "${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}",
-      OPENCLAW_QA_CONVEX_SITE_URL: "${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}",
+      OPENAI_API_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      OPENCLAW_QA_CONVEX_SECRET_CI:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}",
+      OPENCLAW_QA_CONVEX_SITE_URL:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}",
     });
     expect(releaseJob.permissions).toEqual({ contents: "read", "pull-requests": "read" });
     expect(releaseJob.if).toBe(
-      "needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_buzz_enabled == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_buzz_enabled == 'true')",
     );
     expect(releaseJob.with).toMatchObject({
       buzz_scenario: "channel-canary,channel-mention-gating",
@@ -8834,7 +8886,7 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
       run_buzz: true,
     });
     const buzzJob = workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "run_live_buzz");
-    expect(buzzJob.if).toBe("inputs.run_buzz");
+    expect(buzzJob.if).toBe("needs.candidate_execution.result == 'success' && (inputs.run_buzz)");
     const resolveBuzz = workflowStep(buzzJob, "Resolve Buzz QA runner");
     expect(resolveBuzz.run).toContain('runner?.commandName === "buzz"');
     expect(resolveBuzz.run).toContain("selected ref does not declare the Buzz QA runner");
@@ -8881,8 +8933,13 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
     );
 
     for (const [jobName, enabledOutput] of liveJobs) {
+      const selected = `${selection} && needs.resolve_target.outputs.${enabledOutput} == 'true'`;
+      const authority =
+        jobName === "qa_live_telegram_release_checks"
+          ? `needs.candidate_execution.outputs.privileged == 'true' && (${selected})`
+          : selected;
       expect(workflowJob(RELEASE_CHECKS_WORKFLOW, jobName).if).toBe(
-        `${selection} && needs.resolve_target.outputs.${enabledOutput} == 'true'`,
+        `needs.candidate_execution.result == 'success' && (${authority})`,
       );
     }
 
@@ -9239,6 +9296,7 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
       "${{ matrix.lane }}",
     );
     expect(collectorJob.needs).toEqual([
+      "candidate_execution",
       "resolve_target",
       "qa_lab_runtime_pair_lane_release_checks",
     ]);
@@ -9464,7 +9522,7 @@ printf '%s\\n' "$DEEPSEEK_API_KEY" "$DEEPINFRA_API_KEY"`,
     const setupNode = workflowStep(job, "Setup Node environment");
 
     expect(job.if).toBe(
-      "inputs.include_openwebui && inputs.docker_lanes == '' && (inputs.release_test_profile == 'stable' || inputs.release_test_profile == 'full')",
+      "needs.candidate_execution.result == 'success' && (inputs.include_openwebui && inputs.docker_lanes == '' && (inputs.release_test_profile == 'stable' || inputs.release_test_profile == 'full'))",
     );
     expect(job.env?.OPENCLAW_DOCKER_ALL_RELEASE_PROFILE).toBe("${{ inputs.release_test_profile }}");
     expect(setupNode.with).toMatchObject({
@@ -11553,6 +11611,7 @@ promote_windows_release_assets
     ).toBeUndefined();
     expect(clawHubApproval.environment).toBe("clawhub-plugin-release");
     expect(clawHubPublish.needs).toEqual([
+      "candidate_execution",
       "preview_plugins_clawhub",
       "pack_plugins_clawhub_artifacts",
       "seal_clawhub_transactions",
@@ -11896,7 +11955,7 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
         pluginPrereleaseTimeoutFloor(pluginPrerelease, liveE2e, profile),
       ]),
     ) as Record<(typeof profiles)[number], number>;
-    expect(pluginChildTimeouts).toEqual({ beta: 170, stable: 170, full: 200 });
+    expect(pluginChildTimeouts).toEqual({ beta: 180, stable: 180, full: 210 });
     for (const profile of profiles) {
       expect(
         diagnosticDrainTimeout - pluginChildTimeouts[profile],
@@ -11909,17 +11968,25 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       "package_acceptance_release_checks",
     );
     expect(jobNeeds(workflowJob(RELEASE_CHECKS_WORKFLOW, "prepare_release_package"))).toEqual([
+      "candidate_execution",
       "resolve_target",
     ]);
-    expect(jobNeeds(releasePackageJob)).toEqual(["resolve_target", "prepare_release_package"]);
+    expect(jobNeeds(releasePackageJob)).toEqual([
+      "candidate_execution",
+      "resolve_target",
+      "prepare_release_package",
+    ]);
     expect(jobNeeds(workflowJob(PACKAGE_ACCEPTANCE_WORKFLOW, "package_integrity"))).toEqual([
+      "candidate_execution",
       "resolve_package",
     ]);
     expect(jobNeeds(workflowJob(PACKAGE_ACCEPTANCE_WORKFLOW, "docker_acceptance"))).toEqual([
+      "candidate_execution",
       "resolve_package",
       "package_integrity",
     ]);
     expect(jobNeeds(workflowJob(LIVE_E2E_WORKFLOW, "prepare_docker_e2e_image"))).toEqual([
+      "candidate_execution",
       "validate_selected_ref",
     ]);
     expect(jobNeeds(workflowJob(LIVE_E2E_WORKFLOW, "validate_docker_lanes"))).toEqual(
@@ -11938,9 +12005,14 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       profiles.map((profile) => [
         profile,
         [
+          timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], profile),
           timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], profile),
           timeoutForProfile(
             releaseChecks.jobs?.prepare_release_package?.["timeout-minutes"],
+            profile,
+          ),
+          timeoutForProfile(
+            packageAcceptance.jobs?.candidate_execution?.["timeout-minutes"],
             profile,
           ),
           timeoutForProfile(packageAcceptance.jobs?.resolve_package?.["timeout-minutes"], profile),
@@ -11948,6 +12020,7 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
             packageAcceptance.jobs?.package_integrity?.["timeout-minutes"],
             profile,
           ),
+          timeoutForProfile(liveE2e.jobs?.candidate_execution?.["timeout-minutes"], profile),
           timeoutForProfile(liveE2e.jobs?.validate_selected_ref?.["timeout-minutes"], profile),
           timeoutForProfile(liveE2e.jobs?.prepare_docker_e2e_image?.["timeout-minutes"], profile),
           Math.max(
@@ -11963,9 +12036,9 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       ]),
     ) as Record<(typeof profiles)[number], number[]>;
     expect(releasePackagePaths).toEqual({
-      beta: [30, 15, 60, 10, 30, 60, 90, 5, 5],
-      stable: [30, 15, 60, 10, 30, 60, 90, 5, 5],
-      full: [30, 15, 60, 10, 30, 90, 90, 5, 5],
+      beta: [10, 30, 15, 10, 60, 10, 10, 30, 60, 90, 5, 5],
+      stable: [10, 30, 15, 10, 60, 10, 10, 30, 60, 90, 5, 5],
+      full: [10, 30, 15, 10, 60, 10, 10, 30, 90, 90, 5, 5],
     });
     const releaseChecksParent = workflowJob(
       FULL_RELEASE_VALIDATION_WORKFLOW,
@@ -11977,7 +12050,7 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       stable: releasePackagePaths.stable.reduce((total, timeout) => total + timeout, 0),
       full: releasePackagePaths.full.reduce((total, timeout) => total + timeout, 0),
     };
-    expect(releasePackageTimeouts).toEqual({ beta: 305, stable: 305, full: 335 });
+    expect(releasePackageTimeouts).toEqual({ beta: 335, stable: 335, full: 365 });
     for (const [profile, childTimeout] of Object.entries(releasePackageTimeouts)) {
       expect(childTimeout, `release-package:${profile}`).toBeLessThanOrEqual(
         diagnosticDrainTimeout,
@@ -11990,23 +12063,28 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
 
     const releaseSummary = workflowJob(RELEASE_CHECKS_WORKFLOW, "summary");
     const releaseCrossOs = workflowJob(RELEASE_CHECKS_WORKFLOW, "cross_os_release_checks");
-    expect(jobNeeds(releaseCrossOs)).toEqual(["resolve_target", "prepare_release_package"]);
+    expect(jobNeeds(releaseCrossOs)).toEqual([
+      "candidate_execution",
+      "resolve_target",
+      "prepare_release_package",
+    ]);
     expect(jobNeeds(workflowJob(CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW, "prepare"))).toEqual([]);
     expect(
       jobNeeds(workflowJob(CROSS_OS_RELEASE_CHECKS_REUSABLE_WORKFLOW, "cross_os_release_checks")),
     ).toEqual(["prepare"]);
     expect(jobNeeds(releaseSummary)).toContain("cross_os_release_checks");
     const releaseCrossOsPath = [
+      timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.prepare_release_package?.["timeout-minutes"], "stable"),
       timeoutForProfile(crossOs.jobs?.prepare?.["timeout-minutes"], "stable"),
       timeoutForProfile(crossOs.jobs?.cross_os_release_checks?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "stable"),
     ];
-    expect(releaseCrossOsPath).toEqual([30, 15, 90, 60, 5]);
+    expect(releaseCrossOsPath).toEqual([10, 30, 15, 90, 60, 5]);
 
     const releaseInstall = workflowJob(RELEASE_CHECKS_WORKFLOW, "install_smoke_release_checks");
-    expect(jobNeeds(releaseInstall)).toEqual(["resolve_target"]);
+    expect(jobNeeds(releaseInstall)).toEqual(["candidate_execution", "resolve_target"]);
     expect(jobNeeds(workflowJob(INSTALL_SMOKE_REUSABLE_WORKFLOW, "root_dockerfile_image"))).toEqual(
       ["preflight"],
     );
@@ -12040,6 +12118,7 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
     ]);
     expect(jobNeeds(releaseSummary)).toContain("install_smoke_release_checks");
     const releaseInstallPath = [
+      timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "stable"),
       timeoutForProfile(installSmoke.jobs?.preflight?.["timeout-minutes"], "stable"),
       Math.max(
@@ -12056,8 +12135,9 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       timeoutForProfile(installSmoke.jobs?.installer_smoke?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "stable"),
     ];
-    expect(releaseInstallPath).toEqual([30, 15, 75, 120, 5, 5]);
+    expect(releaseInstallPath).toEqual([10, 30, 15, 75, 120, 5, 5]);
     const releaseInstallNonrootPath = [
+      timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "stable"),
       timeoutForProfile(installSmoke.jobs?.preflight?.["timeout-minutes"], "stable"),
       Math.max(
@@ -12074,26 +12154,30 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       timeoutForProfile(installSmoke.jobs?.installer_smoke?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "stable"),
     ];
-    expect(releaseInstallNonrootPath).toEqual([30, 15, 75, 60, 5, 5]);
+    expect(releaseInstallNonrootPath).toEqual([10, 30, 15, 75, 60, 5, 5]);
 
     const releaseQaLive = workflowJob(RELEASE_CHECKS_WORKFLOW, "qa_live_release_checks");
-    expect(jobNeeds(releaseQaLive)).toEqual(["resolve_target"]);
+    expect(jobNeeds(releaseQaLive)).toEqual(["candidate_execution", "resolve_target"]);
     expect(jobNeeds(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "validate_selected_ref"))).toEqual([
+      "candidate_execution",
       "authorize_actor",
     ]);
     expect(jobNeeds(workflowJob(QA_LIVE_TRANSPORTS_WORKFLOW, "run_live_matrix"))).toEqual([
+      "candidate_execution",
       "authorize_actor",
       "validate_selected_ref",
     ]);
     expect(jobNeeds(releaseSummary)).toContain("qa_live_release_checks");
     const releaseQaLivePath = [
+      timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "stable"),
+      timeoutForProfile(qaLive.jobs?.candidate_execution?.["timeout-minutes"], "stable"),
       timeoutForProfile(qaLive.jobs?.authorize_actor?.["timeout-minutes"], "stable"),
       timeoutForProfile(qaLive.jobs?.validate_selected_ref?.["timeout-minutes"], "stable"),
       timeoutForProfile(qaLive.jobs?.run_live_matrix?.["timeout-minutes"], "stable"),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "stable"),
     ];
-    expect(releaseQaLivePath).toEqual([30, 10, 30, 90, 5]);
+    expect(releaseQaLivePath).toEqual([10, 30, 10, 10, 30, 90, 5]);
 
     for (const [pathName, path] of [
       ["cross-os", releaseCrossOsPath],
@@ -12109,18 +12193,19 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
         `release-checks:${pathName}`,
       ).toBeGreaterThanOrEqual(60);
     }
-    expect(releaseCrossOsPath.reduce((total, timeout) => total + timeout, 0)).toBe(200);
-    expect(releaseInstallPath.reduce((total, timeout) => total + timeout, 0)).toBe(250);
-    expect(releaseInstallNonrootPath.reduce((total, timeout) => total + timeout, 0)).toBe(190);
-    expect(releaseQaLivePath.reduce((total, timeout) => total + timeout, 0)).toBe(165);
+    expect(releaseCrossOsPath.reduce((total, timeout) => total + timeout, 0)).toBe(210);
+    expect(releaseInstallPath.reduce((total, timeout) => total + timeout, 0)).toBe(260);
+    expect(releaseInstallNonrootPath.reduce((total, timeout) => total + timeout, 0)).toBe(200);
+    expect(releaseQaLivePath.reduce((total, timeout) => total + timeout, 0)).toBe(185);
 
     expect(
       jobNeeds(workflowJob(RELEASE_CHECKS_WORKFLOW, "qa_live_telegram_release_checks")),
-    ).toEqual(["resolve_target"]);
+    ).toEqual(["candidate_execution", "resolve_target"]);
     expect(jobNeeds(workflowJob(RELEASE_CHECKS_WORKFLOW, "summary"))).toContain(
       "qa_live_telegram_release_checks",
     );
     const releaseTelegramPath = [
+      timeoutForProfile(releaseChecks.jobs?.candidate_execution?.["timeout-minutes"], "beta"),
       timeoutForProfile(releaseChecks.jobs?.resolve_target?.["timeout-minutes"], "beta"),
       timeoutForProfile(
         releaseChecks.jobs?.qa_live_telegram_release_checks?.["timeout-minutes"],
@@ -12128,12 +12213,12 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       ),
       timeoutForProfile(releaseChecks.jobs?.summary?.["timeout-minutes"], "beta"),
     ];
-    expect(releaseTelegramPath).toEqual([30, 210, 5]);
+    expect(releaseTelegramPath).toEqual([10, 30, 210, 5]);
     const releaseTelegramTimeout = releaseTelegramPath.reduce(
       (total, timeout) => total + timeout,
       0,
     );
-    expect(releaseTelegramTimeout).toBe(245);
+    expect(releaseTelegramTimeout).toBe(255);
     expect(diagnosticDrainTimeout - releaseTelegramTimeout).toBeGreaterThanOrEqual(60);
 
     const npmTelegramChildTimeout = timeoutForProfile(
@@ -12148,29 +12233,47 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
     const performanceSource = workflowJob(PERFORMANCE_WORKFLOW, "source_performance");
     const performancePublish = workflowJob(PERFORMANCE_WORKFLOW, "publish");
     const performanceArtifactGuard = workflowJob(PERFORMANCE_WORKFLOW, "artifact_only_guard");
-    expect(jobNeeds(performanceKova)).toEqual(["resolve_target"]);
-    expect(jobNeeds(performanceSource)).toEqual(["resolve_target"]);
-    expect(jobNeeds(performancePublish)).toEqual(["resolve_target", "kova", "source_performance"]);
-    expect(jobNeeds(performanceArtifactGuard)).toEqual(["resolve_target", "kova", "publish"]);
+    expect(jobNeeds(performanceKova)).toEqual(["candidate_execution", "resolve_target"]);
+    expect(jobNeeds(performanceSource)).toEqual(["candidate_execution", "resolve_target"]);
+    expect(jobNeeds(performancePublish)).toEqual([
+      "candidate_execution",
+      "resolve_target",
+      "kova",
+      "source_performance",
+    ]);
+    expect(jobNeeds(performanceArtifactGuard)).toEqual([
+      "candidate_execution",
+      "resolve_target",
+      "kova",
+      "publish",
+    ]);
     expect(performancePublish.if).toContain("inputs.publish_reports == true");
     expect(performanceArtifactGuard.if).toContain("inputs.publish_reports != true");
     expect(timeoutForProfile(performanceSource["timeout-minutes"], "beta")).toBeLessThanOrEqual(
       timeoutForProfile(performanceKova["timeout-minutes"], "beta"),
     );
     const performanceArtifactPath = [
+      timeoutForProfile(
+        workflowJob(PERFORMANCE_WORKFLOW, "candidate_execution")["timeout-minutes"],
+        "beta",
+      ),
       timeoutForProfile(performanceResolve["timeout-minutes"], "beta"),
       timeoutForProfile(performanceKova["timeout-minutes"], "beta"),
       timeoutForProfile(performanceArtifactGuard["timeout-minutes"], "beta"),
     ];
     const performancePublishPath = [
+      timeoutForProfile(
+        workflowJob(PERFORMANCE_WORKFLOW, "candidate_execution")["timeout-minutes"],
+        "beta",
+      ),
       timeoutForProfile(performanceResolve["timeout-minutes"], "beta"),
       timeoutForProfile(performanceKova["timeout-minutes"], "beta"),
       timeoutForProfile(performancePublish["timeout-minutes"], "beta"),
     ];
-    expect(performanceArtifactPath).toEqual([10, 240, 5]);
-    expect(performancePublishPath).toEqual([10, 240, 30]);
-    expect(performanceArtifactPath.reduce((total, timeout) => total + timeout, 0)).toBe(255);
-    expect(performancePublishPath.reduce((total, timeout) => total + timeout, 0)).toBe(280);
+    expect(performanceArtifactPath).toEqual([10, 10, 240, 5]);
+    expect(performancePublishPath).toEqual([10, 10, 240, 30]);
+    expect(performanceArtifactPath.reduce((total, timeout) => total + timeout, 0)).toBe(265);
+    expect(performancePublishPath.reduce((total, timeout) => total + timeout, 0)).toBe(290);
     const performanceParent = workflowJob(FULL_RELEASE_VALIDATION_WORKFLOW, "performance");
     expect(performanceParent["timeout-minutes"]).toBe(15);
     expect(workflowStep(performanceParent, "Dispatch OpenClaw Performance").run).toContain(
@@ -12217,6 +12320,7 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       timeoutForProfile(fullRelease.jobs?.resolve_target?.["timeout-minutes"], "full"),
       timeoutForProfile(fullRelease.jobs?.evidence_reuse?.["timeout-minutes"], "full"),
       timeoutForProfile(fullReleaseCandidate.jobs?.discover?.["timeout-minutes"], "full"),
+      timeoutForProfile(liveE2e.jobs?.candidate_execution?.["timeout-minutes"], "full"),
       timeoutForProfile(liveE2e.jobs?.validate_selected_ref?.["timeout-minutes"], "full"),
       timeoutForProfile(liveE2e.jobs?.prepare_docker_e2e_image?.["timeout-minutes"], "full"),
       timeoutForProfile(
@@ -12226,9 +12330,9 @@ wait_for_run plugin-clawhub-new.yml 123 "${expectedSha}" || status=$?
       timeoutForProfile(candidateBinding["timeout-minutes"], "full"),
       timeoutForProfile(releaseChecksParent["timeout-minutes"], "full"),
     ];
-    expect(fullParentPath).toEqual([10, 10, 10, 30, 90, 15, 5, 15]);
+    expect(fullParentPath).toEqual([10, 10, 10, 10, 30, 90, 15, 5, 15]);
     const fullParentTimeoutFloor = fullParentPath.reduce((total, timeout) => total + timeout, 0);
-    expect(fullParentTimeoutFloor).toBe(185);
+    expect(fullParentTimeoutFloor).toBe(195);
     expect(FULL_RELEASE_WAIT_TIMEOUT_MINUTES).toBe(diagnosticDrainTimeout);
   });
 
@@ -12520,7 +12624,7 @@ esac
     );
     expect(clawHubPackTargetGuard.run).toContain('[[ ! "${TARGET_SHA}" =~ ^[a-f0-9]{40}$ ]]');
     expect(workflowStep(clawHubPackJob, "Checkout").with).toMatchObject({
-      ref: "${{ needs.preview_plugins_clawhub.outputs.ref_revision }}",
+      ref: "${{ needs.candidate_execution.outputs.candidate_sha }}",
       "fetch-depth": 1,
       "persist-credentials": false,
     });

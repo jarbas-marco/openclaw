@@ -2916,6 +2916,17 @@ jobs:
           test "$OWNER_PATH" = "$CI_GIT_OWNER"
           cmp "$OWNER_PATH" .ci-harness/.github/actions/git-owner/owner.py
           python3 -I -S "$OWNER_PATH" --git 0 --version
+      - name: Resolve downstream release protocol baseline
+        id: protocol_base
+        if: matrix.task == 'bundled-protocol'
+        env:
+          PROTOCOL_SINCE_BASE_SHA: ${{ needs.preflight.outputs.diff_base_revision }}
+          PROTOCOL_TARGET_SHA: ${{ needs.preflight.outputs.checkout_revision }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -I -S "$CI_GIT_OWNER" --policy .ci-harness/.github/actions/git-owner/protocol-release-base.py
+
       - name: Prepare release-gate ratchet merge tree
         if: (matrix.task == 'baseline-ratchets' || startsWith(matrix.task, 'release-lint-')) && github.event_name == 'workflow_dispatch' && inputs.release_gate
         env:
@@ -2976,6 +2987,7 @@ jobs:
         env:
           OPENCLAW_TEST_PROJECTS_PARALLEL: 3
           PROTOCOL_SINCE_BASE_SHA: ${{ needs.preflight.outputs.diff_base_revision }}
+          PROTOCOL_RELEASE_BASE_SHA: ${{ steps.protocol_base.outputs.sha }}
           RATCHET_PR_HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
           TASK: ${{ matrix.task }}
         shell: bash
@@ -2991,6 +3003,7 @@ jobs:
             bundled-protocol)
               pnpm test:bundled
               test "$(git rev-parse refs/remotes/origin/ci-ratchet-base^{commit})" = "$PROTOCOL_SINCE_BASE_SHA"
+              export PROTOCOL_SINCE_BASE_SHA="${PROTOCOL_RELEASE_BASE_SHA:-$PROTOCOL_SINCE_BASE_SHA}"
               pnpm protocol:check
               ;;
             contracts-plugins-ci-routing)

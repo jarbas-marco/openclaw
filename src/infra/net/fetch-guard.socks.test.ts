@@ -3,7 +3,9 @@ import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { Readable } from "node:stream";
 import { setImmediate } from "node:timers/promises";
+import { consumeResponseBytes } from "@openclaw/normalization-core";
 import {
   buildConnector,
   fetch as undiciFetch,
@@ -36,6 +38,32 @@ import { createHttp1EnvHttpProxyAgent, createHttp1ProxyAgent } from "./undici-ru
 
 const TARGET_URL = `https://${TARGET_HOST}/media`;
 
+async function readFixturePayload(
+  body: {
+    getReader(): Pick<ReadableStreamDefaultReader<Uint8Array>, "read" | "cancel" | "releaseLock">;
+  } | null,
+): Promise<string> {
+  if (!body) {
+    return "";
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  try {
+    const result = await consumeResponseBytes({
+      maxBytes: Buffer.byteLength(PAYLOAD),
+      read: () => reader.read(),
+      onChunk: (chunk) => chunks.push(chunk),
+      onLimit: () => reader.cancel(),
+    });
+    if (result.truncated) {
+      throw new Error("Proxy fixture body exceeded its expected payload size");
+    }
+    return Buffer.concat(chunks).toString("utf8");
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 async function fetchPayload(
   dispatcher: ReturnType<typeof createHttp1ProxyAgent>,
   protocolProof?: Promise<void>,
@@ -44,7 +72,7 @@ async function fetchPayload(
     await Promise.all([
       undiciFetch(TARGET_URL, { dispatcher, signal: AbortSignal.timeout(5_000) }).then(
         async (response) => {
-          expect(await response.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
         },
       ),
       protocolProof,
@@ -167,7 +195,7 @@ describe("SOCKS proxy protocol boundaries", () => {
           if (mode === "forward-http") {
             try {
               const response = await undiciFetch(`http://${TARGET_HOST}/media`, { dispatcher });
-              expect(await response.text()).toBe(PAYLOAD);
+              expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
             } finally {
               await dispatcher.destroy();
             }
@@ -438,7 +466,7 @@ describe("SOCKS proxy protocol boundaries", () => {
             method: "GET",
             headers: { Authorization: "Bearer fixture-origin-only" },
           });
-          expect(await response.body.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(Readable.toWeb(response.body))).toBe(PAYLOAD);
           expect(connections).toEqual([`socks:${TARGET_HOST}`]);
         } finally {
           await dispatcher.destroy();
@@ -495,7 +523,7 @@ describe("SOCKS proxy protocol boundaries", () => {
       try {
         for (const url of [`http://${TARGET_HOST}/media`, TARGET_URL]) {
           const response = await undiciFetch(url, { dispatcher });
-          expect(await response.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
         }
         expect(connections).toEqual(
           (managedHop === "http" ? ["https", "socks"] : ["socks", "https"]).map(
@@ -536,10 +564,10 @@ describe("SOCKS proxy protocol boundaries", () => {
         );
         try {
           const plain = await undiciFetch(`http://${TARGET_HOST}/media`, { dispatcher });
-          expect(await plain.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(plain.body)).toBe(PAYLOAD);
           const protocol = tls ? waitForProxyProtocol() : undefined;
           const secure = await undiciFetch(TARGET_URL, { dispatcher });
-          expect(await secure.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(secure.body)).toBe(PAYLOAD);
           if (protocol) {
             expect(await protocol).toBe("http/1.1");
           }
@@ -615,7 +643,7 @@ describe("SOCKS proxy protocol boundaries", () => {
         ).rejects.toMatchObject({ cause: { code: "DEPTH_ZERO_SELF_SIGNED_CERT" } });
         expect(connections).toEqual([]);
         const response = await undiciFetch(TARGET_URL, { dispatcher });
-        expect(await response.text()).toBe(PAYLOAD);
+        expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
         expect(connections).toEqual([`https:${TARGET_HOST}`]);
       } finally {
         await dispatcher.destroy();
@@ -640,7 +668,7 @@ describe("SOCKS proxy protocol boundaries", () => {
               dispatcher,
               signal: AbortSignal.timeout(5_000),
             });
-            expect(await response.text()).toBe(PAYLOAD);
+            expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
             expect(connections).toEqual([]);
             expect(originRoutes).toEqual(["direct"]);
           } finally {
@@ -696,7 +724,7 @@ describe("SOCKS proxy protocol boundaries", () => {
           });
           await expect(
             undiciFetch(TARGET_URL, { dispatcher, signal: AbortSignal.timeout(5_000) }).then(
-              (second) => second.text(),
+              (second) => readFixturePayload(second.body),
             ),
           ).rejects.toMatchObject({ cause: { code: "UND_ERR_MAX_ORIGINS_REACHED" } });
           expect(originRoutes).toEqual(["proxy"]);
@@ -754,7 +782,7 @@ describe("SOCKS proxy protocol boundaries", () => {
           throw new Error("expected configured proxy fetch");
         }
         const response = await fetch(`http://${TARGET_HOST}/media`);
-        expect(await response.text()).toBe(PAYLOAD);
+        expect(await readFixturePayload(response.body)).toBe(PAYLOAD);
         expect(connections).toEqual([`socks:${TARGET_HOST}`]);
       } finally {
         setGlobalDispatcher(previous);
@@ -812,7 +840,7 @@ describe("SOCKS proxy protocol boundaries", () => {
                 path: "/media",
                 method: "GET",
               });
-              expect(await response.body.text()).toBe(PAYLOAD);
+              expect(await readFixturePayload(Readable.toWeb(response.body))).toBe(PAYLOAD);
             }
             expect(originRoutes).toEqual(routes);
             expect(intercepted).toHaveBeenCalledTimes(3);
@@ -913,7 +941,7 @@ describe("SOCKS proxy protocol boundaries", () => {
         };
         const result = await fetchWithSsrFGuard({ ...options, url: TARGET_URL });
         try {
-          expect(await result.response.text()).toBe(PAYLOAD);
+          expect(await readFixturePayload(result.response.body)).toBe(PAYLOAD);
         } finally {
           await result.release();
         }

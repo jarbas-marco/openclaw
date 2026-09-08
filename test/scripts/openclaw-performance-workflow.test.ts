@@ -149,7 +149,7 @@ describe("OpenClaw performance workflow", () => {
       type: "string",
     });
     expect(benchmark?.if).toBe(
-      "${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair' }}",
+      "needs.candidate_execution.result == 'success' && (github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair')",
     );
     expect(benchmark?.["runs-on"]).toBe("ubuntu-24.04");
     expect(benchmark?.["timeout-minutes"]).toBe(180);
@@ -165,7 +165,7 @@ describe("OpenClaw performance workflow", () => {
       expect(checkout.with?.["fetch-depth"]).toBe(1);
     }
     expect(helper.with?.ref).toBe("${{ github.workflow_sha }}");
-    expect(candidate.with?.ref).toBe("${{ github.workflow_sha }}");
+    expect(candidate.with?.ref).toBe("${{ needs.candidate_execution.outputs.candidate_sha }}");
     expect(baseline.with?.ref).toBe("${{ inputs.baseline_ref }}");
     expect(run.run).toContain("scripts/vitest-pair-benchmark.mts");
     expect(run.run).toContain("--baseline-sha");
@@ -216,6 +216,7 @@ describe("OpenClaw performance workflow", () => {
     expect(jobs?.publish?.if).toContain("inputs.mode != 'vitest-pair'");
     expect(jobs?.artifact_only_guard?.if).toContain("inputs.mode != 'vitest-pair'");
     expect(guard?.needs).toEqual([
+      "candidate_execution",
       "resolve_target",
       "kova",
       "source_performance",
@@ -393,10 +394,10 @@ describe("OpenClaw performance workflow", () => {
       "${{ steps.lane.outputs.run == 'true' && matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' }}",
     );
     expect(runKova.env?.OPENAI_API_KEY).toBe(
-      "${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '') || '' }}",
     );
     expect(runKova.env?.OPENAI_BASE_URL).toBe(
-      "${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '' }}",
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '') || '' }}",
     );
 
     try {
@@ -450,7 +451,7 @@ describe("OpenClaw performance workflow", () => {
       expect(harness.with?.["persist-credentials"]).toBe(false);
     }
     for (const setup of [kovaSetup, sourceSetup]) {
-      expect(setup.uses).toBe("./.artifacts/performance-workflow/.github/actions/setup-node-env");
+      expect(setup.uses).toBe("./.candidate-setup/.github/actions/setup-node-env");
       expect(setup.with?.["cache-mode"]).toBe(
         "${{ needs.resolve_target.outputs.cache_write_allowed == 'true' && 'restore' || 'off' }}",
       );
@@ -595,10 +596,13 @@ describe("OpenClaw performance workflow", () => {
     const sourceCheckout = findStep("Checkout OpenClaw source target", "source_performance");
     const sourceRecord = findStep("Record source performance revision", "source_performance");
 
-    expect(workflow.jobs?.kova?.needs).toBe("resolve_target");
-    expect(workflow.jobs?.source_performance?.needs).toBe("resolve_target");
+    expect(workflow.jobs?.kova?.needs).toEqual(["candidate_execution", "resolve_target"]);
+    expect(workflow.jobs?.source_performance?.needs).toEqual([
+      "candidate_execution",
+      "resolve_target",
+    ]);
     expect(targetCheckout.uses).toBe("actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1");
-    expect(targetCheckout.with?.ref).toBe("${{ inputs.target_ref || github.sha }}");
+    expect(targetCheckout.with?.ref).toBe("${{ needs.candidate_execution.outputs.candidate_sha }}");
     expect(targetCheckout.with?.path).toBe(".artifacts/performance-target");
     expect(targetCheckout.with?.["sparse-checkout-cone-mode"]).toBe(false);
     expect(targetCheckout.with?.["persist-credentials"]).toBe(false);
@@ -612,9 +616,9 @@ describe("OpenClaw performance workflow", () => {
     expect(resolveTarget.run).not.toContain("gh api");
     expect(resolveTarget.run).toContain("checkout_ref=$resolved_sha");
     expect(resolveTarget.run).toContain("tested_sha=$resolved_sha");
-    expect(checkout.with?.ref).toBe("${{ needs.resolve_target.outputs.checkout_ref }}");
+    expect(checkout.with?.ref).toBe("${{ needs.candidate_execution.outputs.candidate_sha }}");
     expect(record.run).toContain('[[ "$tested_sha" != "$EXPECTED_TESTED_SHA" ]]');
-    expect(sourceCheckout.with?.ref).toBe("${{ needs.resolve_target.outputs.checkout_ref }}");
+    expect(sourceCheckout.with?.ref).toBe("${{ needs.candidate_execution.outputs.candidate_sha }}");
     expect(sourceRecord.run).toContain('[[ "$tested_sha" != "$EXPECTED_TESTED_SHA" ]]');
     expect(
       Object.values(workflow.jobs ?? {})
@@ -764,9 +768,14 @@ describe("OpenClaw performance workflow", () => {
     );
     const pushIndex = publishSteps.findIndex((step) => step.name === "Publish to clawgrit reports");
 
-    expect(publisher?.needs).toEqual(["resolve_target", "kova", "source_performance"]);
+    expect(publisher?.needs).toEqual([
+      "candidate_execution",
+      "resolve_target",
+      "kova",
+      "source_performance",
+    ]);
     expect(publisher?.if).toBe(
-      "${{ always() && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair') && needs.resolve_target.outputs.secret_eligible == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish_reports == true)) && needs.resolve_target.result == 'success' && needs.kova.result != 'cancelled' && needs.source_performance.result != 'cancelled' }}",
+      "needs.candidate_execution.result == 'success' && (always() && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair') && needs.resolve_target.outputs.secret_eligible == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish_reports == true)) && needs.resolve_target.result == 'success' && needs.kova.result != 'cancelled' && needs.source_performance.result != 'cancelled')",
     );
     expect(publisher?.["runs-on"]).toBe("ubuntu-24.04");
     expect(publisher?.permissions?.actions).toBe("read");
@@ -806,9 +815,9 @@ describe("OpenClaw performance workflow", () => {
     const guard = readWorkflow().jobs?.artifact_only_guard;
     const verify = findStep("Verify report publisher stayed disabled", "artifact_only_guard");
 
-    expect(guard?.needs).toEqual(["resolve_target", "kova", "publish"]);
+    expect(guard?.needs).toEqual(["candidate_execution", "resolve_target", "kova", "publish"]);
     expect(guard?.if).toBe(
-      "${{ always() && github.event_name == 'workflow_dispatch' && inputs.mode != 'vitest-pair' && inputs.publish_reports != true }}",
+      "needs.candidate_execution.result == 'success' && (always() && github.event_name == 'workflow_dispatch' && inputs.mode != 'vitest-pair' && inputs.publish_reports != true)",
     );
     expect(guard?.permissions?.contents).toBe("read");
     expect(verify.env?.PUBLISH_RESULT).toBe("${{ needs.publish.result }}");
@@ -836,7 +845,8 @@ describe("OpenClaw performance workflow", () => {
     );
     expect(appToken.with).toEqual({
       "client-id": "Iv23liOECG0slfuhz093",
-      "private-key": "${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}",
+      "private-key":
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAWSWEEPER_APP_PRIVATE_KEY || '' }}",
       owner: "openclaw",
       repositories: "clawgrit-reports",
       "permission-contents": "write",
@@ -845,7 +855,11 @@ describe("OpenClaw performance workflow", () => {
     expect(tokenConsumers.map((step) => step.name)).toEqual(["Publish to clawgrit reports"]);
     expect(publish.env?.CLAWGRIT_REPORTS_APP_TOKEN).toBe(appTokenOutput);
     expect(workflowText.split(appTokenOutput)).toHaveLength(2);
-    expect(workflowText.split("${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}")).toHaveLength(2);
+    expect(
+      workflowText.split(
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAWSWEEPER_APP_PRIVATE_KEY || '' }}",
+      ),
+    ).toHaveLength(2);
     expect(publish.if).toBe(
       "${{ needs.resolve_target.outputs.secret_eligible == 'true' && steps.prepare.outputs.ready == 'true' && steps.prepare.outputs.already_published != 'true' }}",
     );
@@ -1347,16 +1361,18 @@ printf '%s\\n' \
 
     expect(configureAuth.if).toContain("matrix.live == 'true'");
     expect(configureAuth.if).toContain("needs.resolve_target.outputs.secret_eligible == 'true'");
-    expect(configureAuth.env?.OPENAI_API_KEY).toBe("${{ secrets.OPENAI_API_KEY }}");
+    expect(configureAuth.env?.OPENAI_API_KEY).toBe(
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+    );
     expect(configureAuth.run).toContain('if [[ -z "${OPENAI_API_KEY:-}" ]]; then');
     expect(configureAuth.run).toContain("cannot run without live evidence");
     expect(configureAuth.run).toContain("exit 1");
     expect(configureAuth.run).not.toContain("will be skipped");
     expect(runKova.env?.OPENAI_API_KEY).toBe(
-      "${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '') || '' }}",
     );
     expect(runKova.env?.OPENAI_BASE_URL).toBe(
-      "${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '' }}",
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '') || '' }}",
     );
     expect(runKova.run).not.toContain('echo "skipped=true" >> "$GITHUB_OUTPUT"');
   });

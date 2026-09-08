@@ -563,16 +563,16 @@ describe("release validation no-push transport", () => {
     expect(capture.run).toContain("package_required=false");
     expect(capture.run).toContain("docker_required=false");
     expect(job(release, "prepare_release_package").if).toBe(
-      "needs.resolve_target.outputs.package_required == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.package_required == 'true')",
     );
     expect(job(release, "docker_e2e_release_checks").if).toBe(
-      "needs.resolve_target.outputs.docker_required == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.docker_required == 'true')",
     );
     expect(job(release, "install_smoke_release_checks").if).toBe(
-      "needs.resolve_target.outputs.install_smoke_scheduled == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.install_smoke_scheduled == 'true')",
     );
     expect(job(release, "qa_lab_parity_lane_release_checks").if).toBe(
-      "needs.resolve_target.outputs.qa_parity_scheduled == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')",
     );
     expect(job(release, "qa_live_release_checks").if).toContain(
       "needs.resolve_target.outputs.qa_live_scheduled == 'true'",
@@ -1327,7 +1327,19 @@ describe("release validation no-push transport", () => {
         .filter((candidate) => candidate.name?.startsWith("Checkout trusted "))
         .map((candidate) => ({ candidate, jobName })),
     );
-    expect(trustedCheckouts).toHaveLength(13);
+    expect(trustedCheckouts).toHaveLength(24);
+    const setupCheckouts = trustedCheckouts.filter(
+      ({ candidate }) => candidate.with?.path === ".candidate-setup",
+    );
+    expect(setupCheckouts).toHaveLength(11);
+    for (const { candidate, jobName } of setupCheckouts) {
+      expect(candidate.with, jobName).toMatchObject({
+        repository: "${{ needs.candidate_execution.outputs.workflow_repository }}",
+        ref: "${{ needs.candidate_execution.outputs.workflow_sha }}",
+        "persist-credentials": false,
+        "sparse-checkout": ".github/actions",
+      });
+    }
     const binderCheckout = trustedCheckouts.find(
       ({ jobName }) => jobName === "bind_full_release_candidate_evidence",
     );
@@ -1337,7 +1349,9 @@ describe("release validation no-push transport", () => {
       "persist-credentials": false,
     });
     const exactRevisionCheckouts = trustedCheckouts.filter(
-      ({ jobName }) => jobName !== "bind_full_release_candidate_evidence",
+      ({ candidate, jobName }) =>
+        jobName !== "bind_full_release_candidate_evidence" &&
+        candidate.with?.path !== ".candidate-setup",
     );
     expect(exactRevisionCheckouts).toHaveLength(12);
     for (const { candidate, jobName } of exactRevisionCheckouts) {
@@ -1562,10 +1576,22 @@ describe("release validation no-push transport", () => {
       }
     }
     expect(readFileSync(LIVE_E2E, "utf8")).not.toContain("fromJSON(toJSON(job)).workflow_");
-    expect(readFileSync(LIVE_E2E, "utf8")).not.toContain("${{ github.workflow_sha }}");
-    const artifactPackAndLoadSteps = Object.values(workflow.jobs ?? {}).flatMap((workflowJob) =>
-      (workflowJob.steps ?? []).filter((candidate) => candidate.env?.WORKFLOW_SHA !== undefined),
+    // Same-run artifact provenance may inspect the caller; harness authority stays bound to the called job.
+    expect(readFileSync(LIVE_E2E, "utf8").match(/\$\{\{ github\.workflow_sha \}\}/gu)).toHaveLength(
+      1,
     );
+    expect(
+      step(job(workflow, "candidate_execution"), "Classify candidate before checkout or execution")
+        .env,
+    ).toMatchObject({
+      CALLER_WORKFLOW_SHA: "${{ github.workflow_sha }}",
+      WORKFLOW_SHA: "${{ steps.workflow.outputs.workflow_sha }}",
+    });
+    const artifactPackAndLoadSteps = Object.entries(workflow.jobs ?? {})
+      .filter(([jobName]) => jobName !== "candidate_execution")
+      .flatMap(([, workflowJob]) =>
+        (workflowJob.steps ?? []).filter((candidate) => candidate.env?.WORKFLOW_SHA !== undefined),
+      );
     expect(artifactPackAndLoadSteps).toHaveLength(8);
     for (const artifactStep of artifactPackAndLoadSteps) {
       expect(artifactStep.env?.WORKFLOW_SHA, artifactStep.name).toBe(

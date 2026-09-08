@@ -77,13 +77,13 @@ outputs:
     value: ${{ steps.dependency-cache-key.outputs.key }}
   pnpm-store-cache-hit:
     description: Whether the pnpm store restored an exact key.
-    value: ${{ steps.setup-pnpm.outputs.store-cache-hit }}
+    value: ${{ steps.pnpm-store-cache.outputs.cache-hit }}
   pnpm-store-cache-key:
     description: Exact pnpm store key used for restore or save.
-    value: ${{ steps.setup-pnpm.outputs.store-cache-primary-key }}
+    value: ${{ steps.pnpm-store-cache.outputs.cache-primary-key }}
   pnpm-store-cache-path:
     description: Resolved pnpm store path.
-    value: ${{ steps.setup-pnpm.outputs.store-path }}
+    value: ${{ steps.setup-pnpm.outputs.path }}
   vitest-cache-key:
     description: Exact Vitest transform cache key.
     value: ${{ steps.vitest-cache.outputs.cache-primary-key }}
@@ -231,15 +231,28 @@ runs:
           -mindepth 1 -maxdepth 2 \( -type d -o -type l \) -name node_modules \
           -exec rm -rf -- {} +
 
+    # Resolve the whole setup implementation relative to this trusted action.
+    # A nested local `uses` would resolve from the candidate workspace instead.
     - name: Setup pnpm
       id: setup-pnpm
-      uses: ./.github/actions/setup-pnpm-store-cache
+      shell: bash
+      env:
+        CACHE_MODE: ${{ inputs.cache-mode != 'off' && (inputs.dependency-cache != 'true' || steps.dependency-cache.outputs.cache-hit != 'true') && 'restore' || 'off' }}
+        COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        PACKAGE_MANAGER_FILE: package.json
+        REQUESTED_NODE_VERSION: ${{ inputs.node-version }}
+      run: bash "$GITHUB_ACTION_PATH/../setup-pnpm-store-cache/setup-pnpm.sh"
+
+    - name: Restore pnpm store cache
+      id: pnpm-store-cache
+      if: inputs.cache-mode != 'off' && runner.os != 'Windows' && (inputs.dependency-cache != 'true' || steps.dependency-cache.outputs.cache-hit != 'true')
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        node-version: ${{ inputs.node-version }}
-        # On an exact dependency-cache hit, the same archive already restored
-        # the complete store. Every miss can seed it from the coarser cache,
-        # including legacy Blacksmith callers that disabled that old fallback.
-        cache-mode: ${{ inputs.cache-mode != 'off' && (inputs.dependency-cache != 'true' || steps.dependency-cache.outputs.cache-hit != 'true') && 'restore' || 'off' }}
+        path: ${{ steps.setup-pnpm.outputs.path }}
+        key: pnpm-store-${{ runner.os }}-${{ runner.arch }}-${{ inputs.node-version }}-${{ hashFiles('package.json') }}-${{ hashFiles('pnpm-lock.yaml') }}
+        restore-keys: |
+          pnpm-store-${{ runner.os }}-${{ runner.arch }}-${{ inputs.node-version }}-${{ hashFiles('package.json') }}-
+          pnpm-store-${{ runner.os }}-${{ runner.arch }}-${{ inputs.node-version }}-
 
     - name: Setup TruffleHog
       if: inputs.install-trufflehog == 'true'

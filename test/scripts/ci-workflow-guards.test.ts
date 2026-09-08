@@ -6044,11 +6044,22 @@ setImmediate(() => {
         steps.filter((step) => step.uses?.startsWith("actions/cache/restore@")).length,
         actionPath,
       ).toBeGreaterThan(0);
-      const validation = expectDefined(
-        steps.find((step) => step.run?.includes("off|restore|read-write")),
-        `${actionPath} cache-mode validation`,
-      );
-      expect(validation.run).toContain("Invalid cache-mode input");
+      const validation = steps.find((step) => step.run?.includes("off|restore|read-write"));
+      if (actionPath.endsWith("setup-pnpm-store-cache/action.yml")) {
+        expect(steps.find((step) => step.id === "setup-pnpm")?.run).toBe(
+          'bash "$GITHUB_ACTION_PATH/setup-pnpm.sh"',
+        );
+        const sharedSetup = readFileSync(
+          ".github/actions/setup-pnpm-store-cache/setup-pnpm.sh",
+          "utf8",
+        );
+        expect(sharedSetup).toContain("off|restore|read-write");
+        expect(sharedSetup).toContain("Invalid cache-mode input");
+      } else {
+        expect(expectDefined(validation, `${actionPath} cache-mode validation`).run).toContain(
+          "Invalid cache-mode input",
+        );
+      }
     }
 
     const callers: Array<{ file: string; mode: unknown; step: WorkflowStep }> = [];
@@ -6097,6 +6108,7 @@ setImmediate(() => {
         typeof caller.mode === "string" &&
         caller.mode.startsWith("${{") &&
         (caller.mode.includes("needs.preflight.outputs.cache_mode") ||
+          caller.mode.includes("needs.candidate_execution.outputs.cache_mode") ||
           caller.mode.includes("steps.candidate_trust.outputs.cache_mode") ||
           (caller.mode.includes("'restore'") &&
             (caller.mode.includes("'off'") || caller.mode.includes("'read-write'"))));
@@ -6236,11 +6248,11 @@ setImmediate(() => {
     );
     expect(actionSteps.indexOf(restore)).toBeLessThan(actionSteps.indexOf(prepareFallback));
     expect(actionSteps.indexOf(prepareFallback)).toBeLessThan(actionSteps.indexOf(setupPnpm));
-    expect(setupPnpm.with?.["cache-mode"]).toContain(
+    expect(setupPnpm.env?.CACHE_MODE).toContain(
       "steps.dependency-cache.outputs.cache-hit != 'true'",
     );
-    expect(setupPnpm.with?.["cache-mode"]).toContain("inputs.cache-mode != 'off'");
-    expect(setupPnpm.with?.["cache-mode"]).toContain("'restore' || 'off'");
+    expect(setupPnpm.env?.CACHE_MODE).toContain("inputs.cache-mode != 'off'");
+    expect(setupPnpm.env?.CACHE_MODE).toContain("'restore' || 'off'");
     expect(actionSteps.indexOf(restore)).toBeLessThan(actionSteps.indexOf(setupPnpm));
 
     expect(install.run).toBe('bash "$GITHUB_ACTION_PATH/install-dependencies.sh"');

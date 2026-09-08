@@ -3291,7 +3291,7 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
             .filter((group) => !isRepartitionableTooling(group))
             .map(({ runner: _runner, ...group }) => group)
             .toSorted((a, b) => a.shard_name.localeCompare(b.shard_name)),
-          // Allocation may change, but every file must retain its complete execution policy.
+          // Allocation and stripe capacity may change; file execution policy must remain stable.
           tooling: nonPlugin
             .filter(isRepartitionableTooling)
             .flatMap((group) =>
@@ -3303,7 +3303,6 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
                   env: group.env,
                   pretestBuildMode: group.pretestBuildMode,
                   requiresDist: group.requiresDist,
-                  runner: group.runner,
                   exclusive: isExclusiveCompactShardName(group.shard_name),
                 }),
               ),
@@ -3311,8 +3310,23 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
             .toSorted((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b))),
         };
       };
+      const expectToolingRunnerCapacity = (plan: typeof before) => {
+        for (const group of plan
+          .flatMap((shard) => shard.groups)
+          .filter(isRepartitionableTooling)) {
+          const files = expectDefined(group.includePatterns, "tooling capacity membership");
+          // The compiler fixture requires the large runner wherever repartitioning places it.
+          expect(group.runner).toBe(
+            files.includes("test/scripts/write-unified-entry-dts.test.ts")
+              ? DEFAULT_NODE_TEST_RUNNER
+              : BUNDLED_NODE_TEST_RUNNER,
+          );
+        }
+      };
       expectTimingFamilies(before);
       expectTimingFamilies(after);
+      expectToolingRunnerCapacity(before);
+      expectToolingRunnerCapacity(after);
       expect(policies(after)).toEqual(policies(before));
       if (runnerBackend === "github") {
         const regenerateTimingKeys = (plan: typeof before) => {
@@ -3362,10 +3376,10 @@ describe("scripts/lib/ci-node-test-plan.mts", () => {
           }
           regenerateTimingKeys(mutated);
           expectTimingFamilies(mutated);
-          expect(
-            () => expect(policies(mutated)).toEqual(policies(before)),
-            `${mutation} must fail policy equality even with valid timing keys`,
-          ).toThrow();
+          expect(() => {
+            expectToolingRunnerCapacity(mutated);
+            expect(policies(mutated)).toEqual(policies(before));
+          }, `${mutation} must fail execution policy or capacity even with valid timing keys`).toThrow();
         }
         for (const identity of ["parent", "part"] as const) {
           const forged = structuredClone(after);

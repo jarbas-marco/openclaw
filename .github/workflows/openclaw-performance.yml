@@ -96,9 +96,75 @@ env:
   KOVA_SCENARIO_TIMEOUT_MS: ${{ inputs.profile == 'release' && '900000' || '300000' }}
 
 jobs:
+  candidate_execution:
+    name: Classify candidate execution authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.classify.outputs.candidate_sha }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      privileged: ${{ steps.classify.outputs.privileged }}
+      cache_mode: ${{ steps.classify.outputs.cache_mode }}
+    steps:
+      - name: Resolve called workflow identity
+        id: workflow
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const job = JSON.parse(process.env.JOB_CONTEXT);
+          if (!/^[0-9a-f]{40}$/u.test(job.workflow_sha ?? "") ||
+              !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(job.workflow_repository ?? "")) {
+            throw new Error("The called job workflow identity is required");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `workflow_sha=${job.workflow_sha}\nworkflow_repository=${job.workflow_repository}\n`);
+          NODE
+      - name: Checkout immutable candidate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .candidate-policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify candidate before checkout or execution
+        id: classify
+        env:
+          CANDIDATE_REF: ${{ inputs.target_ref || github.sha }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASELINE_REF: ${{ inputs.baseline_ref }}
+          KOVA_REF: ${{ inputs.kova_ref }}
+        run: |
+          set -euo pipefail
+          cd .candidate-policy
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          if [[ "$WORKFLOW_REF" == "refs/heads/$DEFAULT_BRANCH" && -n "$KOVA_REF" &&
+                "$KOVA_REF" != "e4d865f55f655a77df169a7be01877608c3260b9" ]]; then
+            echo "Custom Kova candidates require a nondefault branch context." >&2
+            exit 1
+          fi
+          CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${CANDIDATE_REF}^{commit}")"
+          export CANDIDATE_SHA
+          node scripts/github/classify-candidate-execution.mjs
+          if [[ -n "$BASELINE_REF" ]]; then
+            CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${BASELINE_REF}^{commit}")" \
+              node scripts/github/classify-candidate-execution.mjs
+          fi
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   resolve_target:
+    needs: [candidate_execution]
     name: Resolve target ref
-    if: ${{ github.event_name == 'schedule' || inputs.mode != 'vitest-pair' }}
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -117,7 +183,7 @@ jobs:
       - name: Checkout target metadata
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.target_ref || github.sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           path: .artifacts/performance-target
           sparse-checkout: src/config/zod-schema.agent-defaults.ts
           sparse-checkout-cone-mode: false
@@ -227,8 +293,8 @@ jobs:
 
   kova:
     name: ${{ matrix.title }}
-    needs: resolve_target
-    if: ${{ github.event_name == 'schedule' || inputs.mode != 'vitest-pair' }}
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair')
     permissions:
       contents: read
     runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404' }}
@@ -323,7 +389,7 @@ jobs:
         if: steps.lane.outputs.run == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve_target.outputs.checkout_ref }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -379,9 +445,19 @@ jobs:
           cmp "$trusted_action/action.yml" "$actions_dir/setup-pnpm-store-cache/action.yml"
           cmp "$trusted_action/ensure-node.sh" "$actions_dir/setup-pnpm-store-cache/ensure-node.sh"
 
+      - name: Checkout trusted Node setup graph
+        if: steps.lane.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Set up Node environment
         if: steps.lane.outputs.run == 'true'
-        uses: ./.artifacts/performance-workflow/.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
           cache-mode: ${{ needs.resolve_target.outputs.cache_write_allowed == 'true' && 'restore' || 'off' }}
           install-bun: "false"
@@ -553,8 +629,8 @@ jobs:
       - name: Configure live OpenAI auth
         if: ${{ steps.lane.outputs.run == 'true' && matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' }}
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+          OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -569,8 +645,8 @@ jobs:
         id: kova
         if: steps.lane.outputs.run == 'true'
         env:
-          OPENAI_API_KEY: ${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '' }}
-          OPENAI_BASE_URL: ${{ matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '' }}
+          OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_API_KEY || '') || '' }}
+          OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && (matrix.live == 'true' && needs.resolve_target.outputs.secret_eligible == 'true' && secrets.OPENAI_BASE_URL || '') || '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -727,8 +803,8 @@ jobs:
 
   source_performance:
     name: OpenClaw source performance probes
-    needs: resolve_target
-    if: ${{ github.event_name == 'schedule' || inputs.mode != 'vitest-pair' }}
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair')
     runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || 'blacksmith-16vcpu-ubuntu-2404' }}
     timeout-minutes: 120
     env:
@@ -746,7 +822,7 @@ jobs:
       - name: Checkout OpenClaw source target
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.resolve_target.outputs.checkout_ref }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -778,8 +854,17 @@ jobs:
         shell: bash
         run: *stage_trusted_performance_setup
 
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Set up source performance environment
-        uses: ./.artifacts/performance-workflow/.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
           cache-mode: ${{ needs.resolve_target.outputs.cache_write_allowed == 'true' && 'restore' || 'off' }}
           install-bun: "false"
@@ -1064,8 +1149,8 @@ jobs:
 
   publish:
     name: Publish ${{ matrix.title }} report
-    needs: [resolve_target, kova, source_performance]
-    if: ${{ always() && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair') && needs.resolve_target.outputs.secret_eligible == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish_reports == true)) && needs.resolve_target.result == 'success' && needs.kova.result != 'cancelled' && needs.source_performance.result != 'cancelled' }}
+    needs: [candidate_execution, resolve_target, kova, source_performance]
+    if: needs.candidate_execution.result == 'success' && (always() && (github.event_name == 'schedule' || inputs.mode != 'vitest-pair') && needs.resolve_target.outputs.secret_eligible == 'true' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.publish_reports == true)) && needs.resolve_target.result == 'success' && needs.kova.result != 'cancelled' && needs.source_performance.result != 'cancelled')
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -1417,7 +1502,7 @@ jobs:
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: Iv23liOECG0slfuhz093
-          private-key: ${{ secrets.CLAWSWEEPER_APP_PRIVATE_KEY }}
+          private-key: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAWSWEEPER_APP_PRIVATE_KEY || '' }}
           owner: openclaw
           repositories: clawgrit-reports
           permission-contents: write
@@ -1514,8 +1599,8 @@ jobs:
 
   artifact_only_guard:
     name: Verify artifact-only report mode
-    needs: [resolve_target, kova, publish]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mode != 'vitest-pair' && inputs.publish_reports != true }}
+    needs: [candidate_execution, resolve_target, kova, publish]
+    if: needs.candidate_execution.result == 'success' && (always() && github.event_name == 'workflow_dispatch' && inputs.mode != 'vitest-pair' && inputs.publish_reports != true)
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -1538,8 +1623,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   vitest_pair:
+    needs: [candidate_execution]
     name: Vitest paired benchmark
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair' }}
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair')
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     permissions:
@@ -1587,7 +1673,7 @@ jobs:
       - name: Checkout Vitest pair candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           path: .artifacts/vitest-pair/candidate
           fetch-depth: 1
           persist-credentials: false
@@ -1658,8 +1744,17 @@ jobs:
 
   vitest_pair_guard:
     name: Verify Vitest pair isolation
-    needs: [resolve_target, kova, source_performance, publish, artifact_only_guard, vitest_pair]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair' }}
+    needs:
+      [
+        candidate_execution,
+        resolve_target,
+        kova,
+        source_performance,
+        publish,
+        artifact_only_guard,
+        vitest_pair,
+      ]
+    if: needs.candidate_execution.result == 'success' && (always() && github.event_name == 'workflow_dispatch' && inputs.mode == 'vitest-pair')
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

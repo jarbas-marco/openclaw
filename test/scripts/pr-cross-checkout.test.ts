@@ -119,7 +119,12 @@ function fixture() {
     `#!/bin/sh
 printf '%s\\t%s\\n' "$(git rev-parse --show-toplevel)" "$*" >> '${calls}'
 case "$1 $2" in
-  "repo view") printf '%s\\n' '${JSON.stringify(repo)}' ;;
+  "repo view")
+    if [ "$*" = "repo view --json nameWithOwner --jq .nameWithOwner" ]; then
+      printf '%s\\n' '${repo.nameWithOwner}'
+    else
+      printf '%s\\n' '${JSON.stringify(repo)}'
+    fi ;;
   "api graphql") printf '%s\\n' '${JSON.stringify(response)}' ;;
   "pr view")
     if [ "$(git rev-parse --show-toplevel)" = '${owner}' ]; then
@@ -235,8 +240,15 @@ describePosix("native PR wrapper repository ownership", () => {
             ? "did not include a head SHA"
             : "targets owner-release",
       );
-      expect(f.readCalls()).toHaveLength(1);
-      expect(f.readCalls()[0]).toContain(`${f.owner}\tpr view 123 --json `);
+      if (command === "ci-dispatch") {
+        expect(f.readCalls()).toEqual([
+          `${f.owner}\trepo view --json nameWithOwner --jq .nameWithOwner`,
+          `${f.owner}\tpr view 123 --repo fixture/repo --json baseRefOid,headRefName,headRefOid,isCrossRepository`,
+        ]);
+      } else {
+        expect(f.readCalls()).toHaveLength(1);
+        expect(f.readCalls()[0]).toContain(`${f.owner}\tpr view 123 --json `);
+      }
       expect(f.git(f.owner, ["rev-parse", outcomeRef])).toBe(f.intent);
       expect(f.git(f.owner, ["for-each-ref", "--format=%(refname)", lockRef])).toBe("");
       expect(f.git(f.caller, ["for-each-ref", "--format=%(refname)", "refs/openclaw"])).toBe("");

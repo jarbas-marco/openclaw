@@ -6,6 +6,7 @@ on:
       ref:
         required: true
         type: string
+      # Retained for existing callers; identity is derived from the called job below.
       workflow_repository:
         required: true
         type: string
@@ -45,7 +46,83 @@ env:
   OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: ${{ github.workspace }}
 
 jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      target_sha: ${{ steps.authority.outputs.target_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      privileged: ${{ steps.authority.outputs.privileged }}
+      cache_mode: ${{ steps.authority.outputs.cache_mode }}
+    steps:
+      - name: Assert trusted workflow identity
+        id: workflow
+        env:
+          EXPECTED_WORKFLOW_REPOSITORY: ${{ github.repository }}
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+
+          const job = JSON.parse(process.env.JOB_CONTEXT ?? "{}");
+          const repository = process.env.EXPECTED_WORKFLOW_REPOSITORY ?? "";
+          if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository)) {
+            throw new Error("github.repository must be an owner/repository slug");
+          }
+          if (job.workflow_repository !== repository) {
+            throw new Error("job.workflow_repository must exactly match github.repository");
+          }
+          if (typeof job.workflow_sha !== "string" || !/^[0-9a-f]{40}$/u.test(job.workflow_sha)) {
+            throw new Error("job.workflow_sha must be a full lowercase commit SHA");
+          }
+          if (!process.env.GITHUB_OUTPUT) {
+            throw new Error("GITHUB_OUTPUT is required");
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `workflow_repository=${job.workflow_repository}\nworkflow_sha=${job.workflow_sha}\n`,
+          );
+          NODE
+
+      # Fetch metadata and trusted policy only; no candidate checkout or execution yet.
+      - name: Materialize execution authority helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .trust-harness
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: scripts/github/classify-candidate-execution.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Classify candidate execution authority
+        id: authority
+        env:
+          TARGET_REF: ${{ inputs.ref || github.ref }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git -C .trust-harness merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH" || {
+            echo "::error::Called workflow revision must belong to the repository default-branch history."
+            exit 1
+          }
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          git -C .trust-harness fetch --no-tags --no-recurse-submodules -- origin "$TARGET_REF"
+          CANDIDATE_SHA="$(git -C .trust-harness rev-parse --verify 'FETCH_HEAD^{commit}')"
+          export CANDIDATE_SHA
+          node .trust-harness/scripts/github/classify-candidate-execution.mjs
+          echo "target_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: preflight
     name: Build repo E2E (${{ inputs.build_profile }})
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
@@ -58,22 +135,25 @@ jobs:
         name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.preflight.outputs.target_sha }}
           fetch-depth: 1
+          persist-credentials: false
       - &checkout_harness
         name: Checkout trusted artifact harness
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          repository: ${{ inputs.workflow_repository }}
-          ref: ${{ inputs.workflow_sha }}
+          repository: ${{ needs.preflight.outputs.workflow_repository }}
+          ref: ${{ needs.preflight.outputs.workflow_sha }}
           path: .release-harness
           fetch-depth: 1
           persist-credentials: false
-          sparse-checkout: scripts
+          sparse-checkout: |
+            scripts
+            .github/actions
       - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+        uses: ./.release-harness/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.preflight.outputs.cache_mode }}
           node-version: "24.19.0"
           install-bun: "true"
           build-all-cache-scope: full
@@ -105,7 +185,7 @@ jobs:
 
   test:
     name: Repo E2E (${{ matrix.name }})
-    needs: build
+    needs: [preflight, build]
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 90
@@ -118,9 +198,9 @@ jobs:
       - *checkout_target
       - *checkout_harness
       - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+        uses: ./.release-harness/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.preflight.outputs.cache_mode }}
           node-version: "24.19.0"
           install-bun: "true"
       - name: Download repo E2E build

@@ -56,18 +56,21 @@ export function pluginPrereleaseTimeoutComponents(params: {
     preflight: requireWorkflowJob(params.pluginPrerelease, "preflight"),
     dockerSuite: requireWorkflowJob(params.pluginPrerelease, "plugin-prerelease-docker-suite"),
     suite: requireWorkflowJob(params.pluginPrerelease, "plugin-prerelease-suite"),
+    candidateExecution: requireWorkflowJob(params.liveE2e, "candidate_execution"),
     validateSelectedRef: requireWorkflowJob(params.liveE2e, "validate_selected_ref"),
     prepareImage: requireWorkflowJob(params.liveE2e, "prepare_docker_e2e_image"),
     dockerLanes: requireWorkflowJob(params.liveE2e, "validate_docker_lanes"),
   };
   requireWorkflowNeeds(jobs.dockerSuite, ["preflight"]);
-  requireWorkflowNeeds(jobs.prepareImage, ["validate_selected_ref"], true);
+  requireWorkflowNeeds(jobs.validateSelectedRef, ["candidate_execution"], true);
+  requireWorkflowNeeds(jobs.prepareImage, ["candidate_execution", "validate_selected_ref"], true);
   requireWorkflowNeeds(jobs.dockerLanes, ["prepare_docker_e2e_image"]);
   requireWorkflowNeeds(jobs.suite, ["plugin-npm-security-scan", "plugin-prerelease-docker-suite"]);
   const timeout = (job: ReleaseWorkflowJob) =>
     releaseTimeoutForProfile(job["timeout-minutes"], params.profile);
   return {
     preflight: timeout(jobs.preflight),
+    candidateExecution: timeout(jobs.candidateExecution),
     validateSelectedRef: timeout(jobs.validateSelectedRef),
     prepareImage: timeout(jobs.prepareImage),
     dockerLanes: timeout(jobs.dockerLanes),

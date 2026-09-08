@@ -466,13 +466,14 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     const preview = workflow().jobs?.preview_plugins_npm;
     const previewSteps = preview?.steps ?? [];
     const trusted = step(preview, "Validate ref is on a trusted publish branch");
-    expect(previewSteps.slice(0, 7).map((candidate) => candidate.name)).toEqual([
+    expect(previewSteps.slice(0, 8).map((candidate) => candidate.name)).toEqual([
       "Prepare Git owner",
       "Checkout",
       "Checkout trusted planning tooling",
       "Resolve checked-out ref",
       "Verify trusted preflight tooling identity",
       "Validate ref is on a trusted publish branch",
+      "Checkout trusted Node setup graph",
       "Setup Node environment",
     ]);
     const trustedIndex = previewSteps.indexOf(trusted);
@@ -493,7 +494,9 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     expect(toolingIdentity.run).toContain('--workflow-ref "$WORKFLOW_REF"');
     expect(toolingIdentity.run).toContain('--workflow-full-ref "$WORKFLOW_FULL_REF"');
     expect(toolingIdentity.run).toContain('--workflow-sha "$WORKFLOW_SHA"');
-    expect(step(preview, "Setup Node environment").uses).toBe("./.github/actions/setup-node-env");
+    expect(step(preview, "Setup Node environment").uses).toBe(
+      "./.candidate-setup/.github/actions/setup-node-env",
+    );
     expect(trusted.env).toMatchObject({
       PREFLIGHT_ONLY:
         "${{ github.event_name == 'workflow_dispatch' && inputs.preflight_only || false }}",
@@ -503,7 +506,7 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
         "${{ github.event_name == 'workflow_dispatch' && inputs.release_publish_run_id || '' }}",
       RELEASE_PUBLISH_RUN_ATTEMPT:
         "${{ github.event_name == 'workflow_dispatch' && inputs.release_publish_run_attempt || '' }}",
-      SOURCE_REF: "${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}",
+      SOURCE_REF: "${{ needs.candidate_execution.outputs.candidate_sha }}",
       WORKFLOW_REF: "${{ github.ref }}",
       WORKFLOW_SHA: "${{ github.workflow_sha }}",
     });
@@ -584,7 +587,11 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     });
 
     const verify = parsed.jobs?.verify_plugin_npm_preflight;
-    expect(verify?.needs).toEqual(["preview_plugins_npm", "preview_plugin_pack"]);
+    expect(verify?.needs).toEqual([
+      "candidate_execution",
+      "preview_plugins_npm",
+      "preview_plugin_pack",
+    ]);
     expect(verify?.if).toContain("!inputs.trusted_publisher_preflight");
     expect(verify?.strategy?.matrix?.plugin).toContain("all_matrix");
     expect(verify?.strategy?.matrix?.plugin).toContain("matrix");
@@ -694,7 +701,7 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     expect(readFileSync(workflowPath, "utf8")).toContain("Plugin NPM Artifact Preflight");
     const oidc = parsed.jobs?.trusted_publisher_preflight;
     expect(oidc?.name).toBe("Trusted publisher OIDC exchange");
-    expect(oidc?.needs).toBe("preview_plugins_npm");
+    expect(oidc?.needs).toEqual(["candidate_execution", "preview_plugins_npm"]);
     expect(oidc?.if).toContain("inputs.preflight_only");
     expect(oidc?.if).toContain("inputs.trusted_publisher_preflight");
     expect(oidc?.if).toContain("has_selection == 'true'");
@@ -773,7 +780,9 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     expect(bootstrap.if).toContain(
       "steps.bootstrap_npm_package_version.outputs.already_published != 'true'",
     );
-    expect(bootstrap.env?.NPM_TOKEN).toBe("${{ secrets.NPM_TOKEN }}");
+    expect(bootstrap.env?.NPM_TOKEN).toBe(
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.NPM_TOKEN || '' }}",
+    );
     expect(bootstrap.env?.PACKAGE_NAME).toContain("publication_evidence.outputs.package_name");
     expect(bootstrap.run).not.toContain("@openclaw/meta-provider");
     expect(bootstrap.run).toContain("NPM_CONFIG_USERCONFIG");
@@ -825,7 +834,7 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     });
     expect(
       step(parsed.jobs?.publish_plugins_npm, "Setup trusted publication dependencies").uses,
-    ).toBe("./.github/actions/setup-node-env");
+    ).toBe("./.candidate-setup/.github/actions/setup-node-env");
     expect(
       step(parsed.jobs?.publish_plugins_npm, "Setup trusted publication dependencies").if,
     ).toBeUndefined();
@@ -840,7 +849,11 @@ process.exit(${JSON.stringify(command)} === "node" ? Number(process.env.IDENTITY
     );
 
     const verify = parsed.jobs?.verify_plugins_npm;
-    expect(verify?.needs).toEqual(["preview_plugins_npm", "publish_plugins_npm"]);
+    expect(verify?.needs).toEqual([
+      "candidate_execution",
+      "preview_plugins_npm",
+      "publish_plugins_npm",
+    ]);
     expect(verify?.if).toContain("always()");
     expect(verify?.if).toContain("has_candidates == 'false'");
     expect(verify?.strategy?.matrix?.plugin).toContain("all_matrix");

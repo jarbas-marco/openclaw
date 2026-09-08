@@ -576,7 +576,94 @@ env:
   OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: ${{ github.workspace }}
 
 jobs:
+  candidate_execution:
+    name: Classify candidate execution authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.classify.outputs.candidate_sha }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      privileged: ${{ steps.classify.outputs.privileged }}
+      cache_mode: ${{ steps.classify.outputs.cache_mode }}
+    steps:
+      - name: Resolve called workflow identity
+        id: workflow
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const job = JSON.parse(process.env.JOB_CONTEXT);
+          if (!/^[0-9a-f]{40}$/u.test(job.workflow_sha ?? "") ||
+              !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(job.workflow_repository ?? "")) {
+            throw new Error("The called job workflow identity is required");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `workflow_sha=${job.workflow_sha}\nworkflow_repository=${job.workflow_repository}\n`);
+          NODE
+      - name: Checkout immutable candidate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .candidate-policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify candidate before checkout or execution
+        id: classify
+        env:
+          CANDIDATE_REF: ${{ inputs.ref }}
+          IMAGE_EXECUTION_SELECTED: ${{ inputs.prepare_only || inputs.include_release_path_suites || inputs.include_openwebui || inputs.docker_lanes != '' || (inputs.include_live_suites && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-') || startsWith(inputs.live_suite_filter, 'docker-live-models'))) }}
+          SHARED_IMAGE_POLICY: ${{ inputs.shared_image_policy }}
+          PROVIDED_BARE_IMAGE: ${{ inputs.docker_e2e_bare_image }}
+          PROVIDED_FUNCTIONAL_IMAGE: ${{ inputs.docker_e2e_functional_image }}
+          IMAGE_ARTIFACT_ID: ${{ inputs.shared_image_artifact_id }}
+          IMAGE_ARTIFACT_NAME: ${{ inputs.shared_image_artifact_name }}
+          IMAGE_ARTIFACT_DIGEST: ${{ inputs.shared_image_artifact_digest }}
+          IMAGE_ARTIFACT_RUN_ID: ${{ inputs.shared_image_artifact_run_id }}
+          IMAGE_ARTIFACT_RUN_ATTEMPT: ${{ inputs.shared_image_artifact_run_attempt }}
+          IMAGE_ARCHIVE_SHA256: ${{ inputs.shared_image_archive_sha256 }}
+          PREPARED_NPM_BUNDLE_JSON: ${{ inputs.prepared_npm_bundle_json }}
+          REGISTRY_ARTIFACT_ID: ${{ inputs.prepublish_plugin_registry_artifact_id }}
+          REGISTRY_ARTIFACT_NAME: ${{ inputs.prepublish_plugin_registry_artifact_name }}
+          REGISTRY_ARTIFACT_DIGEST: ${{ inputs.prepublish_plugin_registry_artifact_digest }}
+          REGISTRY_ARTIFACT_RUN_ID: ${{ inputs.prepublish_plugin_registry_artifact_run_id }}
+          REGISTRY_ARTIFACT_RUN_ATTEMPT: ${{ inputs.prepublish_plugin_registry_artifact_run_attempt }}
+          REGISTRY_MANIFEST_SHA256: ${{ inputs.prepublish_plugin_registry_manifest_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+          CALLER_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          ARTIFACT_ID: ${{ inputs.package_artifact_id }}
+          ARTIFACT_NAME: ${{ inputs.package_artifact_name }}
+          ARTIFACT_DIGEST: ${{ inputs.package_artifact_digest }}
+          ARTIFACT_RUN_ID: ${{ inputs.package_artifact_run_id }}
+          ARTIFACT_RUN_ATTEMPT: ${{ inputs.package_artifact_run_attempt }}
+          PACKAGE_SOURCE_SHA: ${{ inputs.package_source_sha }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cd .candidate-policy
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          if [[ "$WORKFLOW_REF" == "refs/heads/$DEFAULT_BRANCH" && -n "$ARTIFACT_ID" ]]; then
+            bash scripts/github/verify-same-run-candidate-artifact.sh
+          fi
+          CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${CANDIDATE_REF}^{commit}")"
+          export CANDIDATE_SHA
+          node scripts/github/classify-candidate-execution.mjs
+          bash scripts/github/verify-candidate-image-authority.sh
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   validate_selected_ref:
+    if: needs.candidate_execution.result == 'success'
+    needs: [candidate_execution]
     runs-on: ${{ !inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 30
     outputs:
@@ -622,6 +709,8 @@ jobs:
       - name: Checkout workflow repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          persist-credentials: false
           # Ref trust needs every branch and tag, but no historical file blobs.
           fetch-depth: 0
           filter: blob:none
@@ -643,7 +732,7 @@ jobs:
         id: validate
         env:
           ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: ${{ inputs.allow_frozen_target_scenario_omissions && '1' || '0' }}
-          INPUT_REF: ${{ inputs.ref }}
+          INPUT_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           PACKAGE_ARTIFACT_DIGEST: ${{ inputs.package_artifact_digest }}
           PACKAGE_ARTIFACT_ID: ${{ inputs.package_artifact_id }}
           PACKAGE_ARTIFACT_NAME: ${{ inputs.package_artifact_name }}
@@ -838,8 +927,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   validate_live_suite_filter:
+    needs: [candidate_execution]
     runs-on: ubuntu-24.04
-    if: inputs.live_suite_filter != ''
+    if: needs.candidate_execution.result == 'success' && (inputs.live_suite_filter != '')
     timeout-minutes: 10
     steps:
       - name: Validate focused live suite filter
@@ -964,7 +1054,8 @@ jobs:
           exit 1
 
   plan_release_workflow_matrices:
-    needs: validate_selected_ref
+    if: needs.candidate_execution.result == 'success'
+    needs: [candidate_execution, validate_selected_ref]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -988,7 +1079,7 @@ jobs:
         if: inputs.include_live_suites
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           path: .release-target
           persist-credentials: false
           sparse-checkout: |
@@ -1018,27 +1109,37 @@ jobs:
         run: node scripts/plan-release-workflow-matrix.mjs >> "$GITHUB_OUTPUT"
 
   validate_release_live_cache:
-    needs: validate_selected_ref
-    if: inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'live-cache')
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'live-cache'))
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 20
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
       OPENCLAW_LIVE_CACHE_TEST: "1"
       OPENCLAW_LIVE_TEST: "1"
     steps:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          persist-credentials: false
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -1070,8 +1171,8 @@ jobs:
 
   validate_repo_e2e_gateway:
     name: Gateway E2E
-    needs: validate_selected_ref
-    if: inputs.include_repo_e2e && inputs.live_suite_filter == ''
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_repo_e2e && inputs.live_suite_filter == '')
     uses: ./.github/workflows/openclaw-repo-e2e-reusable.yml
     with:
       ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
@@ -1090,8 +1191,8 @@ jobs:
 
   validate_repo_e2e_runtime:
     name: UI and plugin E2E
-    needs: validate_selected_ref
-    if: inputs.include_repo_e2e && inputs.live_suite_filter == ''
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_repo_e2e && inputs.live_suite_filter == '')
     uses: ./.github/workflows/openclaw-repo-e2e-reusable.yml
     with:
       ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
@@ -1110,8 +1211,8 @@ jobs:
       allow_frozen_target_scenario_omissions: ${{ inputs.allow_frozen_target_scenario_omissions }}
 
   validate_special_e2e:
-    needs: validate_selected_ref
-    if: inputs.include_repo_e2e && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'openshell-e2e')
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_repo_e2e && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'openshell-e2e'))
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -1132,13 +1233,23 @@ jobs:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          persist-credentials: false
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
           build-all-cache-scope: full
@@ -1263,8 +1374,14 @@ jobs:
           fi
 
   validate_docker_e2e:
-    needs: [validate_selected_ref, prepare_docker_e2e_image, plan_release_workflow_matrices]
-    if: inputs.include_release_path_suites && inputs.docker_lanes == '' && needs.plan_release_workflow_matrices.outputs.docker_e2e_count != '0'
+    needs:
+      [
+        candidate_execution,
+        validate_selected_ref,
+        prepare_docker_e2e_image,
+        plan_release_workflow_matrices,
+      ]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_release_path_suites && inputs.docker_lanes == '' && needs.plan_release_workflow_matrices.outputs.docker_e2e_count != '0')
     name: Docker E2E (${{ matrix.label }})
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
@@ -1273,53 +1390,53 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan_release_workflow_matrices.outputs.docker_e2e_matrix) }}
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      FACTORY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FACTORY_API_KEY || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_DOCKER_E2E_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.image }}
       OPENCLAW_DOCKER_E2E_BARE_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.bare_image }}
       OPENCLAW_DOCKER_E2E_FUNCTIONAL_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.functional_image }}
@@ -1347,7 +1464,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted release harness
@@ -1373,11 +1490,21 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
 
+      - name: Checkout trusted Node setup graph
+        if: contains(matrix.profiles, inputs.release_test_profile)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: contains(matrix.profiles, inputs.release_test_profile)
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -1619,8 +1746,8 @@ jobs:
           if-no-files-found: error
 
   plan_docker_lane_groups:
-    needs: validate_selected_ref
-    if: inputs.docker_lanes != ''
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.docker_lanes != '')
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 5
@@ -1651,8 +1778,14 @@ jobs:
           echo "groups_json=${groups_json}" >> "$GITHUB_OUTPUT"
 
   validate_docker_lanes:
-    needs: [validate_selected_ref, prepare_docker_e2e_image, plan_docker_lane_groups]
-    if: inputs.docker_lanes != ''
+    needs:
+      [
+        candidate_execution,
+        validate_selected_ref,
+        prepare_docker_e2e_image,
+        plan_docker_lane_groups,
+      ]
+    if: needs.candidate_execution.result == 'success' && (inputs.docker_lanes != '')
     name: Docker E2E targeted lanes (${{ matrix.group.label }})
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
@@ -1663,53 +1796,53 @@ jobs:
       matrix:
         group: ${{ fromJson(needs.plan_docker_lane_groups.outputs.groups_json) }}
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      FACTORY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FACTORY_API_KEY || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_DOCKER_E2E_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.image }}
       OPENCLAW_DOCKER_E2E_BARE_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.bare_image }}
       OPENCLAW_DOCKER_E2E_FUNCTIONAL_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.functional_image }}
@@ -1735,7 +1868,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted release harness
@@ -1759,10 +1892,19 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2007,15 +2149,15 @@ jobs:
           if-no-files-found: error
 
   validate_docker_openwebui:
-    needs: [validate_selected_ref, prepare_docker_e2e_image]
-    if: inputs.include_openwebui && inputs.docker_lanes == '' && (inputs.release_test_profile == 'stable' || inputs.release_test_profile == 'full')
+    needs: [candidate_execution, validate_selected_ref, prepare_docker_e2e_image]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_openwebui && inputs.docker_lanes == '' && (inputs.release_test_profile == 'stable' || inputs.release_test_profile == 'full'))
     name: Docker E2E (openwebui)
     continue-on-error: ${{ inputs.advisory }}
     runs-on: ${{ (vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' || inputs.use_github_hosted_runners) && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 60
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
       OPENCLAW_DOCKER_E2E_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.image }}
       OPENCLAW_DOCKER_E2E_FUNCTIONAL_IMAGE: ${{ needs.prepare_docker_e2e_image.outputs.functional_image }}
       OPENCLAW_DOCKER_E2E_PACKAGE_ARTIFACT_NAME: ${{ needs.prepare_docker_e2e_image.outputs.package_artifact_name || 'docker-e2e-package' }}
@@ -2030,7 +2172,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted release harness
@@ -2054,8 +2196,17 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GITHUB_TOKEN: ${{ github.token }}
 
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
           cache-mode: off
           node-version: ${{ env.NODE_VERSION }}
@@ -2204,8 +2355,8 @@ jobs:
 
   prepare_docker_e2e_image:
     name: Prepare shared Docker E2E image
-    needs: validate_selected_ref
-    if: inputs.prepare_only || inputs.include_release_path_suites || inputs.include_openwebui || inputs.docker_lanes != ''
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.prepare_only || inputs.include_release_path_suites || inputs.include_openwebui || inputs.docker_lanes != '')
     # Image preparation stays blocking even when validation suites are advisory.
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: ${{ inputs.release_test_profile == 'full' && 90 || 60 }}
@@ -2323,7 +2474,7 @@ jobs:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -2487,11 +2638,21 @@ jobs:
           fi
           node .release-harness/scripts/package-source-preflight.mjs "${args[@]}"
 
+      - name: Checkout trusted Node setup graph
+        if: (steps.plan.outputs.needs_package == '1' && steps.package_source.outputs.required == 'true') || (inputs.enable_prepublish_plugin_registry && steps.plan.outputs.needs_prepublish_plugin_registry == '1' && inputs.prepublish_plugin_registry_artifact_id == '')
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: (steps.plan.outputs.needs_package == '1' && steps.package_source.outputs.required == 'true') || (inputs.enable_prepublish_plugin_registry && steps.plan.outputs.needs_prepublish_plugin_registry == '1' && inputs.prepublish_plugin_registry_artifact_id == '')
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2905,12 +3066,13 @@ jobs:
         if: inputs.shared_image_policy == 'no-push-artifact' && steps.plan.outputs.needs_bare_image == '1' && inputs.shared_image_artifact_id == ''
         shell: bash
         env:
+          CACHE_MODE: ${{ needs.candidate_execution.outputs.cache_mode }}
           CACHE_IMAGE_REF: ${{ steps.image.outputs.bare_cache_image }}
           IMAGE_REF: ${{ steps.image.outputs.bare_image }}
         run: |
           set -euo pipefail
-          cache=()
-          if docker manifest inspect "$CACHE_IMAGE_REF" >/dev/null 2>&1; then
+          cache=(--no-cache)
+          if [[ "$CACHE_MODE" != "off" ]] && docker manifest inspect "$CACHE_IMAGE_REF" >/dev/null 2>&1; then
             if bash .release-harness/scripts/ci-docker-pull-retry.sh "$CACHE_IMAGE_REF"; then
               cache=(--cache-from "$CACHE_IMAGE_REF")
               echo "Using package-independent bare image cache: $CACHE_IMAGE_REF"
@@ -2931,6 +3093,7 @@ jobs:
         if: inputs.shared_image_policy == 'no-push-artifact' && steps.plan.outputs.needs_functional_image == '1' && inputs.shared_image_artifact_id == ''
         shell: bash
         env:
+          CACHE_MODE: ${{ needs.candidate_execution.outputs.cache_mode }}
           IMAGE_REF: ${{ steps.image.outputs.functional_image }}
           BARE_IMAGE_REF: ${{ steps.image.outputs.bare_image }}
           OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR: ${{ steps.prepublish_plugin_registry.outputs.manifest_sha256 != '' && format('{0}/.artifacts/prepublish-plugin-registry', github.workspace) || '' }}
@@ -2943,8 +3106,8 @@ jobs:
           source .release-harness/scripts/lib/docker-e2e-package.sh
           package_context="$(docker_e2e_prepare_package_context "$GITHUB_WORKSPACE/.artifacts/docker-e2e-package/openclaw-current.tgz")"
           trap 'rm -rf -- "$package_context"' EXIT
-          cache=()
-          if docker image inspect "$BARE_IMAGE_REF" >/dev/null 2>&1; then
+          cache=(--no-cache)
+          if [[ "$CACHE_MODE" != "off" ]] && docker image inspect "$BARE_IMAGE_REF" >/dev/null 2>&1; then
             cache=(--cache-from "$BARE_IMAGE_REF")
           fi
           timeout --kill-after=30s 45m env DOCKER_BUILDKIT=1 docker build \
@@ -3066,8 +3229,8 @@ jobs:
 
   bind_full_release_candidate_evidence:
     name: Bind full release candidate evidence
-    needs: [validate_selected_ref, prepare_docker_e2e_image]
-    if: inputs.emit_candidate_evidence && needs.prepare_docker_e2e_image.result == 'success'
+    needs: [candidate_execution, validate_selected_ref, prepare_docker_e2e_image]
+    if: needs.candidate_execution.result == 'success' && (inputs.emit_candidate_evidence && needs.prepare_docker_e2e_image.result == 'success')
     runs-on: ${{ !inputs.use_github_hosted_runners && github.repository == 'openclaw/openclaw' && vars.OPENCLAW_CI_RUNNER_BACKEND == 'hybrid' && 'blacksmith-4vcpu-ubuntu-2404' || 'ubuntu-24.04' }}
     timeout-minutes: 15
     permissions:
@@ -3472,8 +3635,8 @@ jobs:
           printf 'json=%s\n' "$(jq -cer . <<< "$binding")" >> "$GITHUB_OUTPUT"
 
   prepare_live_test_image:
-    needs: [validate_selected_ref, plan_release_workflow_matrices]
-    if: inputs.include_live_suites && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-') || startsWith(inputs.live_suite_filter, 'docker-live-models'))
+    needs: [candidate_execution, validate_selected_ref, plan_release_workflow_matrices]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-') || startsWith(inputs.live_suite_filter, 'docker-live-models')))
     # Image preparation stays blocking even when validation suites are advisory.
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 60
@@ -3496,7 +3659,7 @@ jobs:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -3549,13 +3712,13 @@ jobs:
           fi
 
       - name: Setup Docker builder
-        if: inputs.shared_image_policy == 'no-push-artifact'
+        if: needs.candidate_execution.outputs.privileged == 'true' && inputs.shared_image_policy == 'no-push-artifact'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: Dockerfile
 
       - name: Build shared live-test image
-        if: inputs.shared_image_policy == 'no-push-artifact'
+        if: needs.candidate_execution.outputs.privileged == 'true' && inputs.shared_image_policy == 'no-push-artifact'
         uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
         with:
           context: .
@@ -3570,6 +3733,23 @@ jobs:
           provenance: false
           load: true
           push: false
+
+      - name: Setup isolated Docker builder
+        if: needs.candidate_execution.outputs.privileged != 'true' && inputs.shared_image_policy == 'no-push-artifact'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
+      - name: Build isolated shared live-test image
+        if: needs.candidate_execution.outputs.privileged != 'true' && inputs.shared_image_policy == 'no-push-artifact'
+        env:
+          LIVE_IMAGE: ${{ steps.image.outputs.live_image }}
+          LIVE_IMAGE_EXTENSIONS: ${{ steps.image.outputs.live_image_extensions }}
+        run: |
+          set -euo pipefail
+          docker buildx build --no-cache --load --file ./Dockerfile --target build \
+            --build-arg "OPENCLAW_EXTENSIONS=$LIVE_IMAGE_EXTENSIONS" \
+            --platform linux/amd64 --tag "$LIVE_IMAGE" --sbom=false --provenance=false .
 
       # Keep trusted tooling outside the target's Docker build context. A frozen
       # target must not accidentally package the current checkout into its image.
@@ -3618,8 +3798,14 @@ jobs:
 
   validate_live_models_docker:
     name: Docker live models (${{ matrix.provider_label }})
-    needs: [validate_selected_ref, prepare_live_test_image, plan_release_workflow_matrices]
-    if: inputs.include_live_suites && inputs.live_model_providers == '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models') && needs.plan_release_workflow_matrices.outputs.live_models_count != '0'
+    needs:
+      [
+        candidate_execution,
+        validate_selected_ref,
+        prepare_live_test_image,
+        plan_release_workflow_matrices,
+      ]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && inputs.live_model_providers == '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models') && needs.plan_release_workflow_matrices.outputs.live_models_count != '0')
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 45
@@ -3627,41 +3813,41 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJson(needs.plan_release_workflow_matrices.outputs.live_models_matrix) }}
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_LIVE_PROVIDERS: ${{ matrix.providers }}
       OPENCLAW_LIVE_IMAGE: ${{ needs.prepare_live_test_image.outputs.live_image }}
       OPENCLAW_LIVE_MODELS: ${{ matrix.models || 'modern' }}
@@ -3675,7 +3861,7 @@ jobs:
         if: contains(matrix.profiles, inputs.release_test_profile)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -3731,11 +3917,21 @@ jobs:
             bash .release-harness/scripts/docker/shared-image-artifact.sh \
             load .artifacts/live-test-image live-test "$TARGET_SHA" "$WORKFLOW_SHA" "$LIVE_IMAGE"
 
+      - name: Checkout trusted Node setup graph
+        if: contains(matrix.profiles, inputs.release_test_profile)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: contains(matrix.profiles, inputs.release_test_profile)
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -3794,47 +3990,47 @@ jobs:
 
   validate_live_models_docker_targeted:
     name: Docker live models (selected providers)
-    needs: [validate_selected_ref, prepare_live_test_image]
-    if: inputs.include_live_suites && inputs.live_model_providers != '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models')
+    needs: [candidate_execution, validate_selected_ref, prepare_live_test_image]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && inputs.live_model_providers != '' && (inputs.live_suite_filter == '' || inputs.live_suite_filter == 'docker-live-models'))
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 45
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       REQUESTED_LIVE_MODEL_PROVIDERS: ${{ inputs.live_model_providers }}
       OPENCLAW_LIVE_IMAGE: ${{ needs.prepare_live_test_image.outputs.live_image }}
       OPENCLAW_LIVE_MAX_MODELS: "6"
@@ -3846,7 +4042,7 @@ jobs:
       - name: Checkout selected ref
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -3901,10 +4097,19 @@ jobs:
             bash .release-harness/scripts/docker/shared-image-artifact.sh \
             load .artifacts/live-test-image live-test "$TARGET_SHA" "$WORKFLOW_SHA" "$LIVE_IMAGE"
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -4018,8 +4223,8 @@ jobs:
         run: OPENCLAW_LIVE_DOCKER_REPO_ROOT="$GITHUB_WORKSPACE" timeout --foreground --kill-after=30s 35m bash .release-harness/scripts/test-live-models-docker.sh
 
   validate_live_provider_suites:
-    needs: validate_selected_ref
-    if: inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || (startsWith(inputs.live_suite_filter, 'native-live-') && !startsWith(inputs.live_suite_filter, 'native-live-extensions-media') && inputs.live_suite_filter != 'native-live-extensions-a-k'))
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || (startsWith(inputs.live_suite_filter, 'native-live-') && !startsWith(inputs.live_suite_filter, 'native-live-extensions-media') && inputs.live_suite_filter != 'native-live-extensions-a-k')))
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -4224,53 +4429,53 @@ jobs:
             advisory: true
             profiles: full
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_LIVE_VIDEO_GENERATION_SKIP_PROVIDERS: ""
       OPENCLAW_LIVE_VYDRA_VIDEO: "1"
       OPENCLAW_VITEST_MAX_WORKERS: "2"
@@ -4279,7 +4484,8 @@ jobs:
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-anthropic' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-anthropic-')) || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-opencode-go' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-opencode-go-')))
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          persist-credentials: false
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted live shard harness
@@ -4292,11 +4498,21 @@ jobs:
           fetch-depth: 1
           path: .release-harness
 
+      - name: Checkout trusted Node setup graph
+        if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-anthropic' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-anthropic-')) || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-opencode-go' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-opencode-go-')))
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-anthropic' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-anthropic-')) || (inputs.live_suite_filter == 'native-live-src-gateway-profiles-opencode-go' && startsWith(matrix.suite_id, 'native-live-src-gateway-profiles-opencode-go-')))
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -4380,8 +4596,8 @@ jobs:
 
   validate_live_docker_provider_suites:
     name: Docker live suites (${{ matrix.label }})
-    needs: [validate_selected_ref, prepare_live_test_image]
-    if: inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-'))
+    needs: [candidate_execution, validate_selected_ref, prepare_live_test_image]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'live-')))
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
@@ -4498,52 +4714,52 @@ jobs:
             profile_env_only: false
             profiles: stable full
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_LIVE_IMAGE: ${{ needs.prepare_live_test_image.outputs.live_image }}
       OPENCLAW_LIVE_REQUIRE_LOCAL_IMAGE: ${{ inputs.shared_image_policy == 'no-push-artifact' && '1' || '0' }}
       OPENCLAW_SELECTED_SHA: ${{ needs.validate_selected_ref.outputs.selected_sha }}
@@ -4557,7 +4773,7 @@ jobs:
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || inputs.live_suite_filter == matrix.suite_group)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           persist-credentials: false
 
@@ -4623,11 +4839,21 @@ jobs:
             bash .release-harness/scripts/docker/shared-image-artifact.sh \
             load .artifacts/live-test-image live-test "$TARGET_SHA" "$WORKFLOW_SHA" "$LIVE_IMAGE"
 
+      - name: Checkout trusted Node setup graph
+        if: steps.codex_compat.outputs.run_lane != 'false' && contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || inputs.live_suite_filter == matrix.suite_group)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: steps.codex_compat.outputs.run_lane != 'false' && contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || inputs.live_suite_filter == matrix.suite_group)
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -4707,8 +4933,8 @@ jobs:
 
   validate_live_media_provider_suites:
     name: Live media suites (${{ matrix.label }})
-    needs: validate_selected_ref
-    if: inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'native-live-extensions-media') || inputs.live_suite_filter == 'native-live-extensions-a-k')
+    needs: [candidate_execution, validate_selected_ref]
+    if: needs.candidate_execution.result == 'success' && (inputs.include_live_suites && !inputs.live_models_only && (inputs.live_suite_filter == '' || startsWith(inputs.live_suite_filter, 'native-live-extensions-media') || inputs.live_suite_filter == 'native-live-extensions-a-k'))
     continue-on-error: ${{ inputs.advisory || inputs.live_advisory }}
     runs-on: ${{ inputs.use_github_hosted_runners && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404' }}
     container:
@@ -4782,52 +5008,52 @@ jobs:
             advisory: true
             profiles: full
     env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
       OPENCLAW_LIVE_VIDEO_GENERATION_SKIP_PROVIDERS: ""
       OPENCLAW_LIVE_VYDRA_VIDEO: "1"
       OPENCLAW_VITEST_MAX_WORKERS: "2"
@@ -4836,7 +5062,8 @@ jobs:
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-extensions-media-video' && startsWith(matrix.suite_id, 'native-live-extensions-media-video-')))
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ needs.validate_selected_ref.outputs.selected_sha }}
+          persist-credentials: false
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted live shard harness
@@ -4857,11 +5084,21 @@ jobs:
           ffmpeg -version | head -1
           ffprobe -version | head -1
 
+      - name: Checkout trusted Node setup graph
+        if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-extensions-media-video' && startsWith(matrix.suite_id, 'native-live-extensions-media-video-')))
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: contains(matrix.profiles, inputs.release_test_profile) && (inputs.live_suite_filter == '' || inputs.live_suite_filter == matrix.suite_id || (inputs.live_suite_filter == 'native-live-extensions-media-video' && startsWith(matrix.suite_id, 'native-live-extensions-media-video-')))
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 

@@ -66,6 +66,7 @@ const defaults: Record<string, string> = {
   HOSTED_RUNNER_STRIPES: "false",
   RUNNER_PROFILE: "github",
   PROTOCOL_SINCE_BASE_SHA: base,
+  PROTOCOL_RELEASE_BASE_SHA: "",
   RATCHET_PR_HEAD_SHA: candidate,
 };
 

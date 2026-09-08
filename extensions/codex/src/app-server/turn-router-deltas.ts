@@ -1,5 +1,5 @@
 import { isJsonObject, type CodexServerNotification, type JsonValue } from "./protocol.js";
-import type { CodexThreadRouteScope } from "./turn-router.js";
+import type { CodexThreadRouteScope } from "./turn-router-types.js";
 
 // Bound each delayed string join so coalescing removes promise pressure without
 // replacing it with a single large allocation or long handler latency spike.

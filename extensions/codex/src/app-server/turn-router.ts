@@ -19,6 +19,9 @@ import {
   materializeQueuedNotification,
   type QueuedNotification,
 } from "./turn-router-deltas.js";
+import type { CodexThreadRouteScope } from "./turn-router-types.js";
+
+export type { CodexThreadRouteScope } from "./turn-router-types.js";
 
 const DEFAULT_PREBIND_NOTIFICATION_LIMIT = 256;
 const DEFAULT_GLOBAL_WARNING_LIMIT = 32;
@@ -26,10 +29,6 @@ export const CODEX_APP_SERVER_NATIVE_TURN_WAIT_TIMEOUT_MS = 30_000;
 
 export type CodexAppServerServerRequest = Required<Pick<RpcRequest, "id" | "method">> & {
   params?: JsonValue;
-};
-export type CodexThreadRouteScope = {
-  threadId: string;
-  turnId?: string;
 };
 type CodexThreadRequestHandler = (
   request: CodexAppServerServerRequest,

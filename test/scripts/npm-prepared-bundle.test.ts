@@ -1,9 +1,11 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import JSZip from "jszip";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parse } from "yaml";
+import { verifyCandidateNpmBundle } from "../../scripts/github/verify-candidate-npm-bundle.mjs";
 import {
   describeNpmBundle,
   describeNpmQualificationProof,
@@ -99,8 +101,12 @@ function packageSourceFixture(
   };
 }
 
-async function bundleFixture(callerWorkflowPath = workflowPath) {
-  const producer = packageProducer(callerWorkflowPath);
+async function bundleFixture(
+  callerWorkflowPath = workflowPath,
+  selectedSourceSha = sourceSha,
+  selectedToolingSha = toolingSha,
+) {
+  const producer = { ...packageProducer(callerWorkflowPath), workflowSha: selectedToolingSha };
   const tarball = Buffer.from("exact publishable root archive");
   const aiTarball = Buffer.from("exact publishable AI archive");
   const corePackage = {
@@ -113,7 +119,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
     schema: "openclaw.npm-package-bundle/v1",
     producer,
     releaseTag: "v2026.8.1",
-    releaseSha: sourceSha,
+    releaseSha: selectedSourceSha,
     npmDistTag: "beta",
     packageName: "openclaw",
     packageVersion: "2026.8.1",
@@ -138,7 +144,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
   });
   const descriptor = {
     schema: PREPARED_NPM_BUNDLE_SCHEMA,
-    source: { sha: sourceSha },
+    source: { sha: selectedSourceSha },
     artifact: {
       id: "78",
       name: "openclaw-npm-package-12-2",
@@ -151,7 +157,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
       fileName: manifest.tarballName,
       sha256: hash(tarball),
       version: manifest.packageVersion,
-      sourceSha,
+      sourceSha: selectedSourceSha,
     },
     corePackages: [corePackage],
     manifestSha256: hash(files.get("package-bundle.json")!),
@@ -160,7 +166,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
   const run = {
     id: 12,
     run_attempt: 2,
-    head_sha: toolingSha,
+    head_sha: selectedToolingSha,
     path: callerWorkflowPath,
     head_branch: "main",
     event: "workflow_dispatch",
@@ -173,7 +179,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
     id: 45,
     run_id: 12,
     run_attempt: 2,
-    head_sha: toolingSha,
+    head_sha: selectedToolingSha,
     name: producer.jobName,
     status: "completed",
     conclusion: "success",
@@ -185,7 +191,7 @@ async function bundleFixture(callerWorkflowPath = workflowPath) {
     size_in_bytes: archive.length,
     expired: false,
     expires_at: "2026-10-01T00:00:00Z",
-    workflow_run: { id: 12, head_sha: toolingSha },
+    workflow_run: { id: 12, head_sha: selectedToolingSha },
   };
   const runGh = (args: string[]) => {
     const endpoint = args[1];
@@ -803,4 +809,225 @@ describe("prepared npm bundle", () => {
     ).rejects.toThrow(expectedError);
     expect(existsSync(outputDir)).toBe(false);
   });
+});
+
+it("admits the exact trusted full-release fresh candidate bundle from its separate npm producer run", async () => {
+  const fixture = await bundleFixture(".github/workflows/full-release-artifacts.yml", toolingSha);
+  const outputDir = join(tempDirs.make("candidate-npm-authority-"), "bundle");
+  const result = await verifyCandidateNpmBundle({
+    descriptor: fixture.descriptor,
+    repository,
+    candidateSha: toolingSha,
+    workflowSha: toolingSha,
+    workflowRef: "refs/heads/main",
+    defaultBranch: "main",
+    callerWorkflowSha: toolingSha,
+    outputDir,
+    token: "fixture-token",
+    runGh: fixture.runGh,
+    fetchImpl: fixture.fetchImpl,
+  });
+  expect(readFileSync(result.tarballPath)).toEqual(fixture.files.get(fixture.manifest.tarballName));
+  const core = fixture.descriptor.corePackages[0];
+  if (!core) {
+    throw new Error("Expected core package fixture");
+  }
+  expect(readFileSync(join(result.coreTarballDir, core.tarballName))).toEqual(
+    fixture.files.get(core.tarballName),
+  );
+  const gate = readFileSync("scripts/github/verify-candidate-image-authority.sh", "utf8");
+  expect(gate).toContain('node "$(dirname "${BASH_SOURCE[0]}")/verify-candidate-npm-bundle.mjs"');
+});
+
+it.each([
+  "candidate source",
+  "isolated producer",
+  "forged job",
+  "producer run",
+  "producer attempt",
+  "artifact digest",
+  "artifact run",
+  "manifest source",
+  "forged manifest source",
+  "root bytes",
+  "core bytes",
+] as const)("rejects unproven prepared candidate bundle: %s", async (attack) => {
+  const fixture = await bundleFixture(
+    ".github/workflows/full-release-artifacts.yml",
+    attack === "forged manifest source" ? sourceSha : toolingSha,
+  );
+  const descriptor = structuredClone(fixture.descriptor);
+  if (attack === "forged manifest source") {
+    descriptor.source.sha = toolingSha;
+    descriptor.package.sourceSha = toolingSha;
+  }
+  let candidateSha = toolingSha;
+  if (attack === "candidate source") {
+    candidateSha = sourceSha;
+  }
+  if (attack === "isolated producer") {
+    descriptor.producer.workflowRef = `${repository}/.github/workflows/full-release-artifacts.yml@refs/heads/isolated`;
+  }
+  if (attack === "forged job") {
+    fixture.job.id = 46;
+  }
+  if (attack === "producer run") {
+    fixture.run.id = 13;
+  }
+  if (attack === "producer attempt") {
+    fixture.run.run_attempt = 3;
+  }
+  if (attack === "artifact digest") {
+    fixture.metadata.digest = `sha256:${"f".repeat(64)}`;
+  }
+  if (attack === "artifact run") {
+    fixture.metadata.workflow_run.id = 13;
+  }
+  if (attack === "manifest source") {
+    descriptor.source.sha = sourceSha;
+    descriptor.package.sourceSha = sourceSha;
+  }
+  if (attack === "root bytes") {
+    descriptor.package.sha256 = "f".repeat(64);
+  }
+  if (attack === "core bytes") {
+    const core = descriptor.corePackages[0];
+    if (!core) {
+      throw new Error("Expected core package fixture");
+    }
+    core.tarballSha256 = "f".repeat(64);
+  }
+  await expect(
+    verifyCandidateNpmBundle({
+      descriptor,
+      repository,
+      candidateSha,
+      workflowSha: toolingSha,
+      workflowRef: "refs/heads/main",
+      defaultBranch: "main",
+      callerWorkflowSha: toolingSha,
+      outputDir: join(tempDirs.make("candidate-npm-denied-"), "bundle"),
+      token: "fixture-token",
+      runGh: fixture.runGh,
+      fetchImpl: fixture.fetchImpl,
+    }),
+  ).rejects.toThrow();
+});
+
+it("runs the trusted LIVE candidate gate through the npm CLI and complete archive authority on a fresh miss", async () => {
+  const root = tempDirs.make("fresh-candidate-gate-");
+  const policy = join(root, ".candidate-policy");
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  for (const name of [
+    "github/classify-candidate-execution.mjs",
+    "github/verify-candidate-image-authority.sh",
+    "github/verify-candidate-npm-bundle.mjs",
+    "github/verify-same-run-candidate-artifact.sh",
+    "npm-prepared-bundle.mjs",
+    "release-tooling-identity.mjs",
+    "lib/actions-artifact-archive.mjs",
+    "lib/record-shared.mjs",
+    "lib/release-version.mjs",
+    "lib/npm-core-release-packages.json",
+  ]) {
+    const target = join(policy, "scripts", name);
+    mkdirSync(dirname(target), { recursive: true });
+    copyFileSync(resolve("scripts", name), target);
+  }
+  const git = (...args: string[]) =>
+    execFileSync(
+      "git",
+      [
+        "-C",
+        policy,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "-c",
+        "core.hooksPath=/dev/null",
+        ...args,
+      ],
+      { encoding: "utf8", env: { ...process.env, GIT_CONFIG_COUNT: "0" } },
+    ).trim();
+  git("init", "--quiet", "-b", "main");
+  git("add", ".");
+  git("commit", "--quiet", "-m", "trusted gate");
+  const sha = git("rev-parse", "HEAD");
+  git("update-ref", "refs/remotes/origin/main", sha);
+  const fixture = await bundleFixture(".github/workflows/full-release-artifacts.yml", sha, sha);
+  for (const [name, value] of Object.entries({
+    run: fixture.run,
+    jobs: { total_count: 1, jobs: [fixture.job] },
+    metadata: fixture.metadata,
+  })) {
+    writeFileSync(join(root, name), JSON.stringify(value));
+  }
+  writeFileSync(join(root, "archive"), fixture.archive);
+  writeFileSync(
+    join(bin, "gh"),
+    `#!/bin/sh
+case "$*" in
+ *jobs?*) cat "$FIXTURE_ROOT/jobs" ;;
+ *actions/artifacts/*) cat "$FIXTURE_ROOT/metadata" ;;
+ *) cat "$FIXTURE_ROOT/run" ;;
+esac
+`,
+    { mode: 0o755 },
+  );
+  const preload = join(root, "fetch.mjs");
+  writeFileSync(
+    preload,
+    `import { readFileSync } from "node:fs";
+globalThis.fetch = async (url) => String(url).endsWith("/zip")
+  ? new Response(readFileSync(process.env.FIXTURE_ROOT + "/archive"))
+  : Response.json(JSON.parse(readFileSync(process.env.FIXTURE_ROOT + "/metadata", "utf8")));
+`,
+  );
+  const live = parse(
+    readFileSync(".github/workflows/openclaw-live-and-e2e-checks-reusable.yml", "utf8"),
+  ) as {
+    jobs: {
+      candidate_execution: {
+        steps: { name: string; run?: string; with?: Record<string, unknown> }[];
+      };
+    };
+  };
+  const checkout = live.jobs.candidate_execution.steps.find(
+    (step) => step.name === "Checkout immutable candidate policy",
+  );
+  expect(checkout?.with?.["sparse-checkout"]).toBeUndefined();
+  const gate = live.jobs.candidate_execution.steps.find(
+    (step) => step.name === "Classify candidate before checkout or execution",
+  )?.run;
+  if (!gate) {
+    throw new Error("Expected real candidate gate");
+  }
+  const result = spawnSync("bash", ["-c", gate], {
+    cwd: root,
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      NODE_OPTIONS: `--import=${preload}`,
+      FIXTURE_ROOT: root,
+      CANDIDATE_REF: sha,
+      WORKFLOW_SHA: sha,
+      CALLER_WORKFLOW_SHA: sha,
+      WORKFLOW_REF: "refs/heads/main",
+      DEFAULT_BRANCH: "main",
+      GITHUB_REPOSITORY: repository,
+      GITHUB_RUN_ID: "99",
+      GITHUB_RUN_ATTEMPT: "1",
+      GITHUB_OUTPUT: join(root, "output"),
+      ARTIFACT_ID: "",
+      IMAGE_EXECUTION_SELECTED: "true",
+      SHARED_IMAGE_POLICY: "no-push-artifact",
+      PREPARED_NPM_BUNDLE_JSON: JSON.stringify(fixture.descriptor),
+      GH_TOKEN: "fixture-token",
+    },
+  });
+  expect(result.status, result.stderr).toBe(0);
+  expect(readFileSync(join(root, "output"), "utf8")).toContain("privileged=true\n");
 });

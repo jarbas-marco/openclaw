@@ -151,7 +151,63 @@ env:
   OPENCLAW_CI_OPENAI_MODEL: ${{ vars.OPENCLAW_CI_OPENAI_MODEL || 'openai/gpt-5.6-luna' }}
 
 jobs:
+  candidate_execution:
+    name: Classify candidate execution authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.classify.outputs.candidate_sha }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      privileged: ${{ steps.classify.outputs.privileged }}
+      cache_mode: ${{ steps.classify.outputs.cache_mode }}
+    steps:
+      - name: Resolve called workflow identity
+        id: workflow
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const job = JSON.parse(process.env.JOB_CONTEXT);
+          if (!/^[0-9a-f]{40}$/u.test(job.workflow_sha ?? "") ||
+              !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(job.workflow_repository ?? "")) {
+            throw new Error("The called job workflow identity is required");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `workflow_sha=${job.workflow_sha}\nworkflow_repository=${job.workflow_repository}\n`);
+          NODE
+      - name: Checkout immutable candidate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .candidate-policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify candidate before checkout or execution
+        id: classify
+        env:
+          CANDIDATE_REF: ${{ inputs.ref || github.sha }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cd .candidate-policy
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${CANDIDATE_REF}^{commit}")"
+          export CANDIDATE_SHA
+          node scripts/github/classify-candidate-execution.mjs
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   resolve_target:
+    if: needs.candidate_execution.result == 'success'
+    needs: [candidate_execution]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -199,7 +255,7 @@ jobs:
     steps:
       - name: Require trusted workflow ref for release checks
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           WORKFLOW_REF: ${{ github.ref }}
         run: |
           set -euo pipefail
@@ -217,7 +273,7 @@ jobs:
 
       - name: Validate ref input
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           set -euo pipefail
@@ -235,7 +291,7 @@ jobs:
         if: inputs.target_context_ref != ''
         env:
           TARGET_CONTEXT_REF: ${{ inputs.target_context_ref }}
-          TARGET_REF: ${{ inputs.ref }}
+          TARGET_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
         run: |
           set -euo pipefail
           normalized_context_ref="$TARGET_CONTEXT_REF"
@@ -268,7 +324,7 @@ jobs:
           CONTEXT_FETCH_REF: ${{ steps.trusted_qa_context.outputs.fetch_ref }}
           CONTEXT_KIND: ${{ steps.trusted_qa_context.outputs.context_kind }}
           CONTEXT_REF: ${{ steps.trusted_qa_context.outputs.normalized_ref }}
-          TARGET_REF: ${{ inputs.ref }}
+          TARGET_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           TRUSTED_REPOSITORY_URL: https://github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
@@ -314,7 +370,7 @@ jobs:
       - name: Fast-resolve selected ref
         id: fast_ref
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           EXPECTED_SHA: ${{ inputs.expected_sha }}
         run: |
           bash workflow/scripts/github/resolve-openclaw-ref.sh \
@@ -328,7 +384,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ inputs.ref }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           path: source
           fetch-depth: 0
           filter: blob:none
@@ -345,7 +401,7 @@ jobs:
         if: steps.fast_ref.outputs.fallback == 'true'
         working-directory: source
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -443,7 +499,7 @@ jobs:
       - name: Capture selected inputs
         id: inputs
         env:
-          RELEASE_REF_INPUT: ${{ inputs.ref }}
+          RELEASE_REF_INPUT: ${{ needs.candidate_execution.outputs.candidate_sha }}
           RELEASE_PROVIDER_INPUT: ${{ inputs.provider }}
           RELEASE_MODE_INPUT: ${{ inputs.mode }}
           RELEASE_PHASE_INPUT: ${{ inputs.phase }}
@@ -839,7 +895,7 @@ jobs:
 
       - name: Summarize validated ref
         env:
-          RELEASE_REF: ${{ inputs.ref }}
+          RELEASE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           RELEASE_SHA: ${{ steps.ref.outputs.sha }}
           RELEASE_REF_FAST_PATH: ${{ steps.fast_ref.outputs.fast }}
           RELEASE_PROVIDER: ${{ inputs.provider }}
@@ -920,8 +976,8 @@ jobs:
 
   prepare_release_package:
     name: Prepare release package artifact
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.package_required == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.package_required == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -977,11 +1033,21 @@ jobs:
             echo "run_id=${GITHUB_RUN_ID}"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Checkout trusted Node setup graph
+        if: needs.resolve_target.outputs.package_mode != 'artifact'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup Node environment
         if: needs.resolve_target.outputs.package_mode != 'artifact'
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
           install-deps: "true"
@@ -1327,8 +1393,8 @@ jobs:
           echo "json=" >> "$GITHUB_OUTPUT"
 
   install_smoke_release_checks:
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.install_smoke_scheduled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.install_smoke_scheduled == 'true')
     permissions:
       actions: read
       contents: read
@@ -1342,8 +1408,8 @@ jobs:
       update_baseline_version: ${{ needs.resolve_target.outputs.source_upgrade_baseline }}
 
   cross_os_release_checks:
-    needs: [resolve_target, prepare_release_package]
-    if: needs.resolve_target.outputs.cross_os_scheduled == 'true'
+    needs: [candidate_execution, resolve_target, prepare_release_package]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.cross_os_scheduled == 'true')
     permissions: read-all
     uses: ./.github/workflows/openclaw-cross-os-release-checks-reusable.yml
     with:
@@ -1369,17 +1435,17 @@ jobs:
       windows_runner: windows-2025
       macos_runner: macos-26
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCLAW_DISCORD_SMOKE_BOT_TOKEN: ${{ secrets.OPENCLAW_DISCORD_SMOKE_BOT_TOKEN }}
-      OPENCLAW_DISCORD_SMOKE_GUILD_ID: ${{ secrets.OPENCLAW_DISCORD_SMOKE_GUILD_ID }}
-      OPENCLAW_DISCORD_SMOKE_CHANNEL_ID: ${{ secrets.OPENCLAW_DISCORD_SMOKE_CHANNEL_ID }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCLAW_DISCORD_SMOKE_BOT_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_DISCORD_SMOKE_BOT_TOKEN || '' }}
+      OPENCLAW_DISCORD_SMOKE_GUILD_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_DISCORD_SMOKE_GUILD_ID || '' }}
+      OPENCLAW_DISCORD_SMOKE_CHANNEL_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_DISCORD_SMOKE_CHANNEL_ID || '' }}
 
   live_repo_e2e_release_checks:
     name: Run repo/live E2E validation
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.live_e2e_scheduled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.live_e2e_scheduled == 'true')
     permissions:
       actions: read
       contents: read
@@ -1404,58 +1470,58 @@ jobs:
       shared_image_artifact_namespace: release-live
       shared_image_policy: no-push-artifact
     secrets: &live_e2e_release_secrets
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      FACTORY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FACTORY_API_KEY || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
 
   docker_e2e_release_checks:
     name: Run Docker release-path validation
-    needs: [resolve_target, prepare_release_package]
-    if: needs.resolve_target.outputs.docker_required == 'true'
+    needs: [candidate_execution, resolve_target, prepare_release_package]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.docker_required == 'true')
     permissions:
       actions: read
       contents: read
@@ -1502,8 +1568,8 @@ jobs:
 
   package_acceptance_release_checks:
     name: Run package acceptance
-    needs: [resolve_target, prepare_release_package]
-    if: needs.resolve_target.outputs.package_acceptance_scheduled == 'true'
+    needs: [candidate_execution, resolve_target, prepare_release_package]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.package_acceptance_scheduled == 'true')
     permissions:
       actions: read
       contents: read
@@ -1538,60 +1604,60 @@ jobs:
       candidate_artifact_json: ${{ needs.resolve_target.outputs.package_acceptance_package_spec == '' && needs.prepare_release_package.outputs.candidate_artifact_json || '' }}
       shared_image_policy: no-push-artifact
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      ANTHROPIC_API_KEY_OLD: ${{ secrets.ANTHROPIC_API_KEY_OLD }}
-      ANTHROPIC_API_TOKEN: ${{ secrets.ANTHROPIC_API_TOKEN }}
-      FACTORY_API_KEY: ${{ secrets.FACTORY_API_KEY }}
-      BYTEPLUS_API_KEY: ${{ secrets.BYTEPLUS_API_KEY }}
-      CEREBRAS_API_KEY: ${{ secrets.CEREBRAS_API_KEY }}
-      DEEPINFRA_API_KEY: ${{ secrets.DEEPINFRA_API_KEY }}
-      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-      DASHSCOPE_API_KEY: ${{ secrets.DASHSCOPE_API_KEY }}
-      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-      KIMI_API_KEY: ${{ secrets.KIMI_API_KEY }}
-      MODELSTUDIO_API_KEY: ${{ secrets.MODELSTUDIO_API_KEY }}
-      MOONSHOT_API_KEY: ${{ secrets.MOONSHOT_API_KEY }}
-      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
-      MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
-      OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-      OPENCODE_ZEN_API_KEY: ${{ secrets.OPENCODE_ZEN_API_KEY }}
-      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ secrets.OPENCLAW_LIVE_BROWSER_CDP_URL }}
-      OPENCLAW_LIVE_SETUP_TOKEN: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN }}
-      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL }}
-      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE }}
-      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE }}
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-      QWEN_API_KEY: ${{ secrets.QWEN_API_KEY }}
-      FAL_KEY: ${{ secrets.FAL_KEY }}
-      RUNWAY_API_KEY: ${{ secrets.RUNWAY_API_KEY }}
-      DEEPGRAM_API_KEY: ${{ secrets.DEEPGRAM_API_KEY }}
-      TOGETHER_API_KEY: ${{ secrets.TOGETHER_API_KEY }}
-      VYDRA_API_KEY: ${{ secrets.VYDRA_API_KEY }}
-      XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
-      ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
-      Z_AI_API_KEY: ${{ secrets.Z_AI_API_KEY }}
-      BYTEPLUS_ACCESS_KEY_ID: ${{ secrets.BYTEPLUS_ACCESS_KEY_ID }}
-      BYTEPLUS_SECRET_ACCESS_KEY: ${{ secrets.BYTEPLUS_SECRET_ACCESS_KEY }}
-      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-      OPENCLAW_CODEX_AUTH_JSON: ${{ secrets.OPENCLAW_CODEX_AUTH_JSON }}
-      OPENCLAW_CODEX_CONFIG_TOML: ${{ secrets.OPENCLAW_CODEX_CONFIG_TOML }}
-      OPENCLAW_CLAUDE_JSON: ${{ secrets.OPENCLAW_CLAUDE_JSON }}
-      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_JSON }}
-      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON }}
-      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ secrets.OPENCLAW_GEMINI_SETTINGS_JSON }}
-      FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
-      OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENAI_BASE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_BASE_URL || '' }}
+      ANTHROPIC_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY || '' }}
+      ANTHROPIC_API_KEY_OLD: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_KEY_OLD || '' }}
+      ANTHROPIC_API_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ANTHROPIC_API_TOKEN || '' }}
+      FACTORY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FACTORY_API_KEY || '' }}
+      BYTEPLUS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_API_KEY || '' }}
+      CEREBRAS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CEREBRAS_API_KEY || '' }}
+      DEEPINFRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPINFRA_API_KEY || '' }}
+      DEEPSEEK_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPSEEK_API_KEY || '' }}
+      DASHSCOPE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DASHSCOPE_API_KEY || '' }}
+      GROQ_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GROQ_API_KEY || '' }}
+      KIMI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.KIMI_API_KEY || '' }}
+      MODELSTUDIO_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MODELSTUDIO_API_KEY || '' }}
+      MOONSHOT_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MOONSHOT_API_KEY || '' }}
+      MISTRAL_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MISTRAL_API_KEY || '' }}
+      MINIMAX_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.MINIMAX_API_KEY || '' }}
+      OPENCODE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_API_KEY || '' }}
+      OPENCODE_ZEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCODE_ZEN_API_KEY || '' }}
+      OPENCLAW_LIVE_BROWSER_CDP_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_BROWSER_CDP_URL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_MODEL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_MODEL || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_PROFILE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_PROFILE || '' }}
+      OPENCLAW_LIVE_SETUP_TOKEN_VALUE: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_LIVE_SETUP_TOKEN_VALUE || '' }}
+      GEMINI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GEMINI_API_KEY || '' }}
+      GOOGLE_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.GOOGLE_API_KEY || '' }}
+      OPENROUTER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENROUTER_API_KEY || '' }}
+      QWEN_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.QWEN_API_KEY || '' }}
+      FAL_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FAL_KEY || '' }}
+      RUNWAY_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.RUNWAY_API_KEY || '' }}
+      DEEPGRAM_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.DEEPGRAM_API_KEY || '' }}
+      TOGETHER_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.TOGETHER_API_KEY || '' }}
+      VYDRA_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.VYDRA_API_KEY || '' }}
+      XAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.XAI_API_KEY || '' }}
+      ZAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.ZAI_API_KEY || '' }}
+      Z_AI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.Z_AI_API_KEY || '' }}
+      BYTEPLUS_ACCESS_KEY_ID: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_ACCESS_KEY_ID || '' }}
+      BYTEPLUS_SECRET_ACCESS_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.BYTEPLUS_SECRET_ACCESS_KEY || '' }}
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.CLAUDE_CODE_OAUTH_TOKEN || '' }}
+      OPENCLAW_CODEX_AUTH_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_AUTH_JSON || '' }}
+      OPENCLAW_CODEX_CONFIG_TOML: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CODEX_CONFIG_TOML || '' }}
+      OPENCLAW_CLAUDE_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_JSON || '' }}
+      OPENCLAW_CLAUDE_CREDENTIALS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_CREDENTIALS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_JSON || '' }}
+      OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_CLAUDE_SETTINGS_LOCAL_JSON || '' }}
+      OPENCLAW_GEMINI_SETTINGS_JSON: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_GEMINI_SETTINGS_JSON || '' }}
+      FIREWORKS_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.FIREWORKS_API_KEY || '' }}
+      OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
 
   maturity_scorecard_release_checks:
     name: Render maturity scorecard release docs
-    needs: [resolve_target]
-    if: contains(fromJSON('["all","qa"]'), needs.resolve_target.outputs.rerun_group) && needs.resolve_target.outputs.run_maturity_scorecard == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (contains(fromJSON('["all","qa"]'), needs.resolve_target.outputs.rerun_group) && needs.resolve_target.outputs.run_maturity_scorecard == 'true')
     permissions:
       actions: read
       contents: read
@@ -1600,14 +1666,14 @@ jobs:
       ref: ${{ needs.resolve_target.outputs.ref }}
       expected_sha: ${{ needs.resolve_target.outputs.revision }}
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
 
   qa_lab_parity_lane_release_checks:
     name: Run QA Lab parity lane (${{ matrix.lane }})
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -1637,7 +1703,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted QA Anthropic mock tooling
@@ -1666,10 +1732,19 @@ jobs:
           rm -rf -- "$trusted_checkout"
           trap - EXIT
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -1775,8 +1850,8 @@ jobs:
 
   qa_lab_parity_report_release_checks:
     name: Run QA Lab parity report
-    needs: [resolve_target, qa_lab_parity_lane_release_checks]
-    if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
+    needs: [candidate_execution, resolve_target, qa_lab_parity_lane_release_checks]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -1791,7 +1866,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted release artifact resolver
@@ -1804,10 +1879,19 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -1902,8 +1986,8 @@ jobs:
 
   qa_lab_runtime_pair_lane_release_checks:
     name: Run QA Lab runtime-pair lane (${{ matrix.lane }})
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')
     continue-on-error: true
     runs-on: ${{ vars.OPENCLAW_CI_RUNNER_BACKEND == 'github' && 'ubuntu-24.04' || 'blacksmith-8vcpu-ubuntu-2404' }}
     timeout-minutes: 45
@@ -1929,13 +2013,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2118,8 +2211,8 @@ jobs:
 
   qa_lab_runtime_parity_release_checks:
     name: Verify QA Lab runtime-pair lanes
-    needs: [resolve_target, qa_lab_runtime_pair_lane_release_checks]
-    if: always() && needs.resolve_target.outputs.qa_parity_scheduled == 'true'
+    needs: [candidate_execution, resolve_target, qa_lab_runtime_pair_lane_release_checks]
+    if: needs.candidate_execution.result == 'success' && (always() && needs.resolve_target.outputs.qa_parity_scheduled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -2235,8 +2328,8 @@ jobs:
 
   runtime_tool_coverage_release_checks:
     name: Enforce QA Lab runtime tool coverage
-    needs: [resolve_target, qa_lab_runtime_parity_release_checks]
-    if: needs.resolve_target.outputs.qa_parity_scheduled == 'true'
+    needs: [candidate_execution, resolve_target, qa_lab_runtime_parity_release_checks]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -2250,7 +2343,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted release artifact resolver
@@ -2263,10 +2356,19 @@ jobs:
           sparse-checkout-cone-mode: false
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2344,8 +2446,8 @@ jobs:
 
   qa_live_release_checks:
     name: Run QA Live Matrix catalog
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_matrix_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_matrix_enabled == 'true')
     permissions:
       contents: read
       pull-requests: read
@@ -2357,14 +2459,14 @@ jobs:
       run_matrix: true
       fail_fast: ${{ fromJSON(needs.resolve_target.outputs.fail_fast) }}
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
 
   qa_live_buzz_release_checks:
     name: Run QA Lab live Buzz lane
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_buzz_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_buzz_enabled == 'true')
     permissions:
       contents: read
       pull-requests: read
@@ -2376,16 +2478,16 @@ jobs:
       run_buzz: true
       buzz_scenario: channel-canary,channel-mention-gating
     secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+      OPENAI_API_KEY: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}
+      OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+      OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
 
   # The child owns Telegram evidence/status artifacts. Preserve its actual outcome
   # while release policy treats this pool-dependent test attempt as advisory.
   qa_live_telegram_release_checks:
     name: Run QA Lab live Telegram lane
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_telegram_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.candidate_execution.outputs.privileged == 'true' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_telegram_enabled == 'true'))
     continue-on-error: true
     outputs:
       conclusion: ${{ steps.dispatch.outputs.conclusion || steps.dispatch.outcome }}
@@ -2526,8 +2628,8 @@ jobs:
 
   qa_live_discord_release_checks:
     name: Run QA Lab live Discord lane
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_discord_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_discord_enabled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2543,21 +2645,30 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
       - &release_qa_required_credentials_step
         name: Validate required QA credential env
         env:
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -2582,8 +2693,8 @@ jobs:
         id: run_lane
         shell: bash
         env:
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
           OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1"
         run: |
           set -euo pipefail
@@ -2642,8 +2753,8 @@ jobs:
 
   qa_live_whatsapp_release_checks:
     name: Run QA Lab live WhatsApp lane
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_whatsapp_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_whatsapp_enabled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2662,13 +2773,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2682,8 +2802,8 @@ jobs:
         id: run_lane
         shell: bash
         env:
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
           OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1"
         run: |
           set -euo pipefail
@@ -2742,8 +2862,8 @@ jobs:
 
   qa_live_slack_release_checks:
     name: Run QA Lab live Slack lane
-    needs: [resolve_target]
-    if: needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_slack_enabled == 'true'
+    needs: [candidate_execution, resolve_target]
+    if: needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_live_scheduled == 'true' && needs.resolve_target.outputs.qa_live_slack_enabled == 'true')
     continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -2759,13 +2879,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.resolve_target.outputs.revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "true"
 
@@ -2779,8 +2908,8 @@ jobs:
         id: run_lane
         shell: bash
         env:
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
           OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1"
         run: |
           set -euo pipefail
@@ -2840,25 +2969,28 @@ jobs:
   summary:
     name: Verify release checks
     needs:
-      - resolve_target
-      - prepare_release_package
-      - install_smoke_release_checks
-      - cross_os_release_checks
-      - live_repo_e2e_release_checks
-      - docker_e2e_release_checks
-      - package_acceptance_release_checks
-      - qa_lab_parity_lane_release_checks
-      - maturity_scorecard_release_checks
-      - qa_lab_parity_report_release_checks
-      - qa_lab_runtime_parity_release_checks
-      - runtime_tool_coverage_release_checks
-      - qa_live_release_checks
-      - qa_live_buzz_release_checks
-      - qa_live_telegram_release_checks
-      - qa_live_discord_release_checks
-      - qa_live_whatsapp_release_checks
-      - qa_live_slack_release_checks
-    if: always()
+      [
+        candidate_execution,
+        resolve_target,
+        prepare_release_package,
+        install_smoke_release_checks,
+        cross_os_release_checks,
+        live_repo_e2e_release_checks,
+        docker_e2e_release_checks,
+        package_acceptance_release_checks,
+        qa_lab_parity_lane_release_checks,
+        maturity_scorecard_release_checks,
+        qa_lab_parity_report_release_checks,
+        qa_lab_runtime_parity_release_checks,
+        runtime_tool_coverage_release_checks,
+        qa_live_release_checks,
+        qa_live_buzz_release_checks,
+        qa_live_telegram_release_checks,
+        qa_live_discord_release_checks,
+        qa_live_whatsapp_release_checks,
+        qa_live_slack_release_checks,
+      ]
+    if: needs.candidate_execution.result == 'success' && (always())
     runs-on: ubuntu-24.04
     permissions:
       actions: read
