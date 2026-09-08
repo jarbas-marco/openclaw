@@ -1607,6 +1607,7 @@ describe("createBackupArchive", () => {
           layout: "state-only",
           prefix: "openclaw-backup-recovery-preserved-root-",
           scenario: "minimal",
+          env: { OPENCLAW_OAUTH_DIR: undefined },
         },
         async (state) => {
           const excludedRoot = state.statePath("internal-agent-runs", "declared");
@@ -1663,6 +1664,7 @@ describe("createBackupArchive", () => {
           layout: "state-only",
           prefix: "openclaw-backup-recovery-symlinked-root-",
           scenario: "minimal",
+          env: { OPENCLAW_OAUTH_DIR: undefined },
         },
         async (state) => {
           const outputPath = state.path("archive.tar.gz");

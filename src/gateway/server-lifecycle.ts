@@ -11,7 +11,7 @@ import {
 } from "../infra/diagnostic-events.js";
 import { upsertPresence } from "../infra/system-presence.js";
 import { startDiagnosticHeartbeat, stopDiagnosticHeartbeat } from "../logging/diagnostic.js";
-import type { createSubsystemLogger } from "../logging/subsystem.js";
+import type { SubsystemLogger as GatewayLogger } from "../logging/subsystem.js";
 import { clearSecretsRuntimeSnapshotState } from "../secrets/runtime-state.js";
 import { AsyncWorkScope } from "../shared/async-work-scope.js";
 import {
@@ -27,11 +27,8 @@ import { disposeNodeConnectionNotifications } from "./node-connection-notificati
 import { clearNodeWakeState } from "./node-wake-state.js";
 import { createLazyGatewayCronState } from "./server-cron-lazy.js";
 import { createGatewayCronReconciliation } from "./server-cron-reconciled.js";
-import {
-  applyGatewayLaneConcurrency,
-  resolveGatewayLaneConcurrency,
-  startGatewayLaneAdmissionMonitor,
-} from "./server-lanes.js";
+import { registerLaneAdmission } from "./server-lane-admission.js";
+import { applyGatewayLaneConcurrency, resolveGatewayLaneConcurrency } from "./server-lanes.js";
 import { createGatewayServerLiveState } from "./server-live-state.js";
 import type { GatewayRequestContext } from "./server-methods/types.js";
 import {
@@ -53,7 +50,6 @@ import { broadcastPresenceSnapshot } from "./server/presence-events.js";
 import { createSessionViewerPresenceDeclarations } from "./session-viewer-presence.js";
 
 type GatewayRuntimePreparation = Awaited<ReturnType<typeof prepareGatewayKernelState>>;
-type GatewayLogger = ReturnType<typeof createSubsystemLogger>;
 
 export async function prepareGatewayLifecycle(params: {
   runtime: GatewayRuntimePreparation;
@@ -514,24 +510,7 @@ export async function prepareGatewayLifecycle(params: {
       runtimeState.gatewayLifetimeSidecars = sidecars;
     },
   });
-  gatewayLifetimeSidecarStopOwner.publish([
-    startGatewayLaneAdmissionMonitor(readinessEventLoopHealth.snapshot, (transition) => {
-      const details = {
-        configured: transition.configured,
-        effective: transition.effective,
-        pressureFactor: transition.pressureFactor,
-        pressureLevel: transition.pressureLevel,
-        reasons: transition.reasons,
-      };
-      if (transition.degraded) {
-        log.warn("gateway lane admissions reduced under event-loop pressure", details);
-      } else if (transition.pressureFactor === 1) {
-        log.info("gateway lane admission ceilings restored after event-loop recovery", details);
-      } else {
-        log.info("gateway lane admissions recovering after event-loop pressure", details);
-      }
-    }),
-  ]);
+  registerLaneAdmission(readinessEventLoopHealth.snapshot, log, gatewayLifetimeSidecarStopOwner);
   const stopRegisteredPostReadySidecars = postReadySidecarStopOwner.stop;
   const stopRegisteredGatewayLifetimeSidecars = gatewayLifetimeSidecarStopOwner.stop;
   const sealAndJoinRegisteredSidecarStops = async () => {
