@@ -2187,7 +2187,7 @@ describe("scripts/changed-lanes", () => {
       paths: ["assets/avatar-placeholder.svg", "assets/chrome-extension/icons/icon128.png"],
       excludesTests: false,
     },
-  ])("$name", ({ paths, excludesTests, broad = false }) => {
+  ])("$name", ({ paths, excludesTests, broad }) => {
     const result = detectChangedLanes(paths);
     const commands = createChangedCheckPlan(result).commands.map((command) => command.args[0]);
 
