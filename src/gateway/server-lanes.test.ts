@@ -6,6 +6,10 @@ import { createDeferred } from "../../test/helpers/promise.js";
 import { DEFAULT_CRON_MAX_CONCURRENT_RUNS } from "../config/cron-limits.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
+  createBackgroundWorkOwner,
+  getBackgroundWorkSnapshot,
+} from "../process/background-work.js";
+import {
   enqueueCommandInLane,
   getCommandLaneSnapshot,
   setCommandLaneConcurrency,
@@ -142,7 +146,25 @@ describe("applyGatewayLaneConcurrency", () => {
     await nestedRun;
     expect(started).toBe(true);
   });
-
+  it("preserves shared background capacity across gateway lane publication", async () => {
+    const owner = createBackgroundWorkOwner({ owner: "plugin:reload-test", maxConcurrent: 3 });
+    const gates = Array.from({ length: 3 }, () => createDeferred());
+    const active = gates.map((gate) => owner.enqueue(async () => await gate.promise));
+    let nextStarted = false;
+    const next = owner.enqueue(async () => {
+      nextStarted = true;
+    });
+    try {
+      applyConfigLaneConcurrency({ hooks: { enabled: true } });
+      applyConfigLaneConcurrency({ hooks: { enabled: false } });
+      expect(getBackgroundWorkSnapshot()).toMatchObject({ activeCount: 3, queuedCount: 1 });
+      expect(nextStarted).toBe(false);
+    } finally {
+      gates.forEach((gate) => gate.resolve());
+      await Promise.all([...active, next]);
+    }
+    expect(nextStarted).toBe(true);
+  });
   it("reduces only new admissions under pressure and restores configured ceilings", async () => {
     vi.useFakeTimers();
     applyGatewayLaneConcurrency(

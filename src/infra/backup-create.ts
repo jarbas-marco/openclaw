@@ -1,4 +1,5 @@
 // Creates backup archives while filtering volatile runtime state.
+import { realpathSync } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -34,24 +35,16 @@ import {
   BACKUP_RECOVERY_PROFILE_STATE_ROOTS,
   buildBackupRecoveryProfileManifest,
 } from "./backup-recovery-profile.js";
-import {
-  classifyBackupSqliteSource,
-  createBackupSqliteSnapshotPlan,
-} from "./backup-sqlite-snapshot.js";
+import { classifyBackupSqliteSource } from "./backup-sqlite-snapshot.js";
+import { createConsistentStateSnapshotPlan } from "./backup-state-snapshot.js";
 import { writeTarArchiveWithRetry } from "./backup-tar-retry.js";
-import { isVolatileBackupPath } from "./backup-volatile-filter.js";
 import {
   createBackupLinkCache,
   createBackupVolatileStatCache,
 } from "./backup-volatile-stat-cache.js";
 import { isErrno } from "./errors.js";
 import { writeJson } from "./json-files.js";
-import {
-  createLegacyAuditBackupSnapshots,
-  hasLegacyAuditBackupSources,
-  isLegacyAuditMigrationBackupPath,
-} from "./state-migrations.audit-backup.js";
-import { withLegacyAuditMigrationLease } from "./state-migrations.audit-coordination.js";
+import { isLegacyAuditMigrationBackupPath } from "./state-migrations.audit-backup.js";
 
 const loadTarRuntime = createLazyRuntimeModule(() => import("tar"));
 
@@ -245,54 +238,37 @@ async function chooseBackupTempRoot(params: {
   return fallback;
 }
 
-function buildManifest(params: {
-  createdAt: string;
-  archiveRoot: string;
-  includeWorkspace: boolean;
-  onlyConfig: boolean;
-  recoveryProfile: boolean;
-  assets: BackupAsset[];
-  skipped: BackupCreateResult["skipped"];
-  stateDir: string;
-  configPath: string;
-  oauthDir: string;
-  workspaceDirs: string[];
-  agentRoots: readonly BackupAgentRoot[];
-}): BackupManifest {
+function buildManifest(
+  result: BackupCreateResult,
+  plan: Awaited<ReturnType<typeof resolveBackupPlanFromDisk>>,
+): BackupManifest {
   return {
-    // Normal archives remain v1. Recovery archives use v2 so an older reader
-    // cannot silently ignore their stronger omission contract.
-    schemaVersion: params.recoveryProfile ? 2 : 1,
-    createdAt: params.createdAt,
-    archiveRoot: params.archiveRoot,
+    schemaVersion: result.recoveryProfile ? 2 : 1,
+    createdAt: result.createdAt,
+    archiveRoot: result.archiveRoot,
     runtimeVersion: resolveRuntimeServiceVersion(),
     platform: process.platform,
     nodeVersion: process.version,
     options: {
-      includeWorkspace: params.includeWorkspace,
-      onlyConfig: params.onlyConfig,
-      ...(params.recoveryProfile ? { recoveryProfile: buildBackupRecoveryProfileManifest() } : {}),
+      includeWorkspace: result.includeWorkspace,
+      onlyConfig: result.onlyConfig,
+      ...(result.recoveryProfile ? { recoveryProfile: buildBackupRecoveryProfileManifest() } : {}),
     },
     paths: {
-      stateDir: params.stateDir,
-      configPath: params.configPath,
-      oauthDir: params.oauthDir,
-      workspaceDirs: params.workspaceDirs,
-      ...(params.onlyConfig
-        ? {}
-        : {
-            agentRoots: params.agentRoots.map(({ agentId, sourcePath }) => ({
-              agentId,
-              sourcePath,
-            })),
-          }),
+      stateDir: result.recoveryProfile
+        ? resolveRecoveryProfileStateAsset(result.assets).sourcePath
+        : plan.stateDir,
+      configPath: plan.configPath,
+      oauthDir: plan.oauthDir,
+      workspaceDirs: plan.workspaceDirs,
+      ...(result.agentRoots ? { agentRoots: [...result.agentRoots] } : {}),
     },
-    assets: params.assets.map((asset) => ({
+    assets: result.assets.map((asset) => ({
       kind: asset.kind,
       sourcePath: asset.sourcePath,
       archivePath: asset.archivePath,
     })),
-    skipped: params.skipped.map((entry) => ({
+    skipped: result.skipped.map((entry) => ({
       kind: entry.kind,
       sourcePath: entry.sourcePath,
       reason: entry.reason,
@@ -353,6 +329,32 @@ function remapArchiveEntryPath(params: {
     return buildBackupArchivePath(params.archiveRoot, remappedSourcePath);
   }
   return buildBackupArchivePath(params.archiveRoot, normalizedEntry);
+}
+
+function remapDeclaredAbsoluteSymbolicLinkTarget(params: {
+  linkpath: string | undefined;
+  archiveEntryPath: string;
+  archiveRoot: string;
+  assets: readonly BackupAsset[];
+}): string | undefined {
+  if (!params.linkpath || !path.isAbsolute(params.linkpath) || params.linkpath.includes("\\")) {
+    return params.linkpath;
+  }
+  // Tar exposes the first link hop, while assets own the final canonical path.
+  // Resolve before containment so chains map to one portable archive target.
+  let targetSourcePath: string;
+  try {
+    targetSourcePath = realpathSync(params.linkpath);
+  } catch {
+    return params.linkpath;
+  }
+  if (!params.assets.some((asset) => isPathWithin(targetSourcePath, asset.sourcePath))) {
+    return params.linkpath;
+  }
+  return path.posix.relative(
+    path.posix.dirname(params.archiveEntryPath),
+    buildBackupArchivePath(params.archiveRoot, targetSourcePath),
+  );
 }
 
 function isBackupTarFilterFile(entry: import("node:fs").Stats | import("tar").ReadEntry): boolean {
@@ -502,34 +504,12 @@ export async function createBackupArchive(
   }
   const tempArchivePath = publication.tempArchivePath;
   try {
-    // Capture every legacy file first, including active and claimed sources.
-    // A concurrent Doctor then leaves each row in this snapshot, the later
-    // SQLite snapshot, or both; restore-side import keys make overlap harmless.
-    const hasLegacyAuditSources = stateAsset
-      ? await hasLegacyAuditBackupSources(stateAsset.sourcePath)
-      : false;
-    const createSnapshotPlans = async () => {
-      const legacyAuditSnapshots =
-        stateAsset && hasLegacyAuditSources
-          ? await createLegacyAuditBackupSnapshots({
-              stateDir: stateAsset.sourcePath,
-              tempDir,
-            })
-          : [];
-      const stateSqliteBackup = !onlyConfig
-        ? await createBackupSqliteSnapshotPlan({
-            inventory: plan.inventory,
-            tempDir,
-            legacyAuditSnapshots,
-          })
-        : { snapshots: [], discoveredSourcePaths: new Set<string>() };
-      return { legacyAuditSnapshots, stateSqliteBackup };
-    };
-    const snapshotPlans =
-      stateAsset && hasLegacyAuditSources
-        ? await withLegacyAuditMigrationLease(stateAsset.sourcePath, createSnapshotPlans)
-        : await createSnapshotPlans();
-    const { legacyAuditSnapshots, stateSqliteBackup } = snapshotPlans;
+    const { legacyAuditSnapshots, stateSqliteBackup } = await createConsistentStateSnapshotPlan({
+      inventory: plan.inventory,
+      stateDir: stateAsset?.sourcePath,
+      tempDir,
+      onlyConfig,
+    });
     const sourcePathRemaps = new Map<string, string>();
     const skippedStateSourcePaths = new Set<string>();
     for (const snapshot of stateSqliteBackup.snapshots) {
@@ -544,25 +524,11 @@ export async function createBackupArchive(
         skippedStateSourcePaths.add(skippedSourcePath);
       }
     }
-    const manifest = buildManifest({
-      createdAt,
-      archiveRoot,
-      includeWorkspace,
-      onlyConfig,
-      recoveryProfile,
-      assets: result.assets,
-      skipped: result.skipped,
-      stateDir: recoveryProfile && stateAsset ? stateAsset.sourcePath : plan.stateDir,
-      configPath: plan.configPath,
-      oauthDir: plan.oauthDir,
-      workspaceDirs: plan.workspaceDirs,
-      agentRoots: plan.inventory.agentRoots,
-    });
+    const manifest = buildManifest(result, plan);
     await writeJson(manifestPath, manifest, { trailingNewline: true });
 
     const tar = await loadTarRuntime();
     const gatewayLockDir = resolveGatewayLockDir(plan.stateDir);
-    const volatilePlan = { stateDirs: [stateAsset?.sourcePath ?? plan.stateDir] };
     let skippedVolatileCount = 0;
     // node-tar invokes filter/onWriteEntry from async filesystem callbacks, so
     // collect violations there and reject only after tar settles.
@@ -616,7 +582,7 @@ export async function createBackupArchive(
         unexpectedSqliteSourcePaths.push(entryPath);
         return false;
       }
-      if (isVolatileBackupPath(entryPath, volatilePlan)) {
+      if (plan.inventory.isVolatile(resolvedEntryPath)) {
         skippedVolatileCount += 1;
         return false;
       }
@@ -641,7 +607,7 @@ export async function createBackupArchive(
                 portable: true,
                 preservePaths: true,
                 linkCache: createBackupLinkCache(),
-                statCache: createBackupVolatileStatCache(volatilePlan),
+                statCache: createBackupVolatileStatCache(plan.inventory.isVolatile),
                 filter: (entryPath, entryStat) => {
                   reportProgress({ phase: "traversal", entryPath });
                   return tarFilter(entryPath, entryStat);
@@ -662,11 +628,17 @@ export async function createBackupArchive(
                   });
                   if (entry.type === "SymbolicLink" && !archiveSymlinkViolation) {
                     try {
+                      entry.linkpath = remapDeclaredAbsoluteSymbolicLinkTarget({
+                        linkpath: entry.linkpath,
+                        archiveEntryPath,
+                        archiveRoot,
+                        assets: result.assets,
+                      });
                       assertArchiveSymbolicLinkTarget({
                         archiveRoot,
                         entryPath: archiveEntryPath,
                         linkpath: entry.linkpath,
-                        assetArchivePaths: manifest.assets.map((asset) => asset.archivePath),
+                        assets: manifest.assets,
                       });
                     } catch (error) {
                       archiveSymlinkViolation =

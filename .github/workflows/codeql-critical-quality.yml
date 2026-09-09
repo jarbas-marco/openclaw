@@ -25,111 +25,7 @@ on:
           - session-diagnostics-boundary
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - ".github/codeql/**"
-      - ".github/workflows/codeql-critical-quality.yml"
-      - "extensions/*.ts"
-      - "extensions/**/*.ts"
-      - "packages/plugin-package-contract/**"
-      - "packages/plugin-sdk/**"
-      - "packages/memory-host-sdk/**"
-      - "packages/net-policy/**"
-      - "src/*.ts"
-      - "src/**/*.ts"
-      - "src/config/**"
-      - "extensions/discord/src/**"
-      - "extensions/feishu/src/**"
-      - "extensions/googlechat/src/**"
-      - "extensions/imessage/src/**"
-      - "extensions/irc/src/**"
-      - "extensions/line/src/**"
-      - "extensions/matrix/src/**"
-      - "extensions/mattermost/src/**"
-      - "extensions/msteams/src/**"
-      - "extensions/nextcloud-talk/src/**"
-      - "extensions/nostr/src/**"
-      - "extensions/qa-channel/src/**"
-      - "extensions/signal/src/**"
-      - "extensions/slack/src/**"
-      - "extensions/synology-chat/src/**"
-      - "extensions/telegram/src/**"
-      - "extensions/tlon/src/**"
-      - "extensions/twitch/src/**"
-      - "extensions/whatsapp/src/**"
-      - "extensions/zalo/src/**"
-      - "extensions/zalouser/src/**"
-      - "src/agents/*auth*.ts"
-      - "src/agents/**/*auth*.ts"
-      - "src/agents/auth-health*.ts"
-      - "src/agents/auth-profiles"
-      - "src/agents/auth-profiles/**"
-      - "src/agents/bash-tools.exec-host-shared.ts"
-      - "src/agents/sandbox"
-      - "src/agents/sandbox/**"
-      - "src/agents/sandbox.ts"
-      - "src/agents/sandbox-*.ts"
-      - "src/acp/control-plane/**"
-      - "src/agents/cli-runner/**"
-      - "src/agents/command/**"
-      - "src/agents/embedded-agent-runner/**"
-      - "src/agents/sessions/**"
-      - "src/agents/sessions/tools/**"
-      - "src/agents/tools/**"
-      - "src/agents/*completion*.ts"
-      - "src/agents/*transport*.ts"
-      - "src/agents/model-*.ts"
-      - "src/agents/openclaw-tools*.ts"
-      - "src/agents/provider-*.ts"
-      - "src/agents/session*.ts"
-      - "src/agents/tool-call*.ts"
-      - "src/auto-reply/reply/agent-runner*.ts"
-      - "src/auto-reply/reply/commands*.ts"
-      - "src/auto-reply/reply/directive-handling*.ts"
-      - "src/auto-reply/reply/dispatch-*.ts"
-      - "src/auto-reply/reply/get-reply-run*.ts"
-      - "src/auto-reply/reply/provider-dispatcher*.ts"
-      - "src/auto-reply/reply/queue*.ts"
-      - "src/auto-reply/reply/reply-run-registry*.ts"
-      - "src/auto-reply/reply/session*.ts"
-      - "src/channels/**"
-      - "src/auto-reply/reply/post-compaction-context.ts"
-      - "src/auto-reply/reply/queue/**"
-      - "src/auto-reply/reply/startup-context.ts"
-      - "src/commands/doctor/cron/dreaming-payload-migration.ts"
-      - "src/commands/doctor-memory-search.ts"
-      - "src/commands/doctor-session-*.ts"
-      - "src/commands/session-store-targets.ts"
-      - "src/commands/sessions*.ts"
-      - "src/cron/service/jobs.ts"
-      - "src/cron/stagger.ts"
-      - "src/gateway/*auth*.ts"
-      - "src/gateway/**/*auth*.ts"
-      - "src/gateway/*secret*.ts"
-      - "src/gateway/**/*secret*.ts"
-      - "packages/gateway-protocol/src/**/*secret*.ts"
-      - "src/gateway/resolve-configured-secret-input-string*.ts"
-      - "src/gateway/security-path*.ts"
-      - "src/gateway/server-methods/secrets*.ts"
-      - "src/gateway/method-scopes.ts"
-      - "packages/gateway-protocol/src/**"
-      - "src/gateway/server-methods/**"
-      - "src/gateway/server-methods.ts"
-      - "src/gateway/server-methods-list.ts"
-      - "src/infra/diagnostic-*.ts"
-      - "src/infra/diagnostics-timeline.ts"
-      - "src/infra/outbound/**"
-      - "src/infra/secret-file*.ts"
-      - "src/infra/session-delivery-queue*.ts"
-      - "src/logging/diagnostic*.ts"
-      - "src/memory/**"
-      - "src/memory-host-sdk/**"
-      - "src/mcp/**"
-      - "src/model-catalog/**"
-      - "src/plugin-sdk/**"
-      - "src/plugins/**"
-      - "src/process/**"
-      - "src/secrets/**"
-      - "src/security/**"
+    # Event path filters are truncated by GitHub; select complete scope inside the job.
   schedule:
     - cron: "30 6 * * *"
 
@@ -191,7 +87,22 @@ jobs:
           network_runtime=false
           session_diagnostics=false
 
-          if [[ "${EVENT_NAME}" != "pull_request" ]]; then
+          full_scan=true
+          changed_files=""
+          if [[ "${EVENT_NAME}" == "pull_request" ]]; then
+            declared_file_count="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.changed_files')"
+            [[ "$declared_file_count" =~ ^[0-9]+$ ]]
+            # The files endpoint stops at 3,000 entries even with pagination.
+            # Fetch and validate the complete response before deciding to skip a shard.
+            file_metadata="$(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files")"
+            file_count="$(printf '%s' "$file_metadata" | jq -s 'map(length) | add // 0')"
+            changed_files="$(printf '%s' "$file_metadata" | jq -r '.[] | .filename, (.previous_filename // empty)')"
+            if [[ "$file_count" -eq "$declared_file_count" && "$file_count" -lt 3000 ]]; then
+              full_scan=false
+            fi
+          fi
+
+          if [[ "$full_scan" == true ]]; then
             agent=true
             channel=true
             config=true
@@ -206,8 +117,6 @@ jobs:
             network_runtime=true
             session_diagnostics=true
           else
-            # Complete the fetch before the loop so API failures cannot select zero shards.
-            changed_files="$(gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" --jq '.[].filename')"
             while IFS= read -r file; do
               case "${file}" in
                 .github/codeql/codeql-network-runtime-boundary-critical-quality.yml|.github/codeql/openclaw-boundary/queries/raw-socket-callsite-classification.ql|.github/codeql/openclaw-boundary/queries/managed-proxy-runtime-mutation.ql|.github/codeql/openclaw-boundary/tests/network-runtime/*)
@@ -451,10 +360,19 @@ jobs:
           codex_transport="extensions/codex/src/app-server/transport-websocket.ts"
           network_codeql_contract_pattern='^\.github/codeql/(codeql-network-runtime-boundary-critical-quality\.yml|openclaw-boundary/queries/(raw-socket-callsite-classification|managed-proxy-runtime-mutation)\.ql)$'
 
+          declared_file_count="$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}" --jq '.changed_files')"
+          [[ "$declared_file_count" =~ ^[0-9]+$ ]]
           gh api --paginate "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" > "$file_metadata"
-          jq -r '.[].filename' "$file_metadata" > "$changed_files"
+          file_count="$(jq -s 'map(length) | add // 0' "$file_metadata")"
+          if [[ "$file_count" -ne "$declared_file_count" || "$file_count" -ge 3000 ]]; then
+            echo "Incomplete PR file metadata requires full network CodeQL review." >&2
+            echo "full_codeql=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          jq -r '.[] | .filename, (.previous_filename // empty)' "$file_metadata" > "$changed_files"
           jq -c '
             .[]
+            | ., (select(.previous_filename != null) | .filename = .previous_filename | .patch = null)
             | select(.filename | test("^(src/cli/gateway-cli/run-loop\\.ts|src/infra/(gateway-lock|jsonl-socket|push-apns-http2|ssh-tunnel)\\.ts|src/infra/net/|src/proxy-capture/|extensions/codex/src/app-server/transport-websocket\\.ts|extensions/irc/src/|extensions/qa-lab/src/|packages/net-policy/src/)"))
             | select(.filename | test("(^|/)[^/]+\\.(?:e2e\\.)?test\\.tsx?$") | not)
           ' "$file_metadata" > "$monitored_sources"

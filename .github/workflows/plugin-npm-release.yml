@@ -29,12 +29,14 @@ on:
       - "scripts/lib/actions-artifact-archive.mjs"
       - "scripts/plugin-npm-publish.sh"
       - "scripts/plugin-publication-artifact.mjs"
+      - "scripts/plugin-npm-bootstrap-approval.mjs"
       - "scripts/release-tooling-identity.d.mts"
       - "scripts/release-tooling-identity.mjs"
       - "scripts/plugin-npm-release-check.ts"
       - "scripts/plugin-npm-release-plan.ts"
       - "scripts/verify-plugin-npm-published-runtime.mts"
       - "src/plugins/package-entrypoints.ts"
+      - "src/utils/run-with-concurrency.ts"
   workflow_dispatch:
     inputs:
       publish_scope:
@@ -99,7 +101,63 @@ env:
   NODE_VERSION: "24.19.0"
 
 jobs:
+  candidate_execution:
+    name: Classify candidate execution authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.classify.outputs.candidate_sha }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      privileged: ${{ steps.classify.outputs.privileged }}
+      cache_mode: ${{ steps.classify.outputs.cache_mode }}
+    steps:
+      - name: Resolve called workflow identity
+        id: workflow
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const job = JSON.parse(process.env.JOB_CONTEXT);
+          if (!/^[0-9a-f]{40}$/u.test(job.workflow_sha ?? "") ||
+              !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(job.workflow_repository ?? "")) {
+            throw new Error("The called job workflow identity is required");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `workflow_sha=${job.workflow_sha}\nworkflow_repository=${job.workflow_repository}\n`);
+          NODE
+      - name: Checkout immutable candidate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .candidate-policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify candidate before checkout or execution
+        id: classify
+        env:
+          CANDIDATE_REF: ${{ inputs.ref || github.sha }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cd .candidate-policy
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${CANDIDATE_REF}^{commit}")"
+          export CANDIDATE_SHA
+          node scripts/github/classify-candidate-execution.mjs
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   preview_plugins_npm:
+    if: needs.candidate_execution.result == 'success'
+    needs: [candidate_execution]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -119,22 +177,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 0
           filter: blob:none
 
-      - name: Checkout trusted preflight tooling
-        if: github.event_name == 'workflow_dispatch' && inputs.preflight_only
+      - name: Checkout trusted planning tooling
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
           ref: ${{ github.workflow_sha }}
           path: .release-tooling
           fetch-depth: 1
-          sparse-checkout: |
-            scripts/lib/record-shared.mjs
-            scripts/release-tooling-identity.mjs
-          sparse-checkout-cone-mode: false
 
       - name: Resolve checked-out ref
         id: ref
@@ -174,7 +227,7 @@ jobs:
           RELEASE_PLUGINS: ${{ github.event_name == 'workflow_dispatch' && inputs.plugins || '' }}
           RELEASE_PUBLISH_RUN_ATTEMPT: ${{ github.event_name == 'workflow_dispatch' && inputs.release_publish_run_attempt || '' }}
           RELEASE_PUBLISH_RUN_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.release_publish_run_id || '' }}
-          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          SOURCE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           WORKFLOW_REF: ${{ github.ref }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
@@ -320,15 +373,25 @@ jobs:
           )
           PYTHON
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "false"
 
       - name: Validate publishable plugin metadata
         env:
+          TSX_TSCONFIG_PATH: ${{ github.workspace }}/.release-tooling/tsconfig.json
           PUBLISH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_scope || '' }}
           RELEASE_PLUGINS: ${{ github.event_name == 'workflow_dispatch' && inputs.plugins || '' }}
           BASE_REF: ${{ github.event_name != 'workflow_dispatch' && github.event.before || '' }}
@@ -344,16 +407,17 @@ jobs:
             if [[ "${NPM_DIST_TAG}" == "extended-stable" ]]; then
               release_args+=(--npm-dist-tag "${NPM_DIST_TAG}")
             fi
-            pnpm release:plugins:npm:check -- "${release_args[@]}"
+            node --import tsx .release-tooling/scripts/plugin-npm-release-check.ts "${release_args[@]}"
           elif [[ -n "${BASE_REF}" ]]; then
-            pnpm release:plugins:npm:check -- --base-ref "${BASE_REF}" --head-ref "${HEAD_REF}"
+            node --import tsx .release-tooling/scripts/plugin-npm-release-check.ts --base-ref "${BASE_REF}" --head-ref "${HEAD_REF}"
           else
-            pnpm release:plugins:npm:check
+            node --import tsx .release-tooling/scripts/plugin-npm-release-check.ts
           fi
 
       - name: Resolve plugin release plan
         id: plan
         env:
+          TSX_TSCONFIG_PATH: ${{ github.workspace }}/.release-tooling/tsconfig.json
           PUBLISH_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_scope || '' }}
           RELEASE_PLUGINS: ${{ github.event_name == 'workflow_dispatch' && inputs.plugins || '' }}
           BASE_REF: ${{ github.event_name != 'workflow_dispatch' && github.event.before || '' }}
@@ -371,14 +435,15 @@ jobs:
             if [[ "${NPM_DIST_TAG}" == "extended-stable" ]]; then
               plan_args+=(--npm-dist-tag "${NPM_DIST_TAG}")
             fi
-            node --import tsx scripts/plugin-npm-release-plan.ts "${plan_args[@]}" > .local/plugin-npm-release-plan.json
+            node --import tsx .release-tooling/scripts/plugin-npm-release-plan.ts "${plan_args[@]}" > .local/plugin-npm-release-plan.json
           elif [[ -n "${BASE_REF}" ]]; then
-            node --import tsx scripts/plugin-npm-release-plan.ts --base-ref "${BASE_REF}" --head-ref "${HEAD_REF}" > .local/plugin-npm-release-plan.json
+            node --import tsx .release-tooling/scripts/plugin-npm-release-plan.ts --base-ref "${BASE_REF}" --head-ref "${HEAD_REF}" > .local/plugin-npm-release-plan.json
           else
-            node --import tsx scripts/plugin-npm-release-plan.ts > .local/plugin-npm-release-plan.json
+            node --import tsx .release-tooling/scripts/plugin-npm-release-plan.ts > .local/plugin-npm-release-plan.json
           fi
 
           cat .local/plugin-npm-release-plan.json
+          jq -r '.warnings[]? | "- Warning: \(.)"' .local/plugin-npm-release-plan.json >> "$GITHUB_STEP_SUMMARY"
 
           candidate_count="$(jq -r '.candidates | length' .local/plugin-npm-release-plan.json)"
           selection_count="$(jq -r '.all | length' .local/plugin-npm-release-plan.json)"
@@ -428,8 +493,8 @@ jobs:
 
   validate_release_publish_approval:
     name: Validate release publish approval
-    needs: preview_plugins_npm
-    if: github.event_name == 'workflow_dispatch' && !inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true'
+    needs: [candidate_execution, preview_plugins_npm]
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'workflow_dispatch' && !inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true')
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -471,8 +536,8 @@ jobs:
           printf '%s' "$RUN_JSON" | DIRECT_RELEASE_RECOVERY="${direct_recovery}" node scripts/validate-release-publish-approval.mjs
 
   preview_plugin_pack:
-    needs: preview_plugins_npm
-    if: (needs.preview_plugins_npm.outputs.has_candidates == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.preflight_only)) || (github.event_name == 'workflow_dispatch' && inputs.preflight_only && !inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true')
+    needs: [candidate_execution, preview_plugins_npm]
+    if: needs.candidate_execution.result == 'success' && ((needs.preview_plugins_npm.outputs.has_candidates == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.preflight_only)) || (github.event_name == 'workflow_dispatch' && inputs.preflight_only && !inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -485,7 +550,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
       - name: Checkout trusted packaging tooling
@@ -498,23 +563,23 @@ jobs:
           sparse-checkout: |
             packages/normalization-core
             scripts
+            src/plugins
+
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
 
       - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "false"
-
-      - name: Preview publish command
-        env:
-          OPENCLAW_PLUGIN_NPM_PUBLISH_TAG: ${{ inputs.npm_dist_tag == 'extended-stable' && inputs.npm_dist_tag || '' }}
-        run: bash .release-tooling/scripts/plugin-npm-publish.sh --repo-root "$GITHUB_WORKSPACE" --dry-run "${{ matrix.plugin.packageDir }}"
-
-      - name: Preview npm pack contents
-        env:
-          OPENCLAW_PLUGIN_NPM_PUBLISH_TAG: ${{ inputs.npm_dist_tag == 'extended-stable' && inputs.npm_dist_tag || '' }}
-        run: bash .release-tooling/scripts/plugin-npm-publish.sh --repo-root "$GITHUB_WORKSPACE" --pack-dry-run "${{ matrix.plugin.packageDir }}"
 
       - name: Prepare immutable npm preflight artifact
         id: preflight_artifact
@@ -527,7 +592,7 @@ jobs:
           PACKAGE_VERSION: ${{ matrix.plugin.version }}
           PUBLISH_TAG: ${{ matrix.plugin.publishTag }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+          SOURCE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           SOURCE_SHA: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
           WORKFLOW_PATH: .github/workflows/plugin-npm-release.yml
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -543,8 +608,7 @@ jobs:
           pack_output="${RUNNER_TEMP}/${EXTENSION_ID}-npm-pack-output.txt"
           pack_json="${artifact_dir}/npm-pack.json"
 
-          OPENCLAW_PLUGIN_NPM_RUNTIME_BUILD=0 \
-            OPENCLAW_PLUGIN_NPM_PACK_OUTPUT_DIR="${artifact_dir}" \
+          OPENCLAW_PLUGIN_NPM_PACK_OUTPUT_DIR="${artifact_dir}" \
             bash .release-tooling/scripts/plugin-npm-publish.sh \
               --repo-root "$GITHUB_WORKSPACE" \
               --pack "${PACKAGE_DIR}" > "${pack_output}"
@@ -749,8 +813,8 @@ jobs:
 
   verify_plugin_npm_preflight:
     name: Preflight plugin npm package (${{ matrix.plugin.packageName }})
-    needs: [preview_plugins_npm, preview_plugin_pack]
-    if: ${{ github.event_name == 'workflow_dispatch' && ((inputs.preflight_only && !inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true') || (!inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true')) }}
+    needs: [candidate_execution, preview_plugins_npm, preview_plugin_pack]
+    if: needs.candidate_execution.result == 'success' && (github.event_name == 'workflow_dispatch' && ((inputs.preflight_only && !inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true') || (!inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true')))
     runs-on: ubuntu-latest
     permissions:
       actions: read
@@ -769,6 +833,10 @@ jobs:
           persist-credentials: false
           ref: ${{ github.workflow_sha }}
           fetch-depth: 1
+          sparse-checkout: |
+            .github/workflows
+            scripts
+            src/plugins
 
       - name: Download immutable npm preflight artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -795,15 +863,18 @@ jobs:
               "fetch",
               "--no-tags",
               "--depth=1",
+              "--filter=blob:none",
               "origin",
               source_sha,
               timeout=120,
               reclaim_locks=True,
           )
+          # The partial fetch leaves this one manifest blob for git show to hydrate.
           package_json = git_output(
               workspace,
               "show",
               f"{source_sha}:{os.environ['PACKAGE_DIR']}/package.json",
+              timeout=120,
           )
           target = os.path.join(
               os.environ["RUNNER_TEMP"],
@@ -826,7 +897,7 @@ jobs:
           PACKAGE_VERSION: ${{ matrix.plugin.version }}
           PUBLISH_TAG: ${{ matrix.plugin.publishTag }}
           REPOSITORY: ${{ github.repository }}
-          SOURCE_REF: ${{ inputs.ref }}
+          SOURCE_REF: ${{ needs.candidate_execution.outputs.candidate_sha }}
           SOURCE_SHA: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
           WORKFLOW_PATH: .github/workflows/plugin-npm-release.yml
           WORKFLOW_REF: ${{ github.workflow_ref }}
@@ -1201,8 +1272,8 @@ jobs:
 
   trusted_publisher_preflight:
     name: Trusted publisher OIDC exchange
-    needs: preview_plugins_npm
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.preflight_only && inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true' }}
+    needs: [candidate_execution, preview_plugins_npm]
+    if: needs.candidate_execution.result == 'success' && (needs.candidate_execution.outputs.privileged == 'true' && (github.event_name == 'workflow_dispatch' && inputs.preflight_only && inputs.trusted_publisher_preflight && needs.preview_plugins_npm.outputs.has_selection == 'true'))
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
@@ -1246,16 +1317,18 @@ jobs:
   publish_plugins_npm:
     needs:
       [
+        candidate_execution,
         preview_plugins_npm,
         preview_plugin_pack,
         verify_plugin_npm_preflight,
         validate_release_publish_approval,
       ]
-    if: github.event_name == 'workflow_dispatch' && !inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true'
+    if: needs.candidate_execution.result == 'success' && (needs.candidate_execution.outputs.privileged == 'true' && (github.event_name == 'workflow_dispatch' && !inputs.preflight_only && needs.preview_plugins_npm.outputs.has_candidates == 'true'))
     runs-on: ubuntu-latest
     environment: npm-release
     permissions:
       actions: read
+      attestations: read
       contents: read
       id-token: write
     strategy:
@@ -1409,15 +1482,18 @@ jobs:
               "fetch",
               "--no-tags",
               "--depth=1",
+              "--filter=blob:none",
               "origin",
               target_sha,
               timeout=120,
               reclaim_locks=True,
           )
+          # The partial fetch leaves this one manifest blob for git show to hydrate.
           package_json = git_output(
               workspace,
               "show",
               f"{target_sha}:{os.environ['PACKAGE_DIR']}/package.json",
+              timeout=120,
           )
           target = os.path.join(
               os.environ["RUNNER_TEMP"],
@@ -1515,28 +1591,19 @@ jobs:
               ;;
           esac
 
-      - name: Setup trusted publication dependencies
-        if: steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap' || steps.publication_evidence.outputs.publish_route == 'npm-readback'
-        uses: ./.github/actions/setup-node-env
-        with:
-          cache-mode: restore
-          node-version: ${{ env.NODE_VERSION }}
-          install-bun: "false"
-
-      - name: Checkout OIDC publication target
-        if: steps.publication_evidence.outputs.publish_route == 'npm-oidc'
+      - name: Checkout trusted Node setup graph
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
           persist-credentials: false
-          ref: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
-          path: .publication-target
-          fetch-depth: 1
+          sparse-checkout: .github/actions
 
-      - name: Setup trusted OIDC packaging dependencies
-        if: steps.publication_evidence.outputs.publish_route == 'npm-oidc'
-        uses: ./.github/actions/setup-node-env
+      - name: Setup trusted publication dependencies
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
-          cache-mode: restore
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "false"
 
@@ -1559,20 +1626,43 @@ jobs:
         if: steps.publication_evidence.outputs.publish_route == 'npm-oidc' && steps.npm_package_version.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          OPENCLAW_NPM_PUBLISH_AUTH_MODE: trusted-publisher
-          OPENCLAW_PLUGIN_NPM_PUBLISH_TAG: ${{ inputs.npm_dist_tag == 'extended-stable' && inputs.npm_dist_tag || '' }}
+          TARBALL_PATH: ${{ steps.publication_evidence.outputs.tarball_path }}
+          PUBLISH_TAG: ${{ steps.publication_evidence.outputs.publish_tag }}
           OPENCLAW_RELEASE_PUBLISH_RUN_ID: ${{ inputs.release_publish_run_id }}
           OPENCLAW_RELEASE_PUBLISH_RUN_ATTEMPT: ${{ inputs.release_publish_run_attempt }}
           OPENCLAW_RELEASE_PUBLISH_REF: ${{ inputs.release_publish_branch }}
           OPENCLAW_RELEASE_PUBLISH_FULL_REF: ${{ inputs.release_publish_full_ref }}
           OPENCLAW_RELEASE_PUBLISH_PARENT_STATE_POLICY: ${{ inputs.release_publish_run_id != '' && (github.actor == 'github-actions[bot]' && 'active-or-failure' || 'manual-recovery') || '' }}
-          OPENCLAW_RELEASE_TOOLING_ALLOW_PREVALIDATED_REF: "true"
           OPENCLAW_RELEASE_TOOLING_FULL_REF: ${{ github.ref }}
-          OPENCLAW_RELEASE_TOOLING_IDENTITY_REQUIRED: "true"
           OPENCLAW_RELEASE_TOOLING_REF: ${{ github.ref_name }}
           OPENCLAW_RELEASE_TOOLING_REPOSITORY: ${{ github.repository }}
           OPENCLAW_RELEASE_TOOLING_SHA: ${{ github.workflow_sha }}
-        run: bash scripts/plugin-npm-publish.sh --repo-root .publication-target --publish "${{ matrix.plugin.packageDir }}"
+        run: |
+          set -euo pipefail
+          unset NODE_AUTH_TOKEN NPM_TOKEN NODE_OPTIONS
+          # npm requires distinct user and global config sources, even when both are empty.
+          npmrc="$(mktemp "${RUNNER_TEMP}/plugin-npm-oidc.XXXXXX")"
+          trap 'rm -f "$npmrc"' EXIT
+          # Publish the attested bytes; rebuilding here loses the candidate's patched install.
+          node scripts/release-tooling-identity.mjs verify \
+            --repository "$OPENCLAW_RELEASE_TOOLING_REPOSITORY" \
+            --workflow-ref "$OPENCLAW_RELEASE_TOOLING_REF" \
+            --workflow-full-ref "$OPENCLAW_RELEASE_TOOLING_FULL_REF" \
+            --workflow-sha "$OPENCLAW_RELEASE_TOOLING_SHA" \
+            --release-publish-run-id "$OPENCLAW_RELEASE_PUBLISH_RUN_ID" \
+            --release-publish-run-attempt "$OPENCLAW_RELEASE_PUBLISH_RUN_ATTEMPT" \
+            --release-publish-ref "$OPENCLAW_RELEASE_PUBLISH_REF" \
+            --release-publish-full-ref "$OPENCLAW_RELEASE_PUBLISH_FULL_REF" \
+            --release-publish-parent-state-policy "$OPENCLAW_RELEASE_PUBLISH_PARENT_STATE_POLICY" \
+            --allow-prevalidated-ref
+          NPM_CONFIG_USERCONFIG="$npmrc" \
+            NPM_CONFIG_GLOBALCONFIG=/dev/null \
+            NPM_CONFIG_REGISTRY=https://registry.npmjs.org/ \
+            timeout --signal=TERM --kill-after=10s 300s npm publish "$TARBALL_PATH" \
+              --access public \
+              --ignore-scripts \
+              --provenance \
+              --tag "$PUBLISH_TAG"
 
       - name: Verify OIDC published runtime
         if: steps.publication_evidence.outputs.publish_route == 'npm-oidc'
@@ -1628,11 +1718,60 @@ jobs:
           console.log("already_published=true");
           NODE
 
+      - name: Download stable npm bootstrap approval
+        if: ${{ steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap' && steps.publication_evidence.outputs.publish_tag == 'latest' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: npm-stable-bootstrap-approval-${{ inputs.release_publish_run_id }}-${{ inputs.release_publish_run_attempt }}
+          path: ${{ runner.temp }}/npm-stable-bootstrap-approval
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.release_publish_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Authorize bootstrap release
+        if: steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_NAME: ${{ steps.publication_evidence.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.publication_evidence.outputs.package_version }}
+          PUBLISH_TAG: ${{ steps.publication_evidence.outputs.publish_tag }}
+          RELEASE_TARGET_SHA: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
+          RELEASE_PUBLISH_RUN_ID: ${{ inputs.release_publish_run_id }}
+          EXPECTED_RUN_ATTEMPT: ${{ inputs.release_publish_run_attempt }}
+          EXPECTED_WORKFLOW_BRANCH: ${{ inputs.release_publish_branch }}
+          EXPECTED_WORKFLOW_FULL_REF: ${{ inputs.release_publish_full_ref }}
+          EXPECTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PACKAGE_VERSION" == *"-beta."* && "$PUBLISH_TAG" == "beta" ]]; then
+            exit 0
+          fi
+          [[ "$PUBLISH_TAG" == "latest" ]] || {
+            echo "npm bootstrap requires beta or an attested regular stable/latest approval." >&2
+            exit 1
+          }
+          approval="${RUNNER_TEMP}/npm-stable-bootstrap-approval/approval.json"
+          gh attestation verify "$approval" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/openclaw-release-publish.yml" \
+            --signer-digest "$EXPECTED_WORKFLOW_SHA" \
+            --source-digest "$EXPECTED_WORKFLOW_SHA" \
+            --source-ref "$EXPECTED_WORKFLOW_FULL_REF" \
+            --deny-self-hosted-runners
+          direct_recovery=false
+          if [[ "$GITHUB_ACTOR" != "github-actions[bot]" ]]; then
+            direct_recovery=true
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RELEASE_PUBLISH_RUN_ID}" \
+            --jq '{workflowName: .name, headBranch: .head_branch, headSha: .head_sha, event, status, conclusion, url: .html_url, runAttempt: .run_attempt, repository: .repository.full_name, path}' |
+            APPROVAL_PATH="$approval" RELEASE_APPROVAL_KIND=npm-stable-bootstrap \
+              DIRECT_RELEASE_RECOVERY="$direct_recovery" node scripts/validate-release-publish-approval.mjs
+
       - name: Publish approved bootstrap tarball
         if: steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap' && steps.bootstrap_npm_package_version.outputs.already_published != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.NPM_TOKEN || '' }}
           PACKAGE_DIR: ${{ matrix.plugin.packageDir }}
           PACKAGE_NAME: ${{ steps.publication_evidence.outputs.package_name }}
           PACKAGE_VERSION: ${{ steps.publication_evidence.outputs.package_version }}
@@ -1648,10 +1787,6 @@ jobs:
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
-          [[ "$PACKAGE_VERSION" == *"-beta."* && "$PUBLISH_TAG" == "beta" ]] || {
-            echo "npm token bootstrap requires an approved beta package and beta tag." >&2
-            exit 1
-          }
           [[ -n "${NPM_TOKEN// }" ]] || {
             echo "npm token bootstrap requires the protected npm release token." >&2
             exit 1
@@ -1706,14 +1841,31 @@ jobs:
           PACKAGE_VERSION: ${{ steps.publication_evidence.outputs.package_version }}
         run: node --import tsx scripts/verify-plugin-npm-published-runtime.mts "${PACKAGE_NAME}@${PACKAGE_VERSION}"
 
-      - name: Record Meta trusted publisher checkpoint
+      - name: Verify bootstrap npm dist-tag
+        if: steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap'
+        env:
+          PACKAGE_NAME: ${{ steps.publication_evidence.outputs.package_name }}
+          PACKAGE_VERSION: ${{ steps.publication_evidence.outputs.package_version }}
+          PUBLISH_TAG: ${{ steps.publication_evidence.outputs.publish_tag }}
+        run: |
+          set -euo pipefail
+          npm view "$PACKAGE_NAME" dist-tags --json --prefer-online |
+            node --input-type=module -e '
+              import { readFileSync } from "node:fs";
+              const tags = JSON.parse(readFileSync(0, "utf8"));
+              if (tags[process.env.PUBLISH_TAG] !== process.env.PACKAGE_VERSION) {
+                throw new Error("Bootstrap dist-tag does not match the approved version; use credential-isolated selector recovery without republishing.");
+              }
+            '
+
+      - name: Record plugin trusted publisher checkpoint
         if: steps.publication_evidence.outputs.publish_route == 'npm-token-bootstrap'
         env:
           ALREADY_PUBLISHED: ${{ steps.bootstrap_npm_package_version.outputs.already_published }}
           PACKAGE_NAME: ${{ steps.publication_evidence.outputs.package_name }}
         run: |
           {
-            echo "## Meta npm bootstrap follow-up"
+            echo "## Plugin npm bootstrap follow-up"
             echo
             if [[ "$ALREADY_PUBLISHED" == "true" ]]; then
               echo "- Verified existing \`${PACKAGE_NAME}\` against the approved immutable tarball."
@@ -1724,8 +1876,8 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   verify_plugins_npm:
-    needs: [preview_plugins_npm, publish_plugins_npm]
-    if: ${{ always() && github.event_name == 'workflow_dispatch' && !inputs.preflight_only && inputs.npm_dist_tag == 'extended-stable' && needs.preview_plugins_npm.result == 'success' && (needs.publish_plugins_npm.result == 'success' || (needs.preview_plugins_npm.outputs.has_candidates == 'false' && needs.publish_plugins_npm.result == 'skipped')) }}
+    needs: [candidate_execution, preview_plugins_npm, publish_plugins_npm]
+    if: needs.candidate_execution.result == 'success' && (always() && github.event_name == 'workflow_dispatch' && !inputs.preflight_only && inputs.npm_dist_tag == 'extended-stable' && needs.preview_plugins_npm.result == 'success' && (needs.publish_plugins_npm.result == 'success' || (needs.preview_plugins_npm.outputs.has_candidates == 'false' && needs.publish_plugins_npm.result == 'skipped')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -1738,13 +1890,22 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          ref: ${{ needs.preview_plugins_npm.outputs.ref_revision }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
 
-      - name: Setup Node environment
-        uses: ./.github/actions/setup-node-env
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment
+        uses: ./.candidate-setup/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.candidate_execution.outputs.cache_mode }}
           node-version: ${{ env.NODE_VERSION }}
           install-bun: "false"
 

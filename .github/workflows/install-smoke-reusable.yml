@@ -3,6 +3,11 @@ name: Install Smoke (Reusable)
 on:
   workflow_call:
     inputs:
+      allow_frozen_target_scenario_omissions:
+        description: Allow trusted compatibility omissions for a canonical frozen release target
+        required: false
+        default: false
+        type: boolean
       allow_unreleased_changelog:
         description: Allow Unreleased changelog notes when packaging the current tree
         required: false
@@ -40,17 +45,22 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
+      privileged: ${{ steps.authority.outputs.privileged }}
+      cache_mode: ${{ steps.authority.outputs.cache_mode }}
       docs_only: ${{ steps.manifest.outputs.docs_only }}
       run_install_smoke: ${{ steps.manifest.outputs.run_install_smoke }}
       run_fast_install_smoke: ${{ steps.manifest.outputs.run_fast_install_smoke }}
       run_full_install_smoke: ${{ steps.manifest.outputs.run_full_install_smoke }}
       run_bun_global_install_smoke: ${{ steps.manifest.outputs.run_bun_global_install_smoke }}
+      fs_safe_native_contract: ${{ steps.manifest.outputs.fs_safe_native_contract }}
       target_sha: ${{ steps.manifest.outputs.target_sha }}
       dockerfile_image: ${{ steps.manifest.outputs.dockerfile_image }}
     steps:
       # The caller workflow SHA can differ during workflow_call. The job context identifies
       # this reusable workflow, so trusted harness checkouts cannot drift to candidate code.
-      - name: Assert trusted workflow identity
+      - &workflow_identity_step
+        name: Assert trusted workflow identity
+        id: workflow
         env:
           EXPECTED_WORKFLOW_REPOSITORY: ${{ github.repository }}
           JOB_CONTEXT: ${{ toJSON(job) }}
@@ -58,6 +68,8 @@ jobs:
         run: |
           set -euo pipefail
           node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+
           const job = JSON.parse(process.env.JOB_CONTEXT ?? "{}");
           const repository = process.env.EXPECTED_WORKFLOW_REPOSITORY ?? "";
           if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(repository)) {
@@ -69,16 +81,68 @@ jobs:
           if (typeof job.workflow_sha !== "string" || !/^[0-9a-f]{40}$/u.test(job.workflow_sha)) {
             throw new Error("job.workflow_sha must be a full lowercase commit SHA");
           }
+          if (!process.env.GITHUB_OUTPUT) {
+            throw new Error("GITHUB_OUTPUT is required");
+          }
+          appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `workflow_repository=${job.workflow_repository}\nworkflow_sha=${job.workflow_sha}\n`,
+          );
           NODE
+
+      # Fetch metadata and trusted policy only; no candidate checkout or execution yet.
+      - name: Materialize execution authority helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .trust-harness
+          fetch-depth: 0
+          persist-credentials: false
+          sparse-checkout: scripts/github/classify-candidate-execution.mjs
+          sparse-checkout-cone-mode: false
+
+      - name: Classify candidate execution authority
+        id: authority
+        env:
+          TARGET_REF: ${{ inputs.ref || github.ref }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git -C .trust-harness merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH" || {
+            echo "::error::Called workflow revision must belong to the repository default-branch history."
+            exit 1
+          }
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          git -C .trust-harness fetch --no-tags --no-recurse-submodules -- origin "$TARGET_REF"
+          CANDIDATE_SHA="$(git -C .trust-harness rev-parse --verify 'FETCH_HEAD^{commit}')"
+          export CANDIDATE_SHA
+          node .trust-harness/scripts/github/classify-candidate-execution.mjs
+          echo "target_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ steps.authority.outputs.target_sha }}
           fetch-depth: 1
           fetch-tags: false
           persist-credentials: false
           submodules: false
+
+      - name: Materialize selected-source contract resolver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .release-harness
+          fetch-depth: 1
+          persist-credentials: false
+          sparse-checkout: scripts/resolve-fs-safe-native-contract.mjs
+          sparse-checkout-cone-mode: false
 
       - name: Build install-smoke CI manifest
         id: manifest
@@ -93,6 +157,14 @@ jobs:
           run_bun_global_install_smoke="$workflow_bun_global_install_smoke"
           run_install_smoke=true
           target_sha="$(git rev-parse HEAD)"
+          if [[ "${{ inputs.allow_frozen_target_scenario_omissions && '1' || '0' }}" == "1" ]]; then
+            # The source checkout is shallow; ancestry makes frozen omission authorization closed.
+            git fetch --quiet --unshallow --no-tags --filter=blob:none origin \
+              '+refs/heads/extended-stable/*:refs/remotes/origin/extended-stable/*'
+          fi
+          fs_safe_native_contract="$(node .release-harness/scripts/resolve-fs-safe-native-contract.mjs \
+            "$target_sha" "${{ steps.workflow.outputs.workflow_sha }}" \
+            "${{ inputs.allow_frozen_target_scenario_omissions && '1' || '0' }}")"
           dockerfile_image="openclaw-dockerfile-smoke-local:${target_sha}"
           {
             echo "docs_only=$docs_only"
@@ -100,6 +172,7 @@ jobs:
             echo "run_fast_install_smoke=$run_fast_install_smoke"
             echo "run_full_install_smoke=$run_full_install_smoke"
             echo "run_bun_global_install_smoke=$run_bun_global_install_smoke"
+            echo "fs_safe_native_contract=$fs_safe_native_contract"
             echo "target_sha=$target_sha"
             echo "dockerfile_image=$dockerfile_image"
           } >> "$GITHUB_OUTPUT"
@@ -120,7 +193,14 @@ jobs:
           ref: ${{ needs.preflight.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: Dockerfile
@@ -335,7 +415,14 @@ jobs:
           );
           NODE
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: Dockerfile
@@ -550,8 +637,11 @@ jobs:
 
       - name: Run Docker gateway network e2e
         env:
+          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: ${{ inputs.allow_frozen_target_scenario_omissions && '1' || '0' }}
           OPENCLAW_GATEWAY_NETWORK_E2E_IMAGE: ${{ needs.root_dockerfile_image.outputs.image_ref }}
           OPENCLAW_GATEWAY_NETWORK_E2E_SKIP_BUILD: "1"
+          OPENCLAW_SELECTED_SHA: ${{ needs.preflight.outputs.target_sha }}
+          OPENCLAW_TOOLING_SHA: ${{ steps.workflow.outputs.sha }}
         run: bash .release-harness/scripts/e2e/gateway-network-docker.sh
 
       - name: Smoke test Dockerfile with matrix extension build arg
@@ -651,7 +741,14 @@ jobs:
             "https://codeload.github.com/${TARGET_REPOSITORY}/tar.gz/${TARGET_SHA}"
           test -s "${RUNNER_TEMP}/candidate.tar.gz"
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-smoke/Dockerfile
@@ -800,7 +897,14 @@ jobs:
       - *trusted_workflow_subdir_checkout_step
       - *trusted_workflow_subdir_identity_step
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-smoke/Dockerfile
@@ -873,7 +977,14 @@ jobs:
       - *trusted_workflow_subdir_checkout_step
       - *trusted_workflow_subdir_identity_step
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/docker/install-sh-nonroot/Dockerfile
@@ -1457,6 +1568,7 @@ jobs:
       - name: Run Bun global install candidate-payload smoke
         working-directory: .release-harness
         env:
+          OPENCLAW_FS_SAFE_NATIVE_CONTRACT: ${{ needs.preflight.outputs.fs_safe_native_contract }}
           OPENCLAW_BUN_GLOBAL_SMOKE_HOST_BUILD: "0"
           OPENCLAW_BUN_GLOBAL_SMOKE_PACKAGE_TGZ: ${{ runner.temp }}/install-smoke-candidate-payload/candidate.tgz
         run: bash scripts/e2e/bun-global-install-smoke.sh
@@ -1476,14 +1588,32 @@ jobs:
           ref: ${{ needs.preflight.outputs.target_sha }}
           persist-credentials: false
 
+      - name: Set up isolated Docker Builder
+        if: needs.preflight.outputs.privileged != 'true'
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+        with:
+          cache-binary: false
+
       - name: Set up Blacksmith Docker Builder
+        if: needs.preflight.outputs.privileged == 'true'
         uses: useblacksmith/setup-docker-builder@a5256a73e30f09e37e3eceb8ca36043d17621d24 # v2.1.0
         with:
           cache-key: scripts/e2e/Dockerfile
 
-      - name: Setup Node environment for package smoke
-        uses: ./.github/actions/setup-node-env
+      - *workflow_identity_step
+
+      - name: Materialize package-smoke setup
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          cache-mode: restore
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .release-harness
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
+      - name: Setup Node environment for package smoke
+        uses: ./.release-harness/.github/actions/setup-node-env
+        with:
+          cache-mode: ${{ needs.preflight.outputs.cache_mode }}
           install-bun: "false"
           install-deps: "true"

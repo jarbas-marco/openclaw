@@ -43,8 +43,6 @@ type ScriptIo = {
 
 const DEFAULT_BASE_REF = "origin/main";
 const DEFAULT_HEAD_REF = "HEAD";
-// Release upgrades can legitimately exceed Node's 64 MiB child-output ceiling.
-const GIT_DIFF_MAX_BUFFER_BYTES = 128 * 1024 * 1024;
 const TEMP_DIR_HELPER_PATH = "test/helpers/temp-dir.ts";
 const TEMP_DIR_HELPER_TEST_PATH = "test/helpers/temp-dir.test.ts";
 const MANUAL_TEMP_DIR_HELPERS = new Set(["cleanupTempDirs", "createTempDirTracker", "makeTempDir"]);
@@ -176,15 +174,31 @@ function readDiff(args: ReturnType<typeof parseArgs>, cwd = process.cwd()): stri
     }
   }
   const range = useMergeBase ? `${args.base}...${args.head}` : `${args.base}..${args.head}`;
-  const diffArgs = args.staged
-    ? ["diff", "--cached", "--unified=0", "--diff-filter=ACMR", "--"]
-    : ["diff", "--unified=0", "--diff-filter=ACMR", range, "--"];
-  return execFileSync("git", diffArgs, {
-    cwd,
-    encoding: "utf8",
-    maxBuffer: GIT_DIFF_MAX_BUFFER_BYTES,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  const diffArgs = ["diff", ...(args.staged ? ["--cached"] : [range]), "--diff-filter=ACMR"];
+  const readGitDiff = (...options: string[]) =>
+    execFileSync("git", ["--literal-pathspecs", ...diffArgs, ...options], {
+      cwd,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  // Select paths before reading patches so unrelated generated output cannot
+  // exhaust the diff buffer. Both rename/copy endpoints preserve added-line scope.
+  const fields = readGitDiff("--name-status", "-z", "--").split("\0");
+  const paths = new Set<string>();
+  for (let index = 0; index < fields.length;) {
+    const status = fields[index++];
+    const from = fields[index++];
+    if (!status || !from) {
+      break;
+    }
+    const to = status.startsWith("R") || status.startsWith("C") ? fields[index++] : from;
+    if (to && shouldInspectFile(to)) {
+      paths.add(from);
+      paths.add(to);
+    }
+  }
+  return paths.size > 0 ? readGitDiff("--unified=0", "--", ...paths) : "";
 }
 
 function readWorktreeSource(filePath: string, cwd: string): string {

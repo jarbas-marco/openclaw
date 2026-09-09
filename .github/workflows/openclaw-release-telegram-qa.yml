@@ -61,7 +61,63 @@ env:
   OPENCLAW_ENABLE_PRIVATE_QA_CLI: "1"
 
 jobs:
+  candidate_execution:
+    name: Classify candidate execution authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      candidate_sha: ${{ steps.classify.outputs.candidate_sha }}
+      workflow_sha: ${{ steps.workflow.outputs.workflow_sha }}
+      workflow_repository: ${{ steps.workflow.outputs.workflow_repository }}
+      privileged: ${{ steps.classify.outputs.privileged }}
+      cache_mode: ${{ steps.classify.outputs.cache_mode }}
+    steps:
+      - name: Resolve called workflow identity
+        id: workflow
+        env:
+          JOB_CONTEXT: ${{ toJSON(job) }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync } from "node:fs";
+          const job = JSON.parse(process.env.JOB_CONTEXT);
+          if (!/^[0-9a-f]{40}$/u.test(job.workflow_sha ?? "") ||
+              !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u.test(job.workflow_repository ?? "")) {
+            throw new Error("The called job workflow identity is required");
+          }
+          appendFileSync(process.env.GITHUB_OUTPUT,
+            `workflow_sha=${job.workflow_sha}\nworkflow_repository=${job.workflow_repository}\n`);
+          NODE
+      - name: Checkout immutable candidate policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ steps.workflow.outputs.workflow_repository }}
+          ref: ${{ steps.workflow.outputs.workflow_sha }}
+          path: .candidate-policy
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Classify candidate before checkout or execution
+        id: classify
+        env:
+          CANDIDATE_REF: ${{ inputs.target_sha }}
+          WORKFLOW_SHA: ${{ steps.workflow.outputs.workflow_sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          cd .candidate-policy
+          git check-ref-format "refs/heads/$DEFAULT_BRANCH"
+          git merge-base --is-ancestor "$WORKFLOW_SHA" "refs/remotes/origin/$DEFAULT_BRANCH"
+          export WORKFLOW_IN_DEFAULT_HISTORY=true
+          CANDIDATE_SHA="$(git rev-parse --verify --end-of-options "${CANDIDATE_REF}^{commit}")"
+          export CANDIDATE_SHA
+          node scripts/github/classify-candidate-execution.mjs
+          echo "candidate_sha=$CANDIDATE_SHA" >> "$GITHUB_OUTPUT"
+
   trusted_identity:
+    if: needs.candidate_execution.result == 'success'
+    needs: [candidate_execution]
     name: Resolve trusted dispatched workflow identity
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -237,8 +293,8 @@ jobs:
 
   build_candidate:
     name: Build secretless Telegram candidate
-    needs: trusted_identity
-    if: always()
+    needs: [candidate_execution, trusted_identity]
+    if: needs.candidate_execution.result == 'success' && (always())
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -280,8 +336,17 @@ jobs:
           set -euo pipefail
           [[ "$(git rev-parse HEAD)" == "$EXPECTED_SHA" ]]
 
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup candidate build toolchain
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
           cache-mode: off
           node-version: ${{ env.NODE_VERSION }}
@@ -291,7 +356,7 @@ jobs:
       - name: Checkout candidate runtime
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.target_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           path: .candidate
           persist-credentials: false
@@ -519,8 +584,8 @@ jobs:
 
   attest_candidate:
     name: Attest verified Telegram candidate
-    needs: [trusted_identity, build_candidate]
-    if: always()
+    needs: [candidate_execution, trusted_identity, build_candidate]
+    if: needs.candidate_execution.result == 'success' && (always())
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -644,7 +709,7 @@ jobs:
       - name: Checkout independent candidate source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.target_sha }}
+          ref: ${{ needs.candidate_execution.outputs.candidate_sha }}
           fetch-depth: 1
           path: .candidate-source
           persist-credentials: false
@@ -737,8 +802,8 @@ jobs:
 
   run_telegram:
     name: Run isolated Telegram candidate
-    needs: [trusted_identity, build_candidate, attest_candidate]
-    if: always()
+    needs: [candidate_execution, trusted_identity, build_candidate, attest_candidate]
+    if: needs.candidate_execution.result == 'success' && (always())
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: qa-live-shared
@@ -774,8 +839,17 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Checkout trusted Node setup graph
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ needs.candidate_execution.outputs.workflow_repository }}
+          ref: ${{ needs.candidate_execution.outputs.workflow_sha }}
+          path: .candidate-setup
+          persist-credentials: false
+          sparse-checkout: .github/actions
+
       - name: Setup trusted harness Node environment
-        uses: ./.github/actions/setup-node-env
+        uses: ./.candidate-setup/.github/actions/setup-node-env
         with:
           cache-mode: off
           node-version: ${{ env.NODE_VERSION }}
@@ -1626,6 +1700,48 @@ jobs:
             chmod -R a+rX,go-w "$OPENCLAW_BUNDLED_PLUGINS_DIR"
           fi
 
+          if [[ "$requested_config_path" == "$config_path" ]]; then
+            # Doctor owns a writable runtime copy; the scenario's source stays immutable.
+            # Keep generation receipts outside SUT state so a canonical mutation always
+            # refreshes the copy, while an unchanged source preserves Doctor repairs.
+            projection_dir="${OPENCLAW_STATE_DIR}/qa-runtime-config"
+            generation_dir="${RUNTIME_ROOT}/config-generations"
+            install -d -o root -g root -m 0700 "$generation_dir"
+            generation_key="$(printf %s "$config_path" | sha256sum | cut -d ' ' -f1)"
+            generation_path="${generation_dir}/${generation_key}"
+            config_generation="$(sha256sum "$config_path" | cut -d ' ' -f1)"
+            previous_generation=""
+            if [[ -e "$generation_path" ]]; then
+              [[ "$(stat -c '%F:%a:%u:%g' "$generation_path")" == "regular file:600:0:0" ]]
+              previous_generation="$(<"$generation_path")"
+            fi
+            if [[ "$previous_generation" != "$config_generation" || ! -e "$projection_dir/openclaw.json" ]]; then
+              # Only the unprivileged SUT writes below its private state root.
+              /usr/bin/setpriv --reuid="$SUT_UID" --regid="$SUT_GID" \
+                --clear-groups --no-new-privs --inh-caps=-all --ambient-caps=-all --bounding-set=-all \
+                /usr/bin/env -i PATH=/usr/bin:/bin /bin/bash -ceu '
+                  umask 077
+                  source_config="$1"
+                  projection_dir="$2"
+                  expected_generation="$3"
+                  mkdir -p "$projection_dir"
+                  [[ -d "$projection_dir" && ! -L "$projection_dir" &&
+                        "$(realpath -e "$projection_dir")" == "$projection_dir" ]]
+                  projection_tmp="$(mktemp "$projection_dir/.seed.XXXXXX")"
+                  trap '\''rm -f "$projection_tmp"'\'' EXIT
+                  cat "$source_config" >"$projection_tmp"
+                  [[ "$(sha256sum "$projection_tmp" | cut -d " " -f1)" == "$expected_generation" ]]
+                  mv -T "$projection_tmp" "$projection_dir/openclaw.json"
+                ' openclaw-config-projection "$config_path" "$projection_dir" "$config_generation"
+              [[ "$(sha256sum "$config_path" | cut -d ' ' -f1)" == "$config_generation" ]]
+              generation_tmp="$(mktemp "$generation_dir/.generation.XXXXXX")"
+              printf %s "$config_generation" >"$generation_tmp"
+              chmod 0600 "$generation_tmp"
+              mv -T "$generation_tmp" "$generation_path"
+            fi
+            export OPENCLAW_CONFIG_PATH="$projection_dir/openclaw.json"
+          fi
+
           boundary_mode=false
           for key in "${control_keys[@]}"; do
             if declare -p "$key" >/dev/null 2>&1; then
@@ -1851,8 +1967,14 @@ jobs:
                           -r "${CANONICAL_CONFIG_PATH:?}" &&
                           ! -w "$CANONICAL_CONFIG_PATH" ]]
                     if [[ "$OPENCLAW_CONFIG_PATH" != "$CANONICAL_CONFIG_PATH" ]]; then
-                      [[ "${1:-}" == "models" && "${2:-}" == "auth" &&
-                            -r "$OPENCLAW_CONFIG_PATH" && -w "$OPENCLAW_CONFIG_PATH" ]]
+                      [[ -r "$OPENCLAW_CONFIG_PATH" && -w "$OPENCLAW_CONFIG_PATH" &&
+                            ! -L "$OPENCLAW_CONFIG_PATH" ]]
+                      case "$OPENCLAW_CONFIG_PATH" in
+                        "${OPENCLAW_STATE_DIR}/qa-runtime-config/openclaw.json") ;;
+                        "${OPENCLAW_STATE_DIR}/qa-auth-bootstrap/openclaw.json")
+                          [[ "${1:-}" == "models" && "${2:-}" == "auth" ]] ;;
+                        *) exit 1 ;;
+                      esac
                     fi
                     [[ -d "${CANDIDATE_ARTIFACTS_DIR:?}" && -r "$CANDIDATE_ARTIFACTS_DIR" && -x "$CANDIDATE_ARTIFACTS_DIR" && ! -w "$CANDIDATE_ARTIFACTS_DIR" ]]
                     for writable_path in \
@@ -1969,8 +2091,8 @@ jobs:
         env:
           JOB_TIMEOUT_MINUTES: "60"
           LEASE_TTL_MS: "7200000"
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
           RUNNER_ENVIRONMENT: ${{ runner.environment }}
         shell: bash
         run: |
@@ -1983,11 +2105,12 @@ jobs:
       - name: Run Telegram live lane
         id: run_lane
         env:
+          TELEGRAM_E2E_SKILL_DIR: ${{ github.workspace }}/.agents/skills/telegram-e2e-userbot
           CANDIDATE_ROOT: ${{ steps.create_sut.outputs.candidate_root }}
           EVIDENCE_RELATIVE: ${{ steps.create_sut.outputs.evidence_relative }}
           EVIDENCE_ROOT: ${{ steps.create_sut.outputs.evidence_root }}
-          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}
-          OPENCLAW_QA_CONVEX_SITE_URL: ${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}
+          OPENCLAW_QA_CONVEX_SECRET_CI: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}
+          OPENCLAW_QA_CONVEX_SITE_URL: ${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}
           OPENCLAW_QA_CREDENTIAL_LEASE_TTL_MS: "7200000"
           OPENCLAW_QA_REDACT_PUBLIC_METADATA: "1"
           OPENCLAW_QA_SUT_FORBIDDEN_SENTINEL: trusted-parent-${{ github.run_id }}-${{ github.run_attempt }}
@@ -2589,8 +2712,8 @@ jobs:
 
   advisory_status:
     name: Record Telegram release-check status
-    needs: [trusted_identity, build_candidate, attest_candidate, run_telegram]
-    if: always()
+    needs: [candidate_execution, trusted_identity, build_candidate, attest_candidate, run_telegram]
+    if: needs.candidate_execution.result == 'success' && (always())
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
