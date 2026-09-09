@@ -298,9 +298,10 @@ export async function finalizeCodexAttempt(
         !effectiveTimedOut &&
         (finalPromptError === null || finalPromptError === undefined) &&
         (completedTurnStatus === "completed" || locallyCompletedTurn);
-      const completedSourceReply = toolBridge.telemetry.messagingToolSentTargets.some(
-        (target) => target.sourceReplyFinal === true,
-      );
+      const completedSourceReply = [
+        ...toolBridge.telemetry.messagingToolSentTargets,
+        ...toolBridge.telemetry.messagingToolSourceReplyPayloads,
+      ].some((target) => target.sourceReplyFinal === true);
       if (completedSourceReply) {
         // Harness classification only sees assistant/reasoning/plan projections.
         // A reply delivered entirely through the source message tool is visible
@@ -348,6 +349,7 @@ export async function finalizeCodexAttempt(
         turnSucceeded,
         attemptSucceeded,
         completedTurnStatus,
+        completedSourceReply,
       };
     };
     // Message-write hooks see the enriched native outcome. The same projection
@@ -451,6 +453,7 @@ export async function finalizeCodexAttempt(
       turnSucceeded,
       attemptSucceeded,
       completedTurnStatus,
+      completedSourceReply,
     } = projectTerminalOutcome();
     terminalState.settledTurnStatus = turnSucceeded
       ? "completed"
@@ -493,6 +496,9 @@ export async function finalizeCodexAttempt(
     const { assistantTranscriptOwned, assistantTranscriptIdempotencyKey, terminalAnchor } =
       mirrorOutcome;
     const shouldCaptureSettledTurnFinalizationContext =
+      // A committed final source reply already completes the turn, including
+      // message-only replies with no native assistant text to project.
+      !completedSourceReply &&
       result.assistantTexts.every((text) => !text.trim()) &&
       result.messagesSnapshot.some((message) => message.role === "toolResult") &&
       (!finalPromptError || activeProjector.settledTurnFailureFinalizationAllowed);
