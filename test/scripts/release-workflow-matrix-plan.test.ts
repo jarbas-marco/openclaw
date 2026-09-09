@@ -555,9 +555,11 @@ describe("scripts/plan-release-workflow-matrix.mjs", () => {
       planner.steps.find((step) => step.name === "Checkout selected live plugin metadata"),
       "selected target metadata checkout",
     );
+    expect(planner.needs).toEqual(["candidate_execution", "validate_selected_ref"]);
     expect(metadataCheckout.with?.ref).toBe(
-      "${{ needs.validate_selected_ref.outputs.selected_sha }}",
+      "${{ needs.candidate_execution.outputs.candidate_sha }}",
     );
+    expect(metadataCheckout.with?.["persist-credentials"]).toBe(false);
     const liveImage = requiredJob(workflow(), "prepare_live_test_image");
     expect(liveImage.needs).toContain("plan_release_workflow_matrices");
     expect(

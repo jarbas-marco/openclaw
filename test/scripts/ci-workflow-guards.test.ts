@@ -2092,9 +2092,13 @@ describe("ci workflow guards", () => {
     );
 
     expect(workflow.on.schedule.length).toBeGreaterThan(0);
-    expect(job.if).toBe("github.event_name == 'schedule'");
+    expect(job.if).toBe(
+      "needs.candidate_execution.result == 'success' && (github.event_name == 'schedule')",
+    );
     expect(step).toBeDefined();
-    expect(step?.env?.OPENAI_API_KEY).toBe("${{ secrets.OPENAI_API_KEY }}");
+    expect(step?.env?.OPENAI_API_KEY).toBe(
+      "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+    );
     expect(step?.["continue-on-error"]).toBeUndefined();
     expect(step?.if).toBeUndefined();
     expect(step?.run).toContain("--provider-mode live-frontier");
@@ -7051,8 +7055,10 @@ server.listen(0, "127.0.0.1", () => {
     ]);
     for (const pipeline of pipelines) {
       // Each profile starts independently; a slow/full declaration build cannot hold up UI readers.
-      expect(pipeline.needs).toBe("validate_selected_ref");
-      expect(pipeline.if).toBe("inputs.include_repo_e2e && inputs.live_suite_filter == ''");
+      expect(pipeline.needs).toEqual(["candidate_execution", "validate_selected_ref"]);
+      expect(pipeline.if).toBe(
+        "needs.candidate_execution.result == 'success' && (inputs.include_repo_e2e && inputs.live_suite_filter == '')",
+      );
       expect(pipeline.uses).toBe("./.github/workflows/openclaw-repo-e2e-reusable.yml");
       expect(pipeline.with.ref).toBe("${{ needs.validate_selected_ref.outputs.selected_sha }}");
       expect(pipeline.with.advisory).toBe("${{ inputs.advisory }}");
@@ -7076,7 +7082,7 @@ server.listen(0, "127.0.0.1", () => {
     });
     const producer = repoE2eWorkflow.jobs.build;
     const repoE2e = repoE2eWorkflow.jobs.test;
-    expect(repoE2e.needs).toBe("build");
+    expect(repoE2e.needs).toEqual(["preflight", "build"]);
     expect(repoE2e.name).toBe("Repo E2E (${{ matrix.name }})");
     expect(repoE2e["timeout-minutes"]).toBe(90);
     expect(repoE2e.strategy).toMatchObject({ "fail-fast": false, "max-parallel": 4 });
@@ -7092,9 +7098,10 @@ server.listen(0, "127.0.0.1", () => {
       "${{ github.run_attempt }}",
     );
     const repoE2eSteps = repoE2e.steps as WorkflowStep[];
-    expect(repoE2eSteps.find((step) => step.name === "Checkout selected ref")?.with?.ref).toBe(
-      "${{ inputs.ref }}",
-    );
+    expect(repoE2eSteps.find((step) => step.name === "Checkout selected ref")?.with).toMatchObject({
+      ref: "${{ needs.preflight.outputs.target_sha }}",
+      "persist-credentials": false,
+    });
     expect(repoE2eSteps.find((step) => step.uses === DOWNLOAD_ARTIFACT_V8)?.with).toMatchObject({
       "artifact-ids": "${{ needs.build.outputs.artifact_id }}",
       "run-id": "${{ needs.build.outputs.artifact_run_id }}",
@@ -16876,7 +16883,7 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     expect(summarizeStep.run).toContain("- Maturity scorecard docs:");
     expect(job.name).toBe("Render maturity scorecard release docs");
     expect(job.if).toBe(
-      "contains(fromJSON('[\"all\",\"qa\"]'), needs.resolve_target.outputs.rerun_group) && needs.resolve_target.outputs.run_maturity_scorecard == 'true'",
+      "needs.candidate_execution.result == 'success' && (contains(fromJSON('[\"all\",\"qa\"]'), needs.resolve_target.outputs.rerun_group) && needs.resolve_target.outputs.run_maturity_scorecard == 'true')",
     );
     expect(job.permissions).toMatchObject({
       actions: "read",
@@ -16890,9 +16897,12 @@ printf '%s\n' "\${CURL_SUCCESS_IP:-203.0.113.7}"
     expect(job.with).not.toHaveProperty("qa_profile");
     expect(job.with).not.toHaveProperty("publish_pull_request");
     expect(job.secrets).toMatchObject({
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}",
-      OPENCLAW_QA_CONVEX_SECRET_CI: "${{ secrets.OPENCLAW_QA_CONVEX_SECRET_CI }}",
-      OPENCLAW_QA_CONVEX_SITE_URL: "${{ secrets.OPENCLAW_QA_CONVEX_SITE_URL }}",
+      OPENAI_API_KEY:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENAI_API_KEY || '' }}",
+      OPENCLAW_QA_CONVEX_SECRET_CI:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SECRET_CI || '' }}",
+      OPENCLAW_QA_CONVEX_SITE_URL:
+        "${{ needs.candidate_execution.outputs.privileged == 'true' && secrets.OPENCLAW_QA_CONVEX_SITE_URL || '' }}",
     });
     expect(summaryJob.needs).toContain("maturity_scorecard_release_checks");
     expect(verifyStep.env.MATURITY_SCORECARD_RELEASE_CHECKS_RESULT).toBe(

@@ -1440,6 +1440,7 @@ describe("scripts/test-projects changed-target routing", () => {
         "test/scripts/test-install-sh-docker.test.ts",
         "test/scripts/authorized-beta-focused-evidence.test.ts",
         "test/scripts/ci-workflow-guards.test.ts",
+        "test/scripts/classify-candidate-execution.test.ts",
         "test/scripts/install-smoke-no-push-workflow.test.ts",
         "test/scripts/openclaw-cross-os-release-workflow.test.ts",
         "test/scripts/openclaw-npm-extended-stable-full-validation-workflow.test.ts",

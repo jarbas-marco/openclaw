@@ -1353,7 +1353,11 @@ describe("scripts/lib/plugin-prerelease-test-plan.mts", () => {
     const runtimeToolCoverage = releaseChecksWorkflow.jobs.runtime_tool_coverage_release_checks;
 
     expect(runtimeToolCoverage["continue-on-error"]).toBeUndefined();
+    expect(runtimeToolCoverage.if).toBe(
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.qa_parity_scheduled == 'true')",
+    );
     expect(runtimeToolCoverage.needs).toEqual([
+      "candidate_execution",
       "resolve_target",
       "qa_lab_runtime_parity_release_checks",
     ]);

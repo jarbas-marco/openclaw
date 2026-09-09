@@ -2815,7 +2815,32 @@ node -e 'const fs=require("node:fs");const p=process.argv[1];const value=JSON.pa
     expect(workflow).toContain("Run Bun global install candidate-payload smoke");
     expect(workflow).toContain("working-directory: .release-harness");
     expect(workflow).toContain("bash scripts/e2e/bun-global-install-smoke.sh");
-    expect(workflow).not.toContain("uses: ./.release-harness/.github/actions/setup-node-env");
+    const jobs = parse(workflow).jobs;
+    expect(jobs.bun_global_install_smoke.steps).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ uses: "./.release-harness/.github/actions/setup-node-env" }),
+      ]),
+    );
+    expect(jobs["docker-e2e-fast"].steps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          name: "Materialize package-smoke setup",
+          with: expect.objectContaining({
+            repository: "${{ steps.workflow.outputs.workflow_repository }}",
+            ref: "${{ steps.workflow.outputs.workflow_sha }}",
+            path: ".release-harness",
+            "persist-credentials": false,
+          }),
+        }),
+        expect.objectContaining({
+          uses: "./.release-harness/.github/actions/setup-node-env",
+          with: expect.objectContaining({
+            "cache-mode": "${{ needs.preflight.outputs.cache_mode }}",
+          }),
+        }),
+      ]),
+    );
+    expect(workflow).not.toContain("uses: ./.github/actions/setup-node-env");
     expect(workflow).toContain(
       "OPENCLAW_BUN_GLOBAL_SMOKE_PACKAGE_TGZ: ${{ runner.temp }}/install-smoke-candidate-payload/candidate.tgz",
     );

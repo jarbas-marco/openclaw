@@ -395,7 +395,9 @@ describe("cross-OS release checks workflow", () => {
     );
 
     const producer = job(workflow, "prepare_release_package");
-    expect(producer.if).toBe("needs.resolve_target.outputs.package_required == 'true'");
+    expect(producer.if).toBe(
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.package_required == 'true')",
+    );
     const resolvePackage = step(producer, "Resolve release package artifact");
     expect(resolvePackage.run).toContain('if [[ "$CROSS_OS_SCHEDULED" == "true" ]]');
     expect(resolvePackage.run).toContain(
@@ -406,10 +408,10 @@ describe("cross-OS release checks workflow", () => {
       'if [[ "$CANDIDATE_PUBLISHED" != "true" && "$required_packages" != \'[]\' ]]',
     );
     expect(job(workflow, "cross_os_release_checks").if).toBe(
-      "needs.resolve_target.outputs.cross_os_scheduled == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.cross_os_scheduled == 'true')",
     );
     expect(job(workflow, "docker_e2e_release_checks").if).toBe(
-      "needs.resolve_target.outputs.docker_required == 'true'",
+      "needs.candidate_execution.result == 'success' && (needs.resolve_target.outputs.docker_required == 'true')",
     );
   });
 
